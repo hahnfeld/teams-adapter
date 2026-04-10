@@ -1,0 +1,40 @@
+{
+  "name": "@openacp/teams-adapter",
+  "version": "1.0.0",
+  "description": "Teams adapter plugin for OpenACP — Adaptive Cards, commands, streaming",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "prepublishOnly": "pnpm run build"
+  },
+  "peerDependencies": {
+    "@openacp/plugin-sdk": ">=2026.0.0"
+  },
+  "dependencies": {
+    "@microsoft/teams.apps": "^2.0.0",
+    "@microsoft/teams.botbuilder": "^2.0.0",
+    "@microsoft/teams.cards": "^2.0.0",
+    "@microsoft/teams.api": "^2.0.0",
+    "@microsoft/agents-hosting": "^1.4.0",
+    "@microsoft/agents-hosting-express": "^1.4.0",
+    "adaptivecards-templating": "^2.3.1"
+  },
+  "devDependencies": {
+    "@openacp/plugin-sdk": "^2026.331.1",
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0"
+  },
+  "files": ["dist"],
+  "packageManager": "pnpm@9.15.0",
+  "license": "MIT"
+}
