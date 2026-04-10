@@ -8,3 +8,4 @@ export type { TeamsDraftManager, TeamsMessageDraft } from "./draft-manager.js";
 export type { PermissionHandler } from "./permissions.js";
 export { SLASH_COMMANDS } from "./commands/index.js";
 export { GraphFileClient } from "./graph.js";
+export { validateBotCredentials, validateTenant, discoverTeamsAndChannels, parseTeamsLink } from "./validators.js";
