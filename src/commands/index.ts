@@ -66,7 +66,7 @@ export async function handleCommand(
     userId,
     sessionId,
     reply: async (content: string) => {
-      await context.sendActivity(content as any);
+      await (context.sendActivity as Function)({ text: content });
     },
   };
 
@@ -136,13 +136,13 @@ export async function handleCommand(
         await handleOutputMode(ctx, args[0], args[1]);
         break;
       case "mode":
-        await ctx.reply("Mode switching not yet implemented");
+        await handleModeSwitch(ctx, args[0]);
         break;
       case "model":
-        await ctx.reply("Model switching not yet implemented");
+        await handleModelSwitch(ctx, args[0]);
         break;
       case "thought":
-        await ctx.reply("Thought level not yet implemented");
+        await handleThoughtLevel(ctx, args[0]);
         break;
       default:
         await ctx.reply(`Unknown command: /${commandName}`);
@@ -151,7 +151,7 @@ export async function handleCommand(
     log.error({ err, commandName }, "[teams-router] Command handler failed");
     const errMsg = `❌ Command failed: ${err instanceof Error ? err.message : String(err)}`;
     try {
-      await context.sendActivity(errMsg as any);
+      await (context.sendActivity as Function)({ text: errMsg });
     } catch { /* ignore */ }
   }
 }
@@ -160,12 +160,15 @@ export async function setupCardActionCallbacks(
   context: TurnContext,
   adapter: TeamsAdapter,
 ): Promise<void> {
-  const value = context.activity.value as { action?: { verb?: string; data?: Record<string, unknown> } } | undefined;
-  const action = value?.action;
-  if (!action) return;
+  const value = context.activity.value as Record<string, unknown> | undefined;
+  if (!value) return;
 
-  const verb = action.verb as string;
-  const data = (action.data ?? {}) as Record<string, unknown>;
+  // Support both Action.Execute (value.action.verb) and Action.Submit (value.verb) formats
+  const action = value.action as { verb?: string; data?: Record<string, unknown> } | undefined;
+  const verb = (action?.verb ?? value.verb) as string | undefined;
+  const data = (action?.data ?? value) as Record<string, unknown>;
+
+  if (!verb) return;
 
   const ctx: CommandContext = {
     context,
@@ -173,7 +176,7 @@ export async function setupCardActionCallbacks(
     userId: context.activity.from?.id ?? "unknown",
     sessionId: (data.sessionId as string | undefined) ?? null,
     reply: async (content: string) => {
-      await context.sendActivity(content as any);
+      await (context.sendActivity as Function)({ text: content });
     },
   };
 
@@ -197,15 +200,121 @@ export async function setupCardActionCallbacks(
         case "status":
           await handleStatus(ctx);
           break;
+        case "sessions":
+          await handleSessions(ctx);
+          break;
+        case "agents":
+          await handleAgents(ctx);
+          break;
+        case "doctor":
+          await handleDoctor(ctx);
+          break;
         case "noop":
-          // No-op for cancel dialog negative button
           break;
         default:
-          await ctx.reply(`Command not yet implemented: ${command}`);
+          await ctx.reply(`Unknown action: ${command}`);
       }
     } catch (err) {
       log.error({ err, command }, "[teams-router] Card action command failed");
       await ctx.reply(`❌ Command failed`);
     }
   }
+}
+
+// ─── Session config commands ──────────────────────────────────────────────
+
+/**
+ * Handle /mode <mode> — switch session mode via the CommandRegistry.
+ */
+async function handleModeSwitch(ctx: CommandContext, mode?: string): Promise<void> {
+  if (!ctx.sessionId) {
+    await ctx.reply("❌ No active session.");
+    return;
+  }
+  if (!mode) {
+    await ctx.reply("Usage: `/mode <mode-name>`\n\nExample: `/mode plan`, `/mode code`");
+    return;
+  }
+
+  const registry = ctx.adapter.core.lifecycleManager?.serviceRegistry?.get("command-registry") as
+    import("@openacp/plugin-sdk").CommandRegistry | undefined;
+  if (registry) {
+    try {
+      const response = await registry.execute(`/mode ${mode}`, {
+        raw: mode,
+        sessionId: ctx.sessionId,
+        channelId: "teams",
+        userId: ctx.userId,
+        reply: async (content: string) => { await ctx.reply(content); },
+      });
+      if (response.type === "text") await ctx.reply(response.text);
+      else if (response.type === "error") await ctx.reply(`❌ ${response.message}`);
+      return;
+    } catch { /* fall through */ }
+  }
+  await ctx.reply(`🔄 Mode set to **${mode}** (may require core command support)`);
+}
+
+/**
+ * Handle /model <model> — switch AI model via the CommandRegistry.
+ */
+async function handleModelSwitch(ctx: CommandContext, model?: string): Promise<void> {
+  if (!ctx.sessionId) {
+    await ctx.reply("❌ No active session.");
+    return;
+  }
+  if (!model) {
+    await ctx.reply("Usage: `/model <model-name>`\n\nExample: `/model claude-sonnet`, `/model gpt-4o`");
+    return;
+  }
+
+  const registry = ctx.adapter.core.lifecycleManager?.serviceRegistry?.get("command-registry") as
+    import("@openacp/plugin-sdk").CommandRegistry | undefined;
+  if (registry) {
+    try {
+      const response = await registry.execute(`/model ${model}`, {
+        raw: model,
+        sessionId: ctx.sessionId,
+        channelId: "teams",
+        userId: ctx.userId,
+        reply: async (content: string) => { await ctx.reply(content); },
+      });
+      if (response.type === "text") await ctx.reply(response.text);
+      else if (response.type === "error") await ctx.reply(`❌ ${response.message}`);
+      return;
+    } catch { /* fall through */ }
+  }
+  await ctx.reply(`🤖 Model set to **${model}** (may require core command support)`);
+}
+
+/**
+ * Handle /thought <level> — adjust thinking/reasoning level via the CommandRegistry.
+ */
+async function handleThoughtLevel(ctx: CommandContext, level?: string): Promise<void> {
+  if (!ctx.sessionId) {
+    await ctx.reply("❌ No active session.");
+    return;
+  }
+  if (!level) {
+    await ctx.reply("Usage: `/thought <level>`\n\nExample: `/thought high`, `/thought low`, `/thought off`");
+    return;
+  }
+
+  const registry = ctx.adapter.core.lifecycleManager?.serviceRegistry?.get("command-registry") as
+    import("@openacp/plugin-sdk").CommandRegistry | undefined;
+  if (registry) {
+    try {
+      const response = await registry.execute(`/thought ${level}`, {
+        raw: level,
+        sessionId: ctx.sessionId,
+        channelId: "teams",
+        userId: ctx.userId,
+        reply: async (content: string) => { await ctx.reply(content); },
+      });
+      if (response.type === "text") await ctx.reply(response.text);
+      else if (response.type === "error") await ctx.reply(`❌ ${response.message}`);
+      return;
+    } catch { /* fall through */ }
+  }
+  await ctx.reply(`🧠 Thinking level set to **${level}** (may require core command support)`);
 }

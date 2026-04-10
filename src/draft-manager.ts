@@ -1,6 +1,7 @@
 import type { TurnContext } from "@microsoft/agents-hosting";
 import { log } from "@openacp/plugin-sdk";
 import { splitMessage } from "./formatting.js";
+import { sendText, updateActivity as updateTeamsActivity } from "./send-utils.js";
 
 const FLUSH_INTERVAL = 5000;
 const MAX_DISPLAY_LENGTH = 1900;
@@ -63,7 +64,7 @@ export class TeamsMessageDraft {
       this.firstFlushPending = true;
       try {
         const result = await this.sendQueue.enqueue(
-          () => this.context.sendActivity({ text: content } as any) as Promise<unknown>,
+          () => sendText(this.context, content) as Promise<unknown>,
           { type: "other" },
         );
         if (result) {
@@ -89,11 +90,11 @@ export class TeamsMessageDraft {
 
       try {
         const result = await this.sendQueue.enqueue(
-          () => this.context.updateActivity({
+          () => updateTeamsActivity(this.context, {
             id: this.ref!.activityId,
             conversation: { id: this.ref!.conversationId },
             text: content,
-          } as any) as Promise<unknown>,
+          }) as Promise<unknown>,
           { type: "text" },
         );
         if (result !== undefined) {
@@ -127,11 +128,11 @@ export class TeamsMessageDraft {
 
     try {
       await this.sendQueue.enqueue(
-        () => this.context.updateActivity({
+        () => updateTeamsActivity(this.context, {
           id: this.ref!.activityId,
           conversation: { id: this.ref!.conversationId },
           text: stripped,
-        } as any) as Promise<unknown>,
+        }) as Promise<unknown>,
         { type: "other" },
       );
       // Only update state after successful send
@@ -171,16 +172,16 @@ export class TeamsMessageDraft {
       try {
         if (this.ref?.activityId) {
           await this.sendQueue.enqueue(
-            () => this.context.updateActivity({
+            () => updateTeamsActivity(this.context, {
               id: this.ref!.activityId,
               conversation: { id: this.ref!.conversationId },
               text: content,
-            } as any) as Promise<unknown>,
+            }) as Promise<unknown>,
             { type: "other" },
           );
         } else {
           await this.sendQueue.enqueue(
-            () => this.context.sendActivity({ text: content } as any) as Promise<unknown>,
+            () => sendText(this.context, content) as Promise<unknown>,
             { type: "other" },
           );
         }
@@ -197,16 +198,16 @@ export class TeamsMessageDraft {
       try {
         if (i === 0 && this.ref?.activityId) {
           await this.sendQueue.enqueue(
-            () => this.context.updateActivity({
+            () => updateTeamsActivity(this.context, {
               id: this.ref!.activityId,
               conversation: { id: this.ref!.conversationId },
               text: content,
-            } as any) as Promise<unknown>,
+            }) as Promise<unknown>,
             { type: "other" },
           );
         } else {
           const result = await this.sendQueue.enqueue(
-            () => this.context.sendActivity({ text: content } as any) as Promise<unknown>,
+            () => sendText(this.context, content) as Promise<unknown>,
             { type: "other" },
           );
           if (result && i === 0) {
@@ -226,7 +227,6 @@ export class TeamsMessageDraft {
 
 export class TeamsDraftManager {
   private drafts = new Map<string, TeamsMessageDraft>();
-  private textBuffers = new Map<string, string>();
 
   constructor(private sendQueue: { enqueue<T>(fn: () => Promise<T>, opts?: { type?: string }): Promise<T | undefined> }) {}
 
@@ -247,30 +247,17 @@ export class TeamsDraftManager {
     return this.drafts.get(sessionId);
   }
 
-  appendText(sessionId: string, text: string): void {
-    this.textBuffers.set(sessionId, (this.textBuffers.get(sessionId) ?? "") + text);
-  }
-
-  async finalize(sessionId: string, context?: TurnContext, isAssistant?: boolean): Promise<void> {
+  async finalize(sessionId: string, _context?: TurnContext, _isAssistant?: boolean): Promise<void> {
     const draft = this.drafts.get(sessionId);
     if (!draft) return;
 
+    // Delete BEFORE awaiting to prevent concurrent finalize() calls
+    // from double-finalizing the same draft (matches Telegram pattern)
     this.drafts.delete(sessionId);
     await draft.finalize();
-
-    if (isAssistant && context) {
-      const fullText = this.textBuffers.get(sessionId);
-      this.textBuffers.delete(sessionId);
-      if (fullText) {
-        // TODO: Detect action patterns and send action buttons as follow-up
-      }
-    } else {
-      this.textBuffers.delete(sessionId);
-    }
   }
 
   cleanup(sessionId: string): void {
     this.drafts.delete(sessionId);
-    this.textBuffers.delete(sessionId);
   }
 }

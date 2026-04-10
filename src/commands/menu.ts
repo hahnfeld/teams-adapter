@@ -1,27 +1,75 @@
 import type { CommandContext } from "./index.js";
+import { sendCard } from "../send-utils.js";
 
+/**
+ * Handle /menu — show the main action menu as an Adaptive Card with buttons.
+ * Mirrors Telegram's buildMenuKeyboard pattern.
+ */
 export async function handleMenu(ctx: CommandContext): Promise<void> {
-  await ctx.reply("📋 Menu not yet implemented");
+  const card = {
+    type: "AdaptiveCard",
+    version: "1.2",
+    body: [
+      { type: "TextBlock", text: "📋 **OpenACP Menu**", weight: "Bolder", size: "Medium" },
+      { type: "TextBlock", text: "Quick actions for managing sessions and agents.", wrap: true, isSubtle: true },
+    ],
+    actions: [
+      { type: "Action.Submit", title: "➕ New Session", data: { verb: "cmd:new" } },
+      { type: "Action.Submit", title: "📊 Status", data: { verb: "cmd:status" } },
+      { type: "Action.Submit", title: "📋 Sessions", data: { verb: "cmd:sessions" } },
+      { type: "Action.Submit", title: "🤖 Agents", data: { verb: "cmd:agents" } },
+      { type: "Action.Submit", title: "🔍 Doctor", data: { verb: "cmd:doctor" } },
+    ],
+  };
+
+  await sendCard(ctx.context, card as Record<string, unknown>);
 }
 
+/**
+ * Handle /help — show available commands.
+ */
 export async function handleHelp(ctx: CommandContext): Promise<void> {
   const commands = [
-    "/new [agent] - Create new session",
-    "/newchat - New chat, same agent & workspace",
-    "/cancel - Cancel current session",
-    "/status - Show session status",
-    "/sessions - List all sessions",
-    "/agents - List available agents",
-    "/menu - Show action menu",
-    "/help - Show this help",
-    "/outputmode low|medium|high - Set output detail",
-    "/bypass - Auto-approve permissions",
+    "**Session Management:**",
+    "`/new [agent] [workspace]` — Create new session",
+    "`/newchat` — New chat, same agent & workspace",
+    "`/cancel` — Abort current prompt",
+    "`/status` — Show session status",
+    "`/sessions` — List all sessions",
+    "`/handoff` — Generate terminal resume command",
+    "",
+    "**Agent Management:**",
+    "`/agents` — List available agents",
+    "`/install <name>` — Install an agent",
+    "",
+    "**Settings:**",
+    "`/outputmode low|medium|high` — Set output detail",
+    "`/bypass` — Toggle auto-approve permissions",
+    "`/tts on|off` — Toggle text-to-speech",
+    "`/mode <mode>` — Switch session mode",
+    "`/model <model>` — Switch AI model",
+    "`/thought <level>` — Adjust thinking level",
+    "`/settings` — Show configuration",
+    "",
+    "**System:**",
+    "`/menu` — Show action menu",
+    "`/doctor` — Run diagnostics",
+    "`/restart` — Restart OpenACP",
+    "`/clear` — Reset assistant session",
   ];
-  await ctx.reply(`**Commands:**\n${commands.join("\n")}`);
+  await ctx.reply(commands.join("\n"));
 }
 
+/**
+ * Handle /clear — reset the assistant session.
+ */
 export async function handleClear(ctx: CommandContext): Promise<void> {
-  await ctx.reply("🗑️ Clear not yet implemented");
+  try {
+    await ctx.adapter.respawnAssistant();
+    await ctx.reply("🗑️ Assistant session cleared and restarted.");
+  } catch (err) {
+    await ctx.reply(`❌ Clear failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 export async function handleMenuButton(ctx: CommandContext): Promise<void> {

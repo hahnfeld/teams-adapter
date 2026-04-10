@@ -9,6 +9,8 @@ export interface TeamsChannelConfig extends Partial<IChannelAdapter> {
   channelId: string;
   notificationChannelId: string | null;
   assistantThreadId: string | null;
+  /** Azure AD client secret for Graph API file operations. Optional — falls back to card-only display. */
+  graphClientSecret?: string;
 }
 
 export interface TeamsPlatformData {

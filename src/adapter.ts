@@ -24,10 +24,20 @@ import { TeamsRenderer } from "./renderer.js";
 import type { TeamsChannelConfig } from "./types.js";
 import { TeamsDraftManager } from "./draft-manager.js";
 import { PermissionHandler } from "./permissions.js";
-import { handleCommand, setupCardActionCallbacks } from "./commands/index.js";
+import { handleCommand, setupCardActionCallbacks, SLASH_COMMANDS } from "./commands/index.js";
 import { spawnAssistant, buildWelcomeMessage } from "./assistant.js";
-import { downloadTeamsFile, isAttachmentTooLarge, buildFileAttachmentCard } from "./media.js";
+import { downloadTeamsFile, isAttachmentTooLarge, buildFileAttachmentCard, uploadFileViaGraph } from "./media.js";
+import { GraphFileClient } from "./graph.js";
+import { ConversationStore } from "./conversation-store.js";
+import { sendText, sendCard, sendActivity } from "./send-utils.js";
+import type { StoredConversationReference } from "./conversation-store.js";
+import { formatPlan, renderUsageCard } from "./formatting.js";
 import type { OutputMode } from "./activity.js";
+
+/** Max retry attempts for transient Teams API failures */
+const MAX_RETRIES = 3;
+/** Base delay (ms) for exponential backoff */
+const BASE_RETRY_DELAY = 1000;
 
 export class TeamsAdapter extends MessagingAdapter {
   readonly name = "teams";
@@ -38,7 +48,7 @@ export class TeamsAdapter extends MessagingAdapter {
     threads: true,
     reactions: false,
     fileUpload: true,
-    voice: true,
+    voice: false,
   };
 
   readonly core: OpenACPCore;
@@ -54,20 +64,61 @@ export class TeamsAdapter extends MessagingAdapter {
   private assistantSession: Session | null = null;
   private assistantInitializing = false;
   private fileService: FileServiceInterface;
+  private graphClient?: GraphFileClient;
+  private conversationStore: ConversationStore;
 
+  /**
+   * Per-session TurnContext references, set during inbound message handling.
+   * Handler overrides read from this map during sendMessage dispatch.
+   */
   private _sessionContexts = new Map<string, { context: TurnContext; isAssistant: boolean }>();
   private _sessionOutputModes = new Map<string, OutputMode>();
+
+  /**
+   * Per-session serial dispatch queues — matches Telegram's _dispatchQueues pattern.
+   * SessionBridge fires sendMessage() as fire-and-forget, so multiple events can arrive
+   * concurrently. Without serialization, fast handlers overtake slow ones, causing
+   * out-of-order delivery. This queue ensures events are processed in arrival order.
+   */
+  private _dispatchQueues = new Map<string, Promise<void>>();
+
+  /** Track processed activity IDs to handle Teams 15-second retry deduplication */
+  private _processedActivities = new Map<string, number>();
+  private _processedCleanupTimer?: ReturnType<typeof setInterval>;
+
+  /** Messages buffered during assistant initialization — replayed once ready */
+  private _assistantInitBuffer: Array<{ sessionId: string; content: OutgoingMessage }> = [];
+
+  /** Bot token cache for proactive messaging via connector REST API */
+  private _botTokenCache?: { token: string; expiresAt: number };
 
   constructor(core: OpenACPCore, config: TeamsChannelConfig) {
     super(
       { configManager: core.configManager },
-      { ...config as unknown as Record<string, unknown>, maxMessageLength: 2000, enabled: config.enabled ?? true } as MessagingAdapterConfig,
+      // Teams measures message size in bytes (100KB limit, 80KB safe threshold).
+      // Use 12000 chars as the split limit — safe for multi-byte content (CJK, emoji)
+      // where each char can be 3-4 bytes, plus activity envelope overhead.
+      { ...config as unknown as Record<string, unknown>, maxMessageLength: 12000, enabled: config.enabled ?? true } as MessagingAdapterConfig,
     );
     this.core = core;
     this.teamsConfig = config;
     this.sendQueue = new SendQueue({ minInterval: 1000 });
     this.draftManager = new TeamsDraftManager(this.sendQueue as any);
     this.fileService = core.fileService;
+
+    // Persistent conversation reference store for proactive messaging
+    const storageDir = core.configManager.resolveDataDir?.() ?? process.cwd();
+    this.conversationStore = new ConversationStore(storageDir);
+
+    // Initialize Graph API client for file operations (optional)
+    if (config.graphClientSecret && config.tenantId && config.botAppId) {
+      this.graphClient = new GraphFileClient(
+        config.tenantId,
+        config.botAppId,
+        config.graphClientSecret,
+      );
+      log.info("[TeamsAdapter] Graph API file client initialized");
+    }
 
     const botBuilderPlugin = new BotBuilderPlugin();
     this.app = new App({
@@ -92,7 +143,23 @@ export class TeamsAdapter extends MessagingAdapter {
       this.setupMessageHandler();
       this.setupCardActionHandler();
 
+      // Periodic cleanup of processed activity IDs (deduplication cache)
+      this._processedCleanupTimer = setInterval(() => {
+        const cutoff = Date.now() - 60_000; // 60s retention
+        for (const [id, ts] of this._processedActivities) {
+          if (ts < cutoff) this._processedActivities.delete(id);
+        }
+      }, 30_000);
+      if (this._processedCleanupTimer.unref) this._processedCleanupTimer.unref();
+
       await this.app.start();
+
+      // Spawn assistant session if configured (non-blocking — matches Telegram's pattern)
+      if (this.teamsConfig.assistantThreadId) {
+        this.setupAssistant().catch((err) => {
+          log.error({ err }, "[TeamsAdapter] Assistant setup failed (non-blocking)");
+        });
+      }
 
       log.info("[TeamsAdapter] Initialization complete");
     } catch (err) {
@@ -104,6 +171,12 @@ export class TeamsAdapter extends MessagingAdapter {
   // ─── stop ─────────────────────────────────────────────────────────────────
 
   async stop(): Promise<void> {
+    // Cancel deduplication cleanup timer
+    if (this._processedCleanupTimer) {
+      clearInterval(this._processedCleanupTimer);
+      this._processedCleanupTimer = undefined;
+    }
+
     if (this.assistantSession) {
       try {
         await this.assistantSession.destroy();
@@ -112,9 +185,15 @@ export class TeamsAdapter extends MessagingAdapter {
       }
       this.assistantSession = null;
     }
+
     this.notificationContext = undefined;
     this._sessionContexts.clear();
     this._sessionOutputModes.clear();
+    this._dispatchQueues.clear();
+    this._processedActivities.clear();
+    this.sendQueue.clear();
+    this.conversationStore.destroy();
+
     await this.app.stop();
     log.info("[TeamsAdapter] Stopped");
   }
@@ -128,7 +207,7 @@ export class TeamsAdapter extends MessagingAdapter {
         const uploadInfo = context.activity.value?.uploadInfo;
         const fileName = uploadInfo?.name ?? "file";
         log.info({ fileName }, "[TeamsAdapter] File consent accepted");
-        await context.sendActivity({ text: `✅ File consent accepted: ${fileName}` } as any);
+        await sendText(context, `✅ File consent accepted: ${fileName}`);
         return { status: 200 };
       } catch (err) {
         log.error({ err }, "[TeamsAdapter] file.consent.accept error");
@@ -142,7 +221,7 @@ export class TeamsAdapter extends MessagingAdapter {
         const uploadInfo = context.activity.value?.uploadInfo;
         const fileName = uploadInfo?.name ?? "file";
         log.info({ fileName }, "[TeamsAdapter] File consent declined");
-        await context.sendActivity({ text: `❌ File consent declined: ${fileName}` } as any);
+        await sendText(context, `❌ File consent declined: ${fileName}`);
         return { status: 200 };
       } catch (err) {
         log.error({ err }, "[TeamsAdapter] file.consent.decline error");
@@ -151,30 +230,111 @@ export class TeamsAdapter extends MessagingAdapter {
     });
 
     this.app.on("message", async (context: any) => {
-      const text = context.activity.text ?? "";
+      // Action.Submit cards send activity.value with the flat data object (no text).
+      // Intercept these before normal text processing.
+      const submitValue = context.activity.value as Record<string, unknown> | undefined;
+      if (submitValue && !context.activity.text) {
+        await this.handleSubmitAction(context, submitValue);
+        return;
+      }
+
+      const text = (context.activity.text ?? "").trim();
       const userId = context.activity.from?.id ?? "unknown";
-      const channelId = String(context.activity.conversation?.id ?? "unknown");
-      const threadId = String(context.activity.channelId ?? channelId);
+      // Use conversation.id as the thread discriminator — NOT activity.channelId
+      // which is always "msteams" for Teams. Conversation ID uniquely identifies
+      // the 1:1, group chat, or channel thread the message came from.
+      const conversationId = String(context.activity.conversation?.id ?? "unknown");
+      const threadId = conversationId;
+      const activityId = context.activity.id as string | undefined;
 
       try {
+        // Idempotency: Teams retries if bot takes >15s — skip duplicate activity IDs
+        if (activityId && this._processedActivities.has(activityId)) {
+          log.debug({ activityId }, "[TeamsAdapter] Duplicate activity, skipping");
+          return;
+        }
+        if (activityId) this._processedActivities.set(activityId, Date.now());
+
         log.debug({ threadId, userId, text: text.slice(0, 50) }, "[TeamsAdapter] message received");
 
         if (!text && !context.activity.attachments?.length) return;
 
-        const sessionId =
-          this.core.sessionManager.getSessionByThread("teams", threadId)?.id ?? "unknown";
+        // Persist conversation reference for proactive messaging (survives restarts)
+        if (context.activity.conversation?.id && context.activity.serviceUrl) {
+          this.conversationStore.upsert({
+            conversationId: context.activity.conversation.id,
+            serviceUrl: context.activity.serviceUrl,
+            tenantId: context.activity.conversation.tenantId ?? this.teamsConfig.tenantId,
+            channelId: context.activity.channelId,
+            botId: context.activity.recipient?.id ?? this.teamsConfig.botAppId,
+            botName: context.activity.recipient?.name ?? "OpenACP",
+            updatedAt: Date.now(),
+          });
+        }
 
         // Capture notification channel context on first message
-        if (this.notificationChannelId && threadId === this.notificationChannelId) {
-          this.notificationConversationId = channelId;
+        if (this.notificationChannelId && conversationId === this.notificationChannelId) {
+          this.notificationConversationId = conversationId;
           this.notificationContext = context;
+        }
+
+        const existingSession = this.core.sessionManager.getSessionByThread("teams", threadId);
+        const sessionId = existingSession?.id ?? "unknown";
+
+        // Always store context under threadId — this is the stable key.
+        // For new sessions, core.handleMessage creates the session and assigns threadId,
+        // then sendMessage is called with the new sessionId. We also store under sessionId
+        // when known, and under threadId as a universal fallback.
+        const isAssistant = this.assistantSession != null && sessionId === this.assistantSession?.id;
+        this._sessionContexts.set(threadId, { context, isAssistant });
+        if (sessionId !== "unknown") {
+          this._sessionContexts.set(sessionId, { context, isAssistant });
+        }
+
+        // Route slash commands — matches Telegram's CommandRegistry dispatch pattern
+        if (text.startsWith("/")) {
+          const registry = this.getCommandRegistry();
+          if (registry) {
+            const rawCommand = text.split(" ")[0].slice(1).toLowerCase();
+            const def = registry.get(rawCommand);
+            if (def) {
+              try {
+                const response = await registry.execute(text, {
+                  raw: "",
+                  sessionId: sessionId !== "unknown" ? sessionId : null,
+                  channelId: "teams",
+                  userId,
+                  reply: async (content: string) => {
+                    if (typeof content === "string") {
+                      await sendText(context, content);
+                    }
+                  },
+                });
+                if (response.type !== "silent") {
+                  await this.renderCommandResponse(response, context);
+                }
+              } catch (err) {
+                log.error({ err, command: rawCommand }, "[TeamsAdapter] Command failed");
+                await sendText(context, `❌ Command failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+              return;
+            }
+          }
+
+          // Fallback: try local handleCommand for commands not in registry
+          await handleCommand(context, this, userId, sessionId !== "unknown" ? sessionId : null);
+          return;
         }
 
         const attachments: Attachment[] = [];
         if (context.activity.attachments?.length) {
           for (const att of context.activity.attachments) {
             try {
-              const buffer = await downloadTeamsFile(att.contentUrl ?? "", att.name ?? "attachment");
+              const buffer = await downloadTeamsFile(
+                att.contentUrl ?? "",
+                att.name ?? "attachment",
+                this.graphClient,
+              );
               if (buffer) {
                 const saved = await this.fileService.saveFile(
                   sessionId,
@@ -197,6 +357,7 @@ export class TeamsAdapter extends MessagingAdapter {
 
         if (!messageText && attachments.length === 0) return;
 
+        // Route to assistant thread
         if (
           this.teamsConfig.assistantThreadId &&
           threadId === this.teamsConfig.assistantThreadId
@@ -215,11 +376,10 @@ export class TeamsAdapter extends MessagingAdapter {
         }
 
         if (sessionId !== "unknown") {
-          // Reset draft state for new prompt
-          const draft = this.draftManager.getDraft(sessionId);
-          if (draft) {
-            this.draftManager.cleanup(sessionId);
-          }
+          // Drain pending dispatches and reset draft state for new prompt
+          const pendingDispatch = this._dispatchQueues.get(sessionId);
+          if (pendingDispatch) await pendingDispatch;
+          this.draftManager.cleanup(sessionId);
         }
 
         await this.core.handleMessage({
@@ -232,13 +392,80 @@ export class TeamsAdapter extends MessagingAdapter {
       } catch (err) {
         log.error({ err, threadId, userId }, "[TeamsAdapter] message handler error");
         try {
-          await context.sendActivity({ text: "❌ Failed to process message. Please try again." } as any);
+          await sendText(context, "❌ Failed to process message. Please try again.");
         } catch { /* best effort */ }
       }
     });
   }
 
   // ─── Card action handler ────────────────────────────────────────────────
+
+  /**
+   * Handle Action.Submit payloads from Adaptive Cards.
+   *
+   * Action.Submit (v1.2 compatible) sends the card's data directly as
+   * activity.value with no text. This handles permission responses, command
+   * buttons, and output mode changes — all of which embed a `verb` field.
+   */
+  private async handleSubmitAction(context: any, data: Record<string, unknown>): Promise<void> {
+    try {
+      const verb = data.verb as string | undefined;
+      if (!verb) return;
+
+      // Permission response: data has verb + sessionId + callbackKey + requestId
+      if (data.sessionId && data.callbackKey && data.requestId) {
+        const handled = await this.permissionHandler.handleCardAction(
+          context,
+          verb,
+          data.sessionId as string,
+          data.callbackKey as string,
+          data.requestId as string,
+        );
+        if (handled) return;
+      }
+
+      // Output mode change: verb = "om:<sessionId>:<mode>"
+      if (verb.startsWith("om:")) {
+        const parts = verb.split(":");
+        if (parts.length === 3) {
+          const [, sessionId, mode] = parts;
+          if (mode === "low" || mode === "medium" || mode === "high") {
+            this._sessionOutputModes.set(sessionId, mode as OutputMode);
+            await sendText(context, `🔄 Output mode: **${mode}**`);
+            return;
+          }
+        }
+      }
+
+      // Session cancel: verb = "cancel:<sessionId>"
+      if (verb.startsWith("cancel:")) {
+        const sessionId = verb.split(":")[1];
+        if (sessionId) {
+          const session = this.core.sessionManager.getSession(sessionId);
+          if (session) {
+            try {
+              await session.destroy();
+              await sendText(context, "❌ Session cancelled");
+            } catch (err) {
+              log.error({ err, sessionId }, "[TeamsAdapter] cancel: destroy failed");
+              await sendText(context, "❌ Failed to cancel session");
+            }
+          }
+        }
+        return;
+      }
+
+      // Command button: verb = "cmd:<command>"
+      if (verb.startsWith("cmd:")) {
+        await setupCardActionCallbacks(context, this);
+        return;
+      }
+    } catch (err) {
+      log.error({ err }, "[TeamsAdapter] handleSubmitAction error");
+    }
+  }
+
+  // ─── Card action handler (for Action.Execute / invoke activities) ─────
 
   private setupCardActionHandler(): void {
     this.app.on("card.action", (async (context: any): Promise<InvokeResponse<"adaptiveCard/action"> | undefined> => {
@@ -274,7 +501,7 @@ export class TeamsAdapter extends MessagingAdapter {
           const [_prefix, sessionId, mode] = parts;
           if (mode === "low" || mode === "medium" || mode === "high") {
             this._sessionOutputModes.set(sessionId, mode as OutputMode);
-            await context.sendActivity({ text: `🔄 Output mode: **${mode}**` } as any);
+            await sendText(context, `🔄 Output mode: **${mode}**`);
             return;
           }
         }
@@ -290,12 +517,12 @@ export class TeamsAdapter extends MessagingAdapter {
             } catch (err) {
               log.error({ err, sessionId }, "[TeamsAdapter] cancel: destroy failed");
               try {
-                await context.sendActivity({ text: "❌ Failed to cancel session" } as any);
+                await sendText(context, "❌ Failed to cancel session");
               } catch { /* best effort */ }
               return;
             }
             try {
-              await context.sendActivity({ text: "❌ Session cancelled" } as any);
+              await sendText(context, "❌ Session cancelled");
             } catch { /* best effort */ }
           }
         }
@@ -331,7 +558,7 @@ export class TeamsAdapter extends MessagingAdapter {
       reply: async (content: string) => {
         if (typeof content === "string") {
           try {
-            await (context.sendActivity as any)({ text: content });
+            await sendText(context, content);
           } catch (err) {
             log.warn({ err }, "[TeamsAdapter] handleCommand: reply failed");
           }
@@ -346,7 +573,7 @@ export class TeamsAdapter extends MessagingAdapter {
 
   private async renderCommandResponse(response: CommandResponse, context: any): Promise<void> {
     const reply = async (text: string) => {
-      await context.sendActivity({ text } as any);
+      await sendText(context, text);
     };
 
     switch (response.type) {
@@ -359,42 +586,42 @@ export class TeamsAdapter extends MessagingAdapter {
       case "menu": {
         const card = {
           type: "AdaptiveCard",
-          version: "1.4",
+          version: "1.2",
           body: [
-            { type: "TextBlock", text: response.title, weight: "Bolder" as const, size: "Medium" as const },
-            { type: "TextBlock", text: response.options.map((o) => `• ${o.label}`).join("\n"), wrap: true },
+            { type: "TextBlock", text: response.title, weight: "Bolder", size: "Medium" },
+            { type: "TextBlock", text: response.options.map((o: { label: string }) => `• ${o.label}`).join("\n"), wrap: true },
           ],
-          actions: response.options.slice(0, 5).map((opt) => ({
-            type: "Action.Execute" as const,
+          actions: response.options.slice(0, 5).map((opt: { label: string; command: string }) => ({
+            type: "Action.Submit",
             title: opt.label.slice(0, 20),
             data: { verb: `cmd:${opt.command}` },
           })),
         };
-        await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card)] } as any);
+        await sendCard(context, card);
         break;
       }
       case "list": {
-        const text = response.items.map((i) => `• **${i.label}**${i.detail ? ` — ${i.detail}` : ""}`).join("\n");
+        const text = response.items.map((i: { label: string; detail?: string }) => `• **${i.label}**${i.detail ? ` — ${i.detail}` : ""}`).join("\n");
         await reply(`${response.title}\n${text}`);
         break;
       }
       case "confirm": {
         const card = {
           type: "AdaptiveCard",
-          version: "1.4",
+          version: "1.2",
           body: [{ type: "TextBlock", text: response.question, wrap: true }],
           actions: [
-            { type: "Action.Execute" as const, title: "Yes", data: { verb: `cmd:${response.onYes}` } },
-            { type: "Action.Execute" as const, title: "No", data: { verb: "cmd:noop" } },
+            { type: "Action.Submit", title: "Yes", data: { verb: `cmd:${response.onYes}` } },
+            { type: "Action.Submit", title: "No", data: { verb: "cmd:noop" } },
           ],
         };
-        await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card)] } as any);
+        await sendCard(context, card);
         break;
       }
       case "silent":
         break;
       default:
-        await reply(`⚠️ Unexpected response type: ${(response as any).type ?? "unknown"}`);
+        await reply(`⚠️ Unexpected response type: ${(response as Record<string, unknown>).type ?? "unknown"}`);
     }
   }
 
@@ -416,11 +643,31 @@ export class TeamsAdapter extends MessagingAdapter {
     try {
       const { session, ready } = await spawnAssistant(this.core, threadId);
       this.assistantSession = session;
+
+      // Safety timeout: if ready never resolves, clear the initializing flag after 60s
+      const timeout = setTimeout(() => {
+        if (this.assistantInitializing) {
+          log.warn("[TeamsAdapter] Assistant ready timeout — clearing initializing flag");
+          this.assistantInitializing = false;
+          this._assistantInitBuffer.splice(0); // discard stale buffered messages
+        }
+      }, 60_000);
+      if (timeout.unref) timeout.unref();
+
       ready.finally(() => {
+        clearTimeout(timeout);
         this.assistantInitializing = false;
+        // Replay any messages buffered during initialization
+        const buffered = this._assistantInitBuffer.splice(0);
+        for (const { sessionId: sid, content: msg } of buffered) {
+          this.sendMessage(sid, msg).catch((err) => {
+            log.warn({ err, sessionId: sid }, "[TeamsAdapter] Failed to replay buffered assistant message");
+          });
+        }
       });
     } catch (err) {
       this.assistantInitializing = false;
+      this._assistantInitBuffer.splice(0);
       log.error({ err }, "[TeamsAdapter] Failed to spawn assistant");
     }
   }
@@ -439,12 +686,90 @@ export class TeamsAdapter extends MessagingAdapter {
     await this.respawnAssistant();
   }
 
-  // ─── Helper: resolve context ─────────────────────────────────────────────
+  // ─── Bot token for proactive messaging ────────────────────────────────────
 
-  private async getContext(sessionId: string): Promise<TurnContext | null> {
-    const ctx = this._sessionContexts.get(sessionId);
-    return ctx?.context ?? null;
+  /**
+   * Acquire a bot framework token for proactive messaging via the MSA/AAD endpoint.
+   * Required when posting to the Bot Connector REST API outside of a turn context.
+   */
+  private async acquireBotToken(): Promise<string | null> {
+    if (this._botTokenCache && Date.now() < this._botTokenCache.expiresAt - 60_000) {
+      return this._botTokenCache.token;
+    }
+
+    const appId = this.teamsConfig.botAppId;
+    const appPassword = this.teamsConfig.botAppPassword;
+    if (!appId || !appPassword) return null;
+
+    try {
+      // Use configured tenantId for single-tenant bots; fall back to botframework.com for multi-tenant
+      const tenantForToken = this.teamsConfig.tenantId || "botframework.com";
+      const response = await fetch(`https://login.microsoftonline.com/${tenantForToken}/oauth2/v2.0/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "client_credentials",
+          client_id: appId,
+          client_secret: appPassword,
+          scope: "https://api.botframework.com/.default",
+        }).toString(),
+      });
+
+      if (!response.ok) {
+        log.warn({ status: response.status }, "[TeamsAdapter] Bot token acquisition failed");
+        return null;
+      }
+
+      const data = (await response.json()) as { access_token: string; expires_in: number };
+      this._botTokenCache = {
+        token: data.access_token,
+        expiresAt: Date.now() + data.expires_in * 1000,
+      };
+      return data.access_token;
+    } catch (err) {
+      log.warn({ err }, "[TeamsAdapter] Bot token acquisition error");
+      return null;
+    }
   }
+
+  // ─── Retry helper — matches Telegram's retryWithBackoff and 429 handling ──
+
+  /**
+   * Send a Teams activity with exponential backoff retry on transient failures.
+   * Handles HTTP 429 (rate limited), 502, 504 per Microsoft best practices.
+   */
+  private async sendActivityWithRetry(
+    context: TurnContext,
+    activity: Record<string, unknown>,
+  ): Promise<unknown> {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await sendActivity(context, activity);
+      } catch (err: unknown) {
+        const statusCode = (err as { statusCode?: number })?.statusCode;
+        // Teams docs require retrying 412, 429, 502, and 504
+        const isRetryable = statusCode === 412 || statusCode === 429 || statusCode === 502 || statusCode === 504;
+
+        if (!isRetryable || attempt === MAX_RETRIES) throw err;
+
+        // Parse Retry-After header if available, otherwise use exponential backoff + jitter
+        const retryAfterRaw = (err as { headers?: Record<string, string> })?.headers?.["retry-after"];
+        const retryAfterSec = retryAfterRaw ? parseInt(retryAfterRaw, 10) : NaN;
+        const delayMs = !isNaN(retryAfterSec) && retryAfterSec > 0
+          ? retryAfterSec * 1000
+          : BASE_RETRY_DELAY * Math.pow(2, attempt) + Math.random() * 500;
+
+        log.warn(
+          { statusCode, attempt: attempt + 1, delayMs },
+          "[TeamsAdapter] Rate limited or transient error, retrying",
+        );
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+    throw new Error("unreachable");
+  }
+
+  // ─── Helper: resolve context ─────────────────────────────────────────────
 
   private resolveMode(sessionId: string): OutputMode {
     // Check session-level override
@@ -474,39 +799,85 @@ export class TeamsAdapter extends MessagingAdapter {
     return "medium";
   }
 
-  private getSessionContext(sessionId: string): { context: TurnContext; isAssistant: boolean } {
-    const ctx = this._sessionContexts.get(sessionId);
-    if (!ctx) {
-      throw new Error(`No context stored for session ${sessionId}`);
-    }
-    return ctx;
-  }
-
   // ─── sendMessage ─────────────────────────────────────────────────────────
 
+  /**
+   * Primary outbound dispatch — routes agent messages to Teams.
+   *
+   * Wraps the base class `sendMessage` in a per-session promise chain (_dispatchQueues)
+   * so concurrent events fired from SessionBridge are serialized and delivered in order,
+   * preventing fast handlers from overtaking slower ones (matches Telegram pattern).
+   *
+   * Context is NOT deleted after dispatch — it persists from the inbound message handler
+   * and is available for the entire session lifetime, avoiding the race condition where
+   * async handlers lose their context mid-execution.
+   */
   async sendMessage(sessionId: string, content: OutgoingMessage): Promise<void> {
+    // Buffer messages during assistant initialization instead of dropping them
     if (
       this.assistantInitializing &&
       this.assistantSession &&
       sessionId === this.assistantSession.id
     ) {
+      this._assistantInitBuffer.push({ sessionId, content });
       return;
     }
 
-    const context = await this.getContext(sessionId);
-    if (!context) return;
-
-    const isAssistant = this.assistantSession != null && sessionId === this.assistantSession.id;
-
-    this._sessionContexts.set(sessionId, { context, isAssistant });
-
-    try {
-      await super.sendMessage(sessionId, content);
-    } finally {
-      // Give nested async handlers time to complete before deleting context
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      this._sessionContexts.delete(sessionId);
+    // Look up context by sessionId first, then by threadId (for newly-created sessions
+    // where context was stored under threadId before the session existed).
+    // Multiple fallback paths ensure the first response to a new session is not dropped.
+    let ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) {
+      // Try in-memory session's threadId
+      const session = this.core.sessionManager.getSession(sessionId);
+      const threadId = session?.threadId;
+      if (threadId) {
+        ctx = this._sessionContexts.get(threadId);
+      }
+      // Try stored session record's threadId (covers async session creation)
+      if (!ctx) {
+        const record = this.core.sessionManager.getSessionRecord(sessionId);
+        const recordThreadId = (record?.platform as Record<string, unknown>)?.threadId as string | undefined;
+        if (recordThreadId) {
+          ctx = this._sessionContexts.get(recordThreadId);
+        }
+      }
+      // Promote to sessionId key for future lookups
+      if (ctx) this._sessionContexts.set(sessionId, ctx);
     }
+    if (!ctx) {
+      // No live TurnContext — for terminal events (error, session_end), attempt
+      // proactive delivery so the user isn't left without feedback
+      if (content.type === "error" || content.type === "session_end") {
+        log.warn({ sessionId, type: content.type }, "[TeamsAdapter] sendMessage: no context, attempting proactive delivery");
+        const text = content.type === "error"
+          ? `❌ **Error:** ${content.text}`
+          : "✅ **Done**";
+        await this.sendNotification({
+          sessionId,
+          type: content.type === "error" ? "error" : "completed",
+          summary: text,
+        });
+      } else {
+        log.warn({ sessionId, type: content.type }, "[TeamsAdapter] sendMessage: no context for session, skipping");
+      }
+      return;
+    }
+
+    // Serialize dispatch per session to preserve event ordering.
+    // Read + write the queue entry atomically (synchronous) so concurrent callers
+    // always chain on the latest promise, preventing parallel execution.
+    const prev = this._dispatchQueues.get(sessionId) ?? Promise.resolve();
+    const next = prev.then(async () => {
+      try {
+        await super.sendMessage(sessionId, content);
+      } catch (err) {
+        log.warn({ err, sessionId, type: content.type }, "[TeamsAdapter] Dispatch error");
+      }
+    });
+    // Set immediately — before any await — so the next concurrent caller sees this entry
+    this._dispatchQueues.set(sessionId, next);
+    await next;
   }
 
   // ─── Handler overrides ───────────────────────────────────────────────────
@@ -518,163 +889,141 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleText(sessionId: string, content: OutgoingMessage): Promise<void> {
-    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
-    try {
-      ctx = this.getSessionContext(sessionId);
-    } catch (err) {
-      log.warn({ err, sessionId }, "[TeamsAdapter] handleText: no session context");
-      return;
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
     const { context } = ctx;
     const draft = this.draftManager.getOrCreate(sessionId, context);
     draft.append(content.text);
-    this.draftManager.appendText(sessionId, content.text);
   }
 
   protected async handleToolCall(sessionId: string, content: OutgoingMessage, verbosity: DisplayVerbosity): Promise<void> {
-    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
-    try {
-      ctx = this.getSessionContext(sessionId);
-    } catch (err) {
-      log.warn({ err, sessionId }, "[TeamsAdapter] handleToolCall: no session context");
-      return;
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
     try {
       const rendered = this.renderer.renderToolCall(content, verbosity);
-      await context.sendActivity({ text: rendered.body } as any);
+      await this.sendActivityWithRetry(context, { text: rendered.body });
     } catch (err) {
       log.error({ err, sessionId }, "[TeamsAdapter] handleToolCall: sendActivity failed");
     }
   }
 
-  protected async handleToolUpdate(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    // Tool updates rendered in plan/usage cards — no separate handling needed
-    void sessionId;
-    void content;
+  protected async handleToolUpdate(sessionId: string, content: OutgoingMessage, verbosity: DisplayVerbosity): Promise<void> {
+    // Only render tool updates in high verbosity mode (matches Telegram's tracker behavior)
+    if (verbosity !== "high") return;
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
+    const { context } = ctx;
+    try {
+      const rendered = this.renderer.renderToolUpdate(content, verbosity);
+      await this.sendActivityWithRetry(context, { text: rendered.body });
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handleToolUpdate: sendActivity failed");
+    }
   }
 
   protected async handlePlan(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
-    try {
-      ctx = this.getSessionContext(sessionId);
-    } catch (err) {
-      log.warn({ err, sessionId }, "[TeamsAdapter] handlePlan: no session context");
-      return;
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
     const { context } = ctx;
     const entries = (content.metadata as { entries?: PlanEntry[] })?.entries ?? [];
     const mode = this.resolveMode(sessionId);
-    const { formatPlan } = await import("./formatting.js");
     const text = formatPlan(entries, mode);
     const card = {
       type: "AdaptiveCard" as const,
-      version: "1.4" as const,
+      version: "1.2" as const,
       body: [{ type: "TextBlock" as const, text, wrap: true }],
     };
     try {
-      await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card as any)] } as any);
+      await this.sendActivityWithRetry(context, { attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)] });
     } catch (err) {
       log.error({ err, sessionId }, "[TeamsAdapter] handlePlan: sendActivity failed");
     }
   }
 
   protected async handleUsage(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
-    try {
-      ctx = this.getSessionContext(sessionId);
-    } catch (err) {
-      log.warn({ err, sessionId }, "[TeamsAdapter] handleUsage: no session context");
-      return;
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
     const meta = content.metadata as { tokensUsed?: number; contextSize?: number; cost?: number; duration?: number } | undefined;
     const mode = this.resolveMode(sessionId);
-    const { renderUsageCard } = await import("./formatting.js");
     const { body } = renderUsageCard(meta ?? {}, mode);
-    const card = { type: "AdaptiveCard" as const, version: "1.4" as const, body };
+    const card = { type: "AdaptiveCard" as const, version: "1.2" as const, body };
     try {
-      await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card as any)] } as any);
+      await this.sendActivityWithRetry(context, { attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)] });
     } catch (err) {
       log.error({ err, sessionId }, "[TeamsAdapter] handleUsage: sendActivity failed");
     }
 
+    // Notify completion in notification channel (matches Telegram's notification pattern)
     if (this.notificationChannelId && sessionId !== this.assistantSession?.id) {
       const sess = this.core.sessionManager.getSession(sessionId);
       const name = sess?.name || "Session";
-      try {
-        await context.sendActivity({ text: `✅ **${name}** — Task completed.` } as any);
-      } catch { /* best effort */ }
+      void this.sendNotification({
+        sessionId,
+        sessionName: name,
+        type: "completed",
+        summary: "Task completed",
+      });
     }
   }
 
   protected async handleSessionEnd(sessionId: string, _content: OutgoingMessage): Promise<void> {
-    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
-    try {
-      ctx = this.getSessionContext(sessionId);
-    } catch (err) {
-      log.warn({ err, sessionId }, "[TeamsAdapter] handleSessionEnd: no session context");
-      return;
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
     this.draftManager.cleanup(sessionId);
     this._sessionOutputModes.delete(sessionId);
+    this._dispatchQueues.delete(sessionId);
     try {
-      await context.sendActivity({ text: "✅ **Done**" } as any);
+      await this.sendActivityWithRetry(context, { text: "✅ **Done**" });
     } catch { /* best effort */ }
   }
 
   protected async handleError(sessionId: string, content: OutgoingMessage): Promise<void> {
-    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
-    try {
-      ctx = this.getSessionContext(sessionId);
-    } catch (err) {
-      log.warn({ err, sessionId }, "[TeamsAdapter] handleError: no session context");
-      return;
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
     this.draftManager.cleanup(sessionId);
     try {
-      await context.sendActivity({ text: `❌ **Error:** ${content.text}` } as any);
+      await this.sendActivityWithRetry(context, { text: `❌ **Error:** ${content.text}` });
     } catch { /* best effort */ }
   }
 
   protected async handleAttachment(sessionId: string, content: OutgoingMessage): Promise<void> {
     if (!content.attachment) return;
     const { attachment } = content;
-    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
-    try {
-      ctx = this.getSessionContext(sessionId);
-    } catch (err) {
-      log.warn({ err, sessionId }, "[TeamsAdapter] handleAttachment: no session context");
-      return;
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
 
     if (isAttachmentTooLarge(attachment.size)) {
       log.warn({ sessionId, fileName: attachment.fileName, size: attachment.size }, "[TeamsAdapter] File too large");
       try {
-        await context.sendActivity({
+        await this.sendActivityWithRetry(context, {
           text: `⚠️ File too large to send (${Math.round(attachment.size / 1024 / 1024)}MB): ${attachment.fileName}`,
-        } as any);
+        });
       } catch { /* best effort */ }
       return;
     }
 
     try {
-      // Show file card — actual serving requires Graph API upload to SharePoint/OneDrive
-      const card = buildFileAttachmentCard(
+      // Upload to OneDrive via Graph API if available, get a sharing URL
+      const shareUrl = await uploadFileViaGraph(
+        this.graphClient,
+        sessionId,
+        attachment.filePath,
         attachment.fileName,
-        attachment.size,
-        `file://${attachment.filePath}`,
         attachment.mimeType,
       );
-      await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card as any)] } as any);
+
+      const card = buildFileAttachmentCard(attachment.fileName, attachment.size, attachment.mimeType, shareUrl ?? undefined);
+      await this.sendActivityWithRetry(context, { attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)] });
 
       if (attachment.type === "audio") {
         const draft = this.draftManager.getDraft(sessionId);
@@ -690,16 +1039,11 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleSystem(sessionId: string, content: OutgoingMessage): Promise<void> {
-    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
-    try {
-      ctx = this.getSessionContext(sessionId);
-    } catch (err) {
-      log.warn({ err, sessionId }, "[TeamsAdapter] handleSystem: no session context");
-      return;
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
     const { context } = ctx;
     try {
-      await context.sendActivity({ text: content.text } as any);
+      await this.sendActivityWithRetry(context, { text: content.text });
     } catch { /* best effort */ }
   }
 
@@ -711,9 +1055,12 @@ export class TeamsAdapter extends MessagingAdapter {
       log.warn({ sessionId }, "[TeamsAdapter] sendPermissionRequest: session not found");
       return;
     }
-    const context = await this.getContext(sessionId);
-    if (!context) return;
-    await this.permissionHandler.sendPermissionRequest(session, request, context);
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) {
+      log.warn({ sessionId }, "[TeamsAdapter] sendPermissionRequest: no context");
+      return;
+    }
+    await this.permissionHandler.sendPermissionRequest(session, request, ctx.context);
   }
 
   // ─── sendNotification ──────────────────────────────────────────────────
@@ -730,27 +1077,129 @@ export class TeamsAdapter extends MessagingAdapter {
       text += `\n${notification.deepLink}`;
     }
 
-    // Route to notification thread if we have context for it
+    // Route to notification thread if we have a live context
     if (this.notificationContext && this.notificationChannelId) {
       try {
-        await this.notificationContext.sendActivity(text as any);
+        await sendText(this.notificationContext, text);
         return;
       } catch (err) {
-        log.warn({ err, type: notification.type, sessionName: notification.sessionName }, "[TeamsAdapter] Failed to send notification to channel");
+        log.warn({ err, type: notification.type }, "[TeamsAdapter] Failed to send notification via live context, trying proactive");
       }
     }
 
-    log.debug({ type: notification.type, sessionName: notification.sessionName, text }, "[TeamsAdapter] sendNotification: no notificationContext configured, skipping");
+    // Fallback: proactive messaging via stored conversation reference + bot token
+    if (this.notificationChannelId) {
+      const ref = this.conversationStore.get(this.notificationChannelId) ?? this.conversationStore.getAny();
+      if (ref) {
+        try {
+          const botToken = await this.acquireBotToken();
+          if (botToken) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 10_000);
+            try {
+              const response = await fetch(`${ref.serviceUrl}/v3/conversations/${ref.conversationId}/activities`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${botToken}`,
+                },
+                body: JSON.stringify({
+                  type: "message",
+                  text,
+                  from: { id: ref.botId, name: ref.botName },
+                }),
+                signal: controller.signal,
+              });
+              if (response.ok) return;
+              log.warn({ status: response.status }, "[TeamsAdapter] Proactive notification failed");
+            } finally {
+              clearTimeout(timeout);
+            }
+          }
+        } catch (err) {
+          log.warn({ err }, "[TeamsAdapter] Proactive notification error");
+        }
+      }
+    }
+
+    // Session-specific context fallback
+    if (notification.sessionId) {
+      const ctx = this._sessionContexts.get(notification.sessionId);
+      if (ctx) {
+        try {
+          await sendText(ctx.context, text);
+          return;
+        } catch { /* best effort */ }
+      }
+    }
+
+    log.debug({ type: notification.type, sessionName: notification.sessionName }, "[TeamsAdapter] sendNotification: no delivery path available");
   }
 
   // ─── createSessionThread ─────────────────────────────────────────────────
 
+  /**
+   * Create a new conversation thread for a session.
+   *
+   * Attempts to create a real Teams channel conversation via the Bot Framework
+   * connector API. If that fails (e.g., missing permissions, no stored conversation
+   * reference), falls back to using the existing conversation ID as thread context.
+   */
   async createSessionThread(sessionId: string, name: string): Promise<string> {
-    const threadId = `thread-${sessionId}-${Date.now()}`;
-    const session = this.core.sessionManager.getSession(sessionId);
-    if (session) {
-      session.threadId = threadId;
+    // Try to create a real Teams conversation thread
+    const ref = this.conversationStore.getAny();
+    if (ref) {
+      try {
+        const botToken = await this.acquireBotToken();
+        if (!botToken) throw new Error("No bot token available");
+        const createUrl = `${ref.serviceUrl}/v3/conversations`;
+        const response = await fetch(createUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${botToken}` },
+          body: JSON.stringify({
+            isGroup: false,
+            bot: { id: ref.botId, name: ref.botName },
+            tenantId: ref.tenantId,
+            activity: {
+              type: "message",
+              text: `**${name}** — New session started`,
+            },
+            channelData: {
+              channel: { id: this.teamsConfig.channelId },
+              tenant: { id: ref.tenantId },
+            },
+          }),
+        });
+
+        if (response.ok) {
+          const data = (await response.json()) as { id: string };
+          const threadId = data.id;
+
+          const session = this.core.sessionManager.getSession(sessionId);
+          if (session) session.threadId = threadId;
+
+          const record = this.core.sessionManager.getSessionRecord(sessionId);
+          if (record) {
+            await this.core.sessionManager.patchRecord(sessionId, {
+              platform: { ...record.platform, threadId },
+            });
+          }
+
+          log.info({ sessionId, threadId, name }, "[TeamsAdapter] Created real Teams conversation thread");
+          return threadId;
+        }
+
+        log.warn({ status: response.status }, "[TeamsAdapter] createConversation failed, using fallback");
+      } catch (err) {
+        log.warn({ err }, "[TeamsAdapter] createConversation error, using fallback");
+      }
     }
+
+    // Fallback: use the configured channel as the conversation context
+    const threadId = this.teamsConfig.channelId || `teams-${sessionId}-${Date.now()}`;
+    const session = this.core.sessionManager.getSession(sessionId);
+    if (session) session.threadId = threadId;
+
     const record = this.core.sessionManager.getSessionRecord(sessionId);
     if (record) {
       await this.core.sessionManager.patchRecord(sessionId, {

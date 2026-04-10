@@ -29,29 +29,66 @@ export function truncateContent(text: string, max: number): string {
   return text.slice(0, max - suffix.length) + suffix;
 }
 
+/**
+ * Split text into chunks that fit within maxLength, preferring paragraph
+ * and line boundaries. Handles single lines longer than maxLength by
+ * hard-splitting at the limit.
+ */
 export function splitMessage(text: string, maxLength: number): string[] {
   if (text.length <= maxLength) return [text];
   const paragraphs = text.split("\n\n");
   const chunks: string[] = [];
   let current = "";
+
+  const pushCurrent = () => {
+    if (current) {
+      chunks.push(current);
+      current = "";
+    }
+  };
+
+  // Hard-split a single string that exceeds maxLength
+  const hardSplit = (s: string) => {
+    while (s.length > maxLength) {
+      chunks.push(s.slice(0, maxLength));
+      s = s.slice(maxLength);
+    }
+    return s; // remainder
+  };
+
   for (const para of paragraphs) {
     const candidate = current ? `${current}\n\n${para}` : para;
-    if (candidate.length > maxLength && current) {
-      chunks.push(current);
-      current = para.length > maxLength ? para.slice(0, maxLength) : para;
-    } else if (candidate.length > maxLength) {
-      const lines = para.split("\n");
-      for (const line of lines) {
-        const lineCandidate = current ? `${current}\n${line}` : line;
-        if (lineCandidate.length > maxLength && current) {
-          chunks.push(current);
-          current = line;
-        } else {
-          current = lineCandidate;
-        }
-      }
-    } else {
+
+    if (candidate.length <= maxLength) {
       current = candidate;
+      continue;
+    }
+
+    // Candidate exceeds limit — flush current and process para separately
+    pushCurrent();
+
+    if (para.length <= maxLength) {
+      current = para;
+      continue;
+    }
+
+    // Para exceeds limit — try splitting on line boundaries
+    const lines = para.split("\n");
+    for (const line of lines) {
+      if (line.length > maxLength) {
+        // Line itself exceeds limit — hard-split it
+        pushCurrent();
+        current = hardSplit(line);
+        continue;
+      }
+
+      const lineCandidate = current ? `${current}\n${line}` : line;
+      if (lineCandidate.length > maxLength) {
+        pushCurrent();
+        current = line;
+      } else {
+        current = lineCandidate;
+      }
     }
   }
   if (current) chunks.push(current);

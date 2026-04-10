@@ -1,8 +1,8 @@
-import { CardFactory } from "@microsoft/agents-hosting";
 import type { TurnContext } from "@microsoft/agents-hosting";
 import { nanoid } from "nanoid";
 import type { PermissionRequest, NotificationMessage, Session } from "@openacp/plugin-sdk";
 import { log } from "@openacp/plugin-sdk";
+import { sendCard, sendText, updateActivity, adaptiveCardAttachment } from "./send-utils.js";
 
 interface PendingPermission {
   sessionId: string;
@@ -50,9 +50,11 @@ export class PermissionHandler {
     });
     this.pendingTimestamps.set(callbackKey, Date.now());
 
+    // Use Adaptive Card v1.2 + Action.Submit for Teams mobile compatibility
+    // (Teams mobile only reliably supports schema ≤1.2; Action.Execute requires 1.4)
     const card = {
       type: "AdaptiveCard" as const,
-      version: "1.4" as const,
+      version: "1.2" as const,
       body: [
         {
           type: "TextBlock" as const,
@@ -68,18 +70,17 @@ export class PermissionHandler {
           spacing: "Medium" as const,
         },
       ],
+      // Action.Submit sends activity.value as the flat data object directly
       actions: request.options.map((option) => ({
-        type: "Action.Execute" as const,
+        type: "Action.Submit" as const,
         title: `${option.isAllow ? "✅" : "❌"} ${option.label}`,
         data: { verb: option.isAllow ? "allow" : "deny", sessionId: session.id, callbackKey, requestId: request.id },
       })),
     };
 
     try {
-      const result = await context.sendActivity({
-        attachments: [CardFactory.adaptiveCard(card as any)],
-      } as any);
-      const activityId = (result as { id?: string }).id;
+      const result = await sendCard(context, card as Record<string, unknown>);
+      const activityId = (result as { id?: string })?.id;
       const pendingEntry = this.pending.get(callbackKey);
       if (pendingEntry && activityId) {
         pendingEntry.activityId = activityId;
@@ -110,7 +111,7 @@ export class PermissionHandler {
     const pending = this.pending.get(callbackKey);
     if (!pending) {
       try {
-        await context.sendActivity({ text: "❌ Permission request expired" } as any);
+        await sendText(context, "❌ Permission request expired");
       } catch (err) {
         log.warn({ err, callbackKey }, "[PermissionHandler] Failed to send expired message");
       }
@@ -122,19 +123,23 @@ export class PermissionHandler {
     log.info({ requestId: pending.requestId, verb, sessionId }, "[PermissionHandler] Permission responded");
 
     if (session?.permissionGate?.requestId === pending.requestId) {
-      const option = verb === "allow" || verb === "always"
-        ? pending.options.find((o) => o.isAllow)
-        : pending.options.find((o) => !o.isAllow);
-      session.permissionGate.resolve(option?.id ?? "");
+      const wantAllow = verb === "allow" || verb === "always";
+      const option = pending.options.find((o) => o.isAllow === wantAllow);
+      if (option) {
+        session.permissionGate.resolve(option.id);
+      } else {
+        // Fallback: resolve with the first option matching intent, or the first option
+        const fallback = pending.options[wantAllow ? 0 : pending.options.length - 1];
+        log.warn({ requestId: pending.requestId, verb, optionCount: pending.options.length }, "[PermissionHandler] No matching option for verb, using fallback");
+        session.permissionGate.resolve(fallback?.id ?? pending.options[0]?.id ?? "denied");
+      }
     }
 
     this.pending.delete(callbackKey);
     this.pendingTimestamps.delete(callbackKey);
 
     try {
-      await context.sendActivity({
-        text: `✅ Permission ${verb === "always" ? "always-allowed" : verb === "allow" ? "Allowed" : "Denied"}`,
-      } as any);
+      await sendText(context, `✅ Permission ${verb === "always" ? "always-allowed" : verb === "allow" ? "Allowed" : "Denied"}`);
     } catch (err) {
       log.warn({ err, callbackKey }, "[PermissionHandler] Failed to send response message");
     }
@@ -143,18 +148,18 @@ export class PermissionHandler {
       try {
         const updatedCard = {
           type: "AdaptiveCard" as const,
-          version: "1.4" as const,
+          version: "1.2" as const,
           body: [
             { type: "TextBlock" as const, text: "🔐 Permission Request — Responded", weight: "Bolder" as const, isSubtle: true },
             { type: "TextBlock" as const, text: `✅ ${verb === "always" ? "Always Allowed" : verb === "allow" ? "Allowed" : "Denied"}`, wrap: true },
           ],
           actions: [] as unknown[],
         };
-        await context.updateActivity({
+        await updateActivity(context, {
           id: pending.activityId,
           conversation: { id: pending.conversationId },
-          attachments: [CardFactory.adaptiveCard(updatedCard as any)],
-        } as any);
+          attachments: [adaptiveCardAttachment(updatedCard as Record<string, unknown>)],
+        });
       } catch { /* ignore */ }
     }
 
