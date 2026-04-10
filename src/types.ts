@@ -1,6 +1,6 @@
-import type { ChannelConfig } from "@openacp/plugin-sdk";
+import type { IChannelAdapter } from "@openacp/plugin-sdk";
 
-export interface TeamsChannelConfig extends ChannelConfig {
+export interface TeamsChannelConfig extends Partial<IChannelAdapter> {
   enabled: boolean;
   botAppId: string;
   botAppPassword: string;

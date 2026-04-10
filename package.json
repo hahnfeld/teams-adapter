@@ -21,12 +21,10 @@
     "@openacp/plugin-sdk": ">=2026.0.0"
   },
   "dependencies": {
-    "@microsoft/teams.apps": "^2.0.0",
-    "@microsoft/teams.botbuilder": "^2.0.0",
-    "@microsoft/teams.cards": "^2.0.0",
-    "@microsoft/teams.api": "^2.0.0",
     "@microsoft/agents-hosting": "^1.4.0",
     "@microsoft/agents-hosting-express": "^1.4.0",
+    "@microsoft/teams.apps": "^2.0.0",
+    "@microsoft/teams.botbuilder": "^2.0.0",
     "adaptivecards-templating": "^2.3.1"
   },
   "devDependencies": {

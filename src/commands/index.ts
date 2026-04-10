@@ -1,10 +1,10 @@
-import type { TurnContext } from "@microsoft/teams.botbuilder";
+import type { TurnContext } from "@microsoft/agents-hosting";
 import { log } from "@openacp/plugin-sdk";
 import type { TeamsAdapter } from "../adapter.js";
 
 import { handleNew, handleNewChat } from "./new-session.js";
 import { handleCancel, handleStatus, handleSessions, handleHandoff } from "./session.js";
-import { handleBypass, handleTTS, handleRestart, handleUpdate, handleOutputMode } from "./admin.js";
+import { handleBypass, handleTTS, handleRestart, handleRespawn, handleUpdate, handleOutputMode } from "./admin.js";
 import { handleMenu, handleHelp, handleClear } from "./menu.js";
 import { handleAgents, handleInstall } from "./agents.js";
 import { handleDoctor } from "./doctor.js";
@@ -34,6 +34,7 @@ export const SLASH_COMMANDS = [
   { command: "integrate", description: "Manage agent integrations" },
   { command: "handoff", description: "Generate terminal resume command" },
   { command: "restart", description: "Restart OpenACP" },
+  { command: "respawn", description: "Restart the assistant session" },
   { command: "update", description: "Update to latest version" },
   { command: "doctor", description: "Run system diagnostics" },
   { command: "tts", description: "Toggle Text to Speech" },
@@ -65,7 +66,7 @@ export async function handleCommand(
     userId,
     sessionId,
     reply: async (content: string) => {
-      await context.sendActivity({ text: content });
+      await context.sendActivity(content as any);
     },
   };
 
@@ -103,6 +104,9 @@ export async function handleCommand(
         break;
       case "restart":
         await handleRestart(ctx);
+        break;
+      case "respawn":
+        await handleRespawn(ctx);
         break;
       case "update":
         await handleUpdate(ctx);
@@ -147,7 +151,7 @@ export async function handleCommand(
     log.error({ err, commandName }, "[teams-router] Command handler failed");
     const errMsg = `❌ Command failed: ${err instanceof Error ? err.message : String(err)}`;
     try {
-      await context.sendActivity({ text: errMsg });
+      await context.sendActivity(errMsg as any);
     } catch { /* ignore */ }
   }
 }
@@ -156,19 +160,20 @@ export async function setupCardActionCallbacks(
   context: TurnContext,
   adapter: TeamsAdapter,
 ): Promise<void> {
-  const action = context.activity.value?.action;
+  const value = context.activity.value as { action?: { verb?: string; data?: Record<string, unknown> } } | undefined;
+  const action = value?.action;
   if (!action) return;
 
   const verb = action.verb as string;
-  const data = action.data ?? {};
+  const data = (action.data ?? {}) as Record<string, unknown>;
 
   const ctx: CommandContext = {
     context,
     adapter,
     userId: context.activity.from?.id ?? "unknown",
-    sessionId: data.sessionId ?? null,
+    sessionId: (data.sessionId as string | undefined) ?? null,
     reply: async (content: string) => {
-      await context.sendActivity({ text });
+      await context.sendActivity(content as any);
     },
   };
 
@@ -191,6 +196,9 @@ export async function setupCardActionCallbacks(
           break;
         case "status":
           await handleStatus(ctx);
+          break;
+        case "noop":
+          // No-op for cancel dialog negative button
           break;
         default:
           await ctx.reply(`Command not yet implemented: ${command}`);

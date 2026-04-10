@@ -1,5 +1,5 @@
-import { CardFactory } from "@microsoft/teams.cards";
-import type { TurnContext } from "@microsoft/teams.botbuilder";
+import { CardFactory } from "@microsoft/agents-hosting";
+import type { TurnContext } from "@microsoft/agents-hosting";
 import { nanoid } from "nanoid";
 import type { PermissionRequest, NotificationMessage, Session } from "@openacp/plugin-sdk";
 import { log } from "@openacp/plugin-sdk";
@@ -14,39 +14,55 @@ interface PendingPermission {
 
 export class PermissionHandler {
   private pending: Map<string, PendingPermission> = new Map();
+  private pendingTimestamps: Map<string, number> = new Map();
 
   constructor(
     private getSession: (sessionId: string) => Session | undefined,
     private sendNotification: (notification: NotificationMessage) => Promise<void>,
   ) {}
 
+  private evictStale(): void {
+    const MAX_PENDING = 100;
+    if (this.pending.size < MAX_PENDING) return;
+    const now = Date.now();
+    const staleThreshold = 10 * 60 * 1000; // 10 minutes
+    for (const [key, ts] of this.pendingTimestamps) {
+      if (now - ts > staleThreshold) {
+        this.pending.delete(key);
+        this.pendingTimestamps.delete(key);
+      }
+    }
+  }
+
   async sendPermissionRequest(
     session: Session,
     request: PermissionRequest,
     context: TurnContext,
   ): Promise<void> {
+    this.evictStale();
     const callbackKey = nanoid(8);
     this.pending.set(callbackKey, {
       sessionId: session.id,
       requestId: request.id,
       options: request.options.map((o) => ({ id: o.id, isAllow: o.isAllow })),
-      activityId: context.activity.id,
-      conversationId: context.activity.conversation?.id,
+      activityId: context.activity.id as string | undefined,
+      conversationId: context.activity.conversation?.id as string | undefined,
     });
+    this.pendingTimestamps.set(callbackKey, Date.now());
 
     const card = {
       type: "AdaptiveCard" as const,
       version: "1.4" as const,
       body: [
         {
-          type: "TextBlock",
+          type: "TextBlock" as const,
           text: "🔐 Permission Request",
           weight: "Bolder" as const,
           color: "Warning" as const,
           size: "Medium" as const,
         },
         {
-          type: "TextBlock",
+          type: "TextBlock" as const,
           text: request.description,
           wrap: true,
           spacing: "Medium" as const,
@@ -61,13 +77,13 @@ export class PermissionHandler {
 
     try {
       const result = await context.sendActivity({
-        attachments: [CardFactory.adaptiveCard(card)],
-      });
+        attachments: [CardFactory.adaptiveCard(card as any)],
+      } as any);
       const activityId = (result as { id?: string }).id;
       const pendingEntry = this.pending.get(callbackKey);
       if (pendingEntry && activityId) {
         pendingEntry.activityId = activityId;
-        pendingEntry.conversationId = context.activity.conversation?.id;
+        pendingEntry.conversationId = context.activity.conversation?.id as string | undefined;
       }
     } catch (err) {
       log.warn({ err, sessionId: session.id }, "[PermissionHandler] Failed to send permission request");
@@ -82,23 +98,28 @@ export class PermissionHandler {
     });
   }
 
-  async handleCardAction(context: TurnContext, verb: string, sessionId: string, callbackKey: string, requestId: string): Promise<boolean> {
+  async handleCardAction(
+    context: TurnContext,
+    verb: string,
+    sessionId: string,
+    callbackKey: string,
+    requestId: string,
+  ): Promise<boolean> {
     if (verb !== "allow" && verb !== "deny" && verb !== "always") return false;
 
     const pending = this.pending.get(callbackKey);
     if (!pending) {
       try {
-        await context.sendActivity({ text: "❌ Permission request expired" });
-      } catch { /* ignore */ }
+        await context.sendActivity({ text: "❌ Permission request expired" } as any);
+      } catch (err) {
+        log.warn({ err, callbackKey }, "[PermissionHandler] Failed to send expired message");
+      }
       return true;
     }
 
     const session = this.getSession(pending.sessionId);
 
-    log.info(
-      { requestId: pending.requestId, verb, sessionId },
-      "[PermissionHandler] Permission responded",
-    );
+    log.info({ requestId: pending.requestId, verb, sessionId }, "[PermissionHandler] Permission responded");
 
     if (session?.permissionGate?.requestId === pending.requestId) {
       const option = verb === "allow" || verb === "always"
@@ -108,37 +129,32 @@ export class PermissionHandler {
     }
 
     this.pending.delete(callbackKey);
+    this.pendingTimestamps.delete(callbackKey);
 
     try {
-      await context.sendActivity({ text: `✅ Permission ${verb === "always" ? "always-allowed" : verb}d` });
-    } catch { /* ignore */ }
+      await context.sendActivity({
+        text: `✅ Permission ${verb === "always" ? "always-allowed" : verb === "allow" ? "Allowed" : "Denied"}`,
+      } as any);
+    } catch (err) {
+      log.warn({ err, callbackKey }, "[PermissionHandler] Failed to send response message");
+    }
 
-    // Remove action buttons from the original card by editing it
     if (pending.activityId && pending.conversationId) {
       try {
         const updatedCard = {
           type: "AdaptiveCard" as const,
           version: "1.4" as const,
           body: [
-            {
-              type: "TextBlock",
-              text: "🔐 Permission Request — Responded",
-              weight: "Bolder" as const,
-              isSubtle: true,
-            },
-            {
-              type: "TextBlock",
-              text: `✅ ${verb === "always" ? "Always Allowed" : verb === "allow" ? "Allowed" : "Denied"}`,
-              wrap: true,
-            },
+            { type: "TextBlock" as const, text: "🔐 Permission Request — Responded", weight: "Bolder" as const, isSubtle: true },
+            { type: "TextBlock" as const, text: `✅ ${verb === "always" ? "Always Allowed" : verb === "allow" ? "Allowed" : "Denied"}`, wrap: true },
           ],
-          actions: [],
+          actions: [] as unknown[],
         };
         await context.updateActivity({
           id: pending.activityId,
           conversation: { id: pending.conversationId },
-          attachments: [CardFactory.adaptiveCard(updatedCard)],
-        });
+          attachments: [CardFactory.adaptiveCard(updatedCard as any)],
+        } as any);
       } catch { /* ignore */ }
     }
 

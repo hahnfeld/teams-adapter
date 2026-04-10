@@ -1,6 +1,6 @@
-import { TurnContext } from "@microsoft/teams.botbuilder";
+import type { TurnContext } from "@microsoft/agents-hosting";
+import { log } from "@openacp/plugin-sdk";
 import { splitMessage } from "./formatting.js";
-import type { SendQueue } from "@openacp/plugin-sdk";
 
 const FLUSH_INTERVAL = 5000;
 const MAX_DISPLAY_LENGTH = 1900;
@@ -10,10 +10,6 @@ export interface MessageRef {
   conversationId?: string;
 }
 
-/**
- * Teams-specific message draft that batches text updates and sends
- * them as a single Teams message, editing it in place via updateActivity().
- */
 export class TeamsMessageDraft {
   private buffer: string = "";
   private ref?: MessageRef;
@@ -22,10 +18,11 @@ export class TeamsMessageDraft {
   private lastSentBuffer: string = "";
   private displayTruncated = false;
   private firstFlushPending = false;
+  private finalizing = false;
 
   constructor(
     private context: TurnContext,
-    private sendQueue: SendQueue,
+    private sendQueue: { enqueue<T>(fn: () => Promise<T>, opts?: { type?: string }): Promise<T | undefined> },
     private sessionId: string,
   ) {}
 
@@ -43,9 +40,7 @@ export class TeamsMessageDraft {
     if (this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      this.flushPromise = this.flushPromise
-        .then(() => this.flush())
-        .catch(() => {});
+      this.flushPromise = this.flushPromise.then(() => this.flush()).catch(() => {});
     }, FLUSH_INTERVAL);
   }
 
@@ -68,14 +63,14 @@ export class TeamsMessageDraft {
       this.firstFlushPending = true;
       try {
         const result = await this.sendQueue.enqueue(
-          () => this.context.sendActivity({ text: content }),
+          () => this.context.sendActivity({ text: content } as any) as Promise<unknown>,
           { type: "other" },
         );
         if (result) {
           const activityId = (result as { id?: string }).id;
           this.ref = {
             activityId,
-            conversationId: this.context.activity.conversation?.id,
+            conversationId: this.context.activity.conversation?.id as string | undefined,
           };
           if (!truncated) {
             this.lastSentBuffer = snapshot;
@@ -84,8 +79,8 @@ export class TeamsMessageDraft {
             this.displayTruncated = true;
           }
         }
-      } catch {
-        // send failed — next flush will retry
+      } catch (err) {
+        log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] flush: sendActivity failed");
       } finally {
         this.firstFlushPending = false;
       }
@@ -95,11 +90,11 @@ export class TeamsMessageDraft {
       try {
         const result = await this.sendQueue.enqueue(
           () => this.context.updateActivity({
-            id: this.ref.activityId,
-            conversation: { id: this.ref.conversationId },
+            id: this.ref!.activityId,
+            conversation: { id: this.ref!.conversationId },
             text: content,
-          }),
-          { type: "text", key: this.sessionId },
+          } as any) as Promise<unknown>,
+          { type: "text" },
         );
         if (result !== undefined) {
           if (!truncated) {
@@ -109,8 +104,8 @@ export class TeamsMessageDraft {
             this.displayTruncated = true;
           }
         }
-      } catch {
-        // Don't reset ref — transient errors should not cause duplicate sends
+      } catch (err) {
+        log.warn({ err, sessionId: this.sessionId, activityId: this.ref?.activityId }, "[TeamsMessageDraft] flush: updateActivity failed");
       }
     }
   }
@@ -118,29 +113,46 @@ export class TeamsMessageDraft {
   async stripPattern(pattern: RegExp): Promise<void> {
     if (!this.ref?.activityId || !this.buffer) return;
 
-    const stripped = this.buffer.replace(pattern, "").trim();
-    if (stripped === this.buffer.trim()) return;
+    let stripped: string;
+    try {
+      stripped = this.buffer.replace(pattern, "").trim();
+    } catch (err) {
+      log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] stripPattern: replace failed");
+      return;
+    }
 
-    this.buffer = stripped;
-    this.lastSentBuffer = stripped;
+    if (stripped === this.buffer.trim()) return;
 
     if (!stripped) return;
 
     try {
       await this.sendQueue.enqueue(
         () => this.context.updateActivity({
-          id: this.ref.activityId,
-          conversation: { id: this.ref.conversationId },
+          id: this.ref!.activityId,
+          conversation: { id: this.ref!.conversationId },
           text: stripped,
-        }),
+        } as any) as Promise<unknown>,
         { type: "other" },
       );
-    } catch {
-      // Best effort — non-critical edit
+      // Only update state after successful send
+      this.buffer = stripped;
+      this.lastSentBuffer = stripped;
+    } catch (err) {
+      log.warn({ err, sessionId: this.sessionId, activityId: this.ref?.activityId }, "[TeamsMessageDraft] stripPattern: updateActivity failed");
     }
   }
 
   async finalize(): Promise<void> {
+    if (this.finalizing) return;
+    this.finalizing = true;
+    try {
+      await this._finalizeInner();
+    } finally {
+      this.finalizing = false;
+    }
+  }
+
+  private async _finalizeInner(): Promise<void> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
@@ -160,15 +172,15 @@ export class TeamsMessageDraft {
         if (this.ref?.activityId) {
           await this.sendQueue.enqueue(
             () => this.context.updateActivity({
-              id: this.ref.activityId,
-              conversation: { id: this.ref.conversationId },
+              id: this.ref!.activityId,
+              conversation: { id: this.ref!.conversationId },
               text: content,
-            }),
+            } as any) as Promise<unknown>,
             { type: "other" },
           );
         } else {
           await this.sendQueue.enqueue(
-            () => this.context.sendActivity({ text: content }),
+            () => this.context.sendActivity({ text: content } as any) as Promise<unknown>,
             { type: "other" },
           );
         }
@@ -186,42 +198,37 @@ export class TeamsMessageDraft {
         if (i === 0 && this.ref?.activityId) {
           await this.sendQueue.enqueue(
             () => this.context.updateActivity({
-              id: this.ref.activityId,
-              conversation: { id: this.ref.conversationId },
+              id: this.ref!.activityId,
+              conversation: { id: this.ref!.conversationId },
               text: content,
-            }),
+            } as any) as Promise<unknown>,
             { type: "other" },
           );
         } else {
           const result = await this.sendQueue.enqueue(
-            () => this.context.sendActivity({ text: content }),
+            () => this.context.sendActivity({ text: content } as any) as Promise<unknown>,
             { type: "other" },
           );
           if (result && i === 0) {
             const activityId = (result as { id?: string }).id;
             this.ref = {
               activityId,
-              conversationId: this.context.activity.conversation?.id,
+              conversationId: this.context.activity.conversation?.id as string | undefined,
             };
           }
         }
-      } catch {
-        // Skip this chunk — best effort
+      } catch (err) {
+        log.warn({ err, sessionId: this.sessionId, chunk: i }, "[TeamsMessageDraft] finalize: chunk send failed");
       }
     }
   }
 }
 
-/**
- * Teams-specific draft manager.
- * Batches text updates into drafts before sending, handles TTS strip pattern.
- * Draft message stored per session, flushed on tool call or timeout.
- */
 export class TeamsDraftManager {
   private drafts = new Map<string, TeamsMessageDraft>();
   private textBuffers = new Map<string, string>();
 
-  constructor(private sendQueue: SendQueue) {}
+  constructor(private sendQueue: { enqueue<T>(fn: () => Promise<T>, opts?: { type?: string }): Promise<T | undefined> }) {}
 
   getOrCreate(sessionId: string, context: TurnContext): TeamsMessageDraft {
     let draft = this.drafts.get(sessionId);
@@ -256,7 +263,6 @@ export class TeamsDraftManager {
       this.textBuffers.delete(sessionId);
       if (fullText) {
         // TODO: Detect action patterns and send action buttons as follow-up
-        // Similar to Discord's detectAction/storeAction/buildActionKeyboard
       }
     } else {
       this.textBuffers.delete(sessionId);

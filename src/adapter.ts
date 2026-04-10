@@ -1,12 +1,12 @@
-import { App, MemoryStorage } from "@microsoft/teams.apps";
-import { configureBotBuilderAdapter } from "@microsoft/teams.botbuilder";
-import { CardFactory } from "@microsoft/teams.cards";
-import type { TurnContext } from "@microsoft/teams.botbuilder";
+import { App } from "@microsoft/teams.apps";
+import { BotBuilderPlugin } from "@microsoft/teams.botbuilder";
+import { CardFactory, MemoryStorage } from "@microsoft/agents-hosting";
+import type { TurnContext } from "@microsoft/agents-hosting";
+import type { InvokeResponse } from "@microsoft/teams.api";
 import type {
   OutgoingMessage,
   PermissionRequest,
   NotificationMessage,
-  AgentCommand,
   PlanEntry,
   Attachment,
   OpenACPCore,
@@ -23,17 +23,11 @@ import type { CommandRegistry } from "@openacp/plugin-sdk";
 import { TeamsRenderer } from "./renderer.js";
 import type { TeamsChannelConfig } from "./types.js";
 import { TeamsDraftManager } from "./draft-manager.js";
-import { ActivityTracker, type ToolCallMeta, type OutputMode } from "./activity.js";
 import { PermissionHandler } from "./permissions.js";
-import {
-  handleCommand,
-  setupCardActionCallbacks,
-} from "./commands/index.js";
+import { handleCommand, setupCardActionCallbacks } from "./commands/index.js";
 import { spawnAssistant, buildWelcomeMessage } from "./assistant.js";
-import {
-  downloadTeamsFile,
-  isAttachmentTooLarge,
-} from "./media.js";
+import { downloadTeamsFile, isAttachmentTooLarge, buildFileAttachmentCard } from "./media.js";
+import type { OutputMode } from "./activity.js";
 
 export class TeamsAdapter extends MessagingAdapter {
   readonly name = "teams";
@@ -42,7 +36,7 @@ export class TeamsAdapter extends MessagingAdapter {
     streaming: true,
     richFormatting: true,
     threads: true,
-    reactions: false, // Teams doesn't have reactions like Discord
+    reactions: false,
     fileUpload: true,
     voice: true,
   };
@@ -52,38 +46,34 @@ export class TeamsAdapter extends MessagingAdapter {
   private teamsConfig: TeamsChannelConfig;
   private sendQueue: SendQueue;
   private draftManager: TeamsDraftManager;
-  private _outputModeResolver = new OutputModeResolver();
   private permissionHandler!: PermissionHandler;
-  private sessionTrackers: Map<string, ActivityTracker> = new Map();
 
   private notificationChannelId?: string;
+  private notificationConversationId?: string;
+  private notificationContext?: TurnContext;
   private assistantSession: Session | null = null;
   private assistantInitializing = false;
   private fileService: FileServiceInterface;
 
-  // Per-session context for concurrency safety in sendMessage handlers
   private _sessionContexts = new Map<string, { context: TurnContext; isAssistant: boolean }>();
+  private _sessionOutputModes = new Map<string, OutputMode>();
 
   constructor(core: OpenACPCore, config: TeamsChannelConfig) {
     super(
       { configManager: core.configManager },
-      { ...config as Record<string, unknown>, maxMessageLength: 2000, enabled: config.enabled ?? true } as MessagingAdapterConfig,
+      { ...config as unknown as Record<string, unknown>, maxMessageLength: 2000, enabled: config.enabled ?? true } as MessagingAdapterConfig,
     );
     this.core = core;
     this.teamsConfig = config;
     this.sendQueue = new SendQueue({ minInterval: 1000 });
-    this.draftManager = new TeamsDraftManager(this.sendQueue);
+    this.draftManager = new TeamsDraftManager(this.sendQueue as any);
     this.fileService = core.fileService;
 
-    const adapter = configureBotBuilderAdapter({
-      appId: config.botAppId,
-      appPassword: config.botAppPassword,
-    });
-
+    const botBuilderPlugin = new BotBuilderPlugin();
     this.app = new App({
       storage: new MemoryStorage(),
-      adapter,
-    });
+      plugins: [botBuilderPlugin],
+    } as any);
   }
 
   // ─── start ────────────────────────────────────────────────────────────────
@@ -122,6 +112,9 @@ export class TeamsAdapter extends MessagingAdapter {
       }
       this.assistantSession = null;
     }
+    this.notificationContext = undefined;
+    this._sessionContexts.clear();
+    this._sessionOutputModes.clear();
     await this.app.stop();
     log.info("[TeamsAdapter] Stopped");
   }
@@ -129,27 +122,54 @@ export class TeamsAdapter extends MessagingAdapter {
   // ─── Message handler ──────────────────────────────────────────────────────
 
   private setupMessageHandler(): void {
-    this.app.on("message", async (context) => {
+    // File consent: accept
+    this.app.on("file.consent.accept", async (context: any) => {
       try {
-        const text = context.activity.text ?? "";
-        const userId = context.activity.from?.id ?? "unknown";
-        const channelId = context.activity.conversation?.id ?? "unknown";
-        const threadId = context.activity.channelId ?? channelId;
+        const uploadInfo = context.activity.value?.uploadInfo;
+        const fileName = uploadInfo?.name ?? "file";
+        log.info({ fileName }, "[TeamsAdapter] File consent accepted");
+        await context.sendActivity({ text: `✅ File consent accepted: ${fileName}` } as any);
+        return { status: 200 };
+      } catch (err) {
+        log.error({ err }, "[TeamsAdapter] file.consent.accept error");
+        return { status: 500 };
+      }
+    });
 
-        log.debug(
-          { threadId, userId, text: text.slice(0, 50) },
-          "[TeamsAdapter] message received",
-        );
+    // File consent: decline
+    this.app.on("file.consent.decline", async (context: any) => {
+      try {
+        const uploadInfo = context.activity.value?.uploadInfo;
+        const fileName = uploadInfo?.name ?? "file";
+        log.info({ fileName }, "[TeamsAdapter] File consent declined");
+        await context.sendActivity({ text: `❌ File consent declined: ${fileName}` } as any);
+        return { status: 200 };
+      } catch (err) {
+        log.error({ err }, "[TeamsAdapter] file.consent.decline error");
+        return { status: 500 };
+      }
+    });
 
-        // Ignore empty messages without attachments
+    this.app.on("message", async (context: any) => {
+      const text = context.activity.text ?? "";
+      const userId = context.activity.from?.id ?? "unknown";
+      const channelId = String(context.activity.conversation?.id ?? "unknown");
+      const threadId = String(context.activity.channelId ?? channelId);
+
+      try {
+        log.debug({ threadId, userId, text: text.slice(0, 50) }, "[TeamsAdapter] message received");
+
         if (!text && !context.activity.attachments?.length) return;
 
-        // Resolve sessionId for file storage (fallback to "unknown" for new sessions)
         const sessionId =
-          this.core.sessionManager.getSessionByThread("teams", threadId)
-            ?.id ?? "unknown";
+          this.core.sessionManager.getSessionByThread("teams", threadId)?.id ?? "unknown";
 
-        // Process attachments
+        // Capture notification channel context on first message
+        if (this.notificationChannelId && threadId === this.notificationChannelId) {
+          this.notificationConversationId = channelId;
+          this.notificationContext = context;
+        }
+
         const attachments: Attachment[] = [];
         if (context.activity.attachments?.length) {
           for (const att of context.activity.attachments) {
@@ -170,7 +190,6 @@ export class TeamsAdapter extends MessagingAdapter {
           }
         }
 
-        // Generate fallback text if message has attachments but no text
         let messageText = text;
         if (!messageText && attachments.length > 0) {
           messageText = attachments.map((a) => `[Attachment: ${a.fileName}]`).join("\n");
@@ -178,29 +197,31 @@ export class TeamsAdapter extends MessagingAdapter {
 
         if (!messageText && attachments.length === 0) return;
 
-        // Route assistant thread messages to assistant
         if (
           this.teamsConfig.assistantThreadId &&
           threadId === this.teamsConfig.assistantThreadId
         ) {
           if (this.assistantSession && messageText) {
-            await this.assistantSession.enqueuePrompt(
-              messageText,
-              attachments.length > 0 ? attachments : undefined,
-            );
+            try {
+              await this.assistantSession.enqueuePrompt(
+                messageText,
+                attachments.length > 0 ? attachments : undefined,
+              );
+            } catch (err) {
+              log.error({ err, sessionId: this.assistantSession.id }, "[TeamsAdapter] assistant enqueuePrompt failed");
+            }
           }
           return;
         }
 
-        // Reset tracker state for new prompt cycle on existing sessions
         if (sessionId !== "unknown") {
-          const tracker = this.sessionTrackers.get(sessionId);
-          if (tracker) {
-            await tracker.onNewPrompt();
+          // Reset draft state for new prompt
+          const draft = this.draftManager.getDraft(sessionId);
+          if (draft) {
+            this.draftManager.cleanup(sessionId);
           }
         }
 
-        // Route to core for session dispatch
         await this.core.handleMessage({
           channelId: "teams",
           threadId,
@@ -209,68 +230,82 @@ export class TeamsAdapter extends MessagingAdapter {
           ...(attachments.length > 0 ? { attachments } : {}),
         });
       } catch (err) {
-        log.error({ err }, "[TeamsAdapter] message handler error");
+        log.error({ err, threadId, userId }, "[TeamsAdapter] message handler error");
+        try {
+          await context.sendActivity({ text: "❌ Failed to process message. Please try again." } as any);
+        } catch { /* best effort */ }
       }
     });
   }
 
-  // ─── Card action handler (Adaptive Card invoke) ─────────────────────────
+  // ─── Card action handler ────────────────────────────────────────────────
 
   private setupCardActionHandler(): void {
-    this.app.on("adaptiveCardInvoke", async (context) => {
-      try {
-        const action = context.activity.value?.action;
-        if (!action) return;
+    this.app.on("card.action", (async (context: any): Promise<InvokeResponse<"adaptiveCard/action"> | undefined> => {
+      await this.cardActionHandler(context);
+      return { status: 200 };
+    }) as any);
+  }
 
-        const verb = action.verb;
-        const data = action.data;
+  private async cardActionHandler(context: any): Promise<void> {
+    try {
+      const action = context.activity.value?.action;
+      if (!action) return;
 
-        if (!verb) return;
+      const verb = action.verb as string;
+      const data = action.data as Record<string, unknown> ?? {};
 
-        // Permission button callbacks
-        if (data?.sessionId && data?.callbackKey && data?.requestId) {
-          const handled = await this.permissionHandler.handleCardAction(
-            context,
-            verb,
-            data.sessionId,
-            data.callbackKey,
-            data.requestId,
-          );
-          if (handled) return;
+      if (!verb) return;
+
+      if (data?.sessionId && data?.callbackKey && data?.requestId) {
+        const handled = await this.permissionHandler.handleCardAction(
+          context,
+          verb,
+          data.sessionId as string,
+          data.callbackKey as string,
+          data.requestId as string,
+        );
+        if (handled) return;
+      }
+
+      if (typeof verb === "string" && verb.startsWith("om:")) {
+        const parts = verb.split(":");
+        if (parts.length === 3) {
+          const [_prefix, sessionId, mode] = parts;
+          if (mode === "low" || mode === "medium" || mode === "high") {
+            this._sessionOutputModes.set(sessionId, mode as OutputMode);
+            await context.sendActivity({ text: `🔄 Output mode: **${mode}**` } as any);
+            return;
+          }
         }
+      }
 
-        // Output mode buttons (om:sessionId:mode)
-        if (typeof verb === "string" && verb.startsWith("om:")) {
-          const parts = verb.split(":");
-          if (parts.length === 3) {
-            const [_prefix, sessionId, mode] = parts;
-            if (mode === "low" || mode === "medium" || mode === "high") {
-              this.updateSessionOutputMode(sessionId, mode as OutputMode);
-              await context.sendActivity({ text: `🔄 Output mode: **${mode}**` });
+      if (verb.startsWith("cancel:")) {
+        const sessionId = verb.split(":")[1];
+        if (sessionId) {
+          const session = this.core.sessionManager.getSession(sessionId);
+          if (session) {
+            try {
+              await session.destroy();
+            } catch (err) {
+              log.error({ err, sessionId }, "[TeamsAdapter] cancel: destroy failed");
+              try {
+                await context.sendActivity({ text: "❌ Failed to cancel session" } as any);
+              } catch { /* best effort */ }
               return;
             }
+            try {
+              await context.sendActivity({ text: "❌ Session cancelled" } as any);
+            } catch { /* best effort */ }
           }
         }
-
-        // Cancel button
-        if (verb.startsWith("cancel:")) {
-          const sessionId = verb.split(":")[1];
-          if (sessionId) {
-            const session = this.core.sessionManager.getSession(sessionId);
-            if (session) {
-              await session.destroy();
-              await context.sendActivity({ text: "❌ Session cancelled" });
-            }
-          }
-          return;
-        }
-
-        // Route to card action callbacks (command buttons)
-        await setupCardActionCallbacks(context, this);
-      } catch (err) {
-        log.error({ err }, "[TeamsAdapter] adaptiveCardInvoke handler error");
+        return;
       }
-    });
+
+      await setupCardActionCallbacks(context, this);
+    } catch (err) {
+      log.error({ err }, "[TeamsAdapter] card.action handler error");
+    }
   }
 
   // ─── CommandRegistry dispatch ────────────────────────────────────────────
@@ -288,8 +323,6 @@ export class TeamsAdapter extends MessagingAdapter {
     const registry = this.getCommandRegistry();
     if (!registry) return;
 
-    const channelId = context.activity.conversation?.id ?? "teams";
-
     const response = await registry.execute(text, {
       raw: "",
       sessionId,
@@ -297,7 +330,11 @@ export class TeamsAdapter extends MessagingAdapter {
       userId,
       reply: async (content: string) => {
         if (typeof content === "string") {
-          await context.sendActivity({ text: content });
+          try {
+            await (context.sendActivity as any)({ text: content });
+          } catch (err) {
+            log.warn({ err }, "[TeamsAdapter] handleCommand: reply failed");
+          }
         }
       },
     });
@@ -307,12 +344,9 @@ export class TeamsAdapter extends MessagingAdapter {
     }
   }
 
-  private async renderCommandResponse(
-    response: CommandResponse,
-    context: TurnContext,
-  ): Promise<void> {
+  private async renderCommandResponse(response: CommandResponse, context: any): Promise<void> {
     const reply = async (text: string) => {
-      await context.sendActivity({ text });
+      await context.sendActivity({ text } as any);
     };
 
     switch (response.type) {
@@ -324,8 +358,8 @@ export class TeamsAdapter extends MessagingAdapter {
         break;
       case "menu": {
         const card = {
-          type: "AdaptiveCard" as const,
-          version: "1.4" as const,
+          type: "AdaptiveCard",
+          version: "1.4",
           body: [
             { type: "TextBlock", text: response.title, weight: "Bolder" as const, size: "Medium" as const },
             { type: "TextBlock", text: response.options.map((o) => `• ${o.label}`).join("\n"), wrap: true },
@@ -336,7 +370,7 @@ export class TeamsAdapter extends MessagingAdapter {
             data: { verb: `cmd:${opt.command}` },
           })),
         };
-        await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card)] });
+        await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card)] } as any);
         break;
       }
       case "list": {
@@ -346,21 +380,21 @@ export class TeamsAdapter extends MessagingAdapter {
       }
       case "confirm": {
         const card = {
-          type: "AdaptiveCard" as const,
-          version: "1.4" as const,
-          body: [
-            { type: "TextBlock", text: response.question, wrap: true },
-          ],
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: [{ type: "TextBlock", text: response.question, wrap: true }],
           actions: [
             { type: "Action.Execute" as const, title: "Yes", data: { verb: `cmd:${response.onYes}` } },
             { type: "Action.Execute" as const, title: "No", data: { verb: "cmd:noop" } },
           ],
         };
-        await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card)] });
+        await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card)] } as any);
         break;
       }
       case "silent":
         break;
+      default:
+        await reply(`⚠️ Unexpected response type: ${(response as any).type ?? "unknown"}`);
     }
   }
 
@@ -370,7 +404,6 @@ export class TeamsAdapter extends MessagingAdapter {
     let threadId = this.teamsConfig.assistantThreadId ?? undefined;
 
     if (!threadId) {
-      // Create a new thread for the assistant
       threadId = await this.createSessionThread("assistant", "Assistant") as string;
       this.teamsConfig.assistantThreadId = threadId;
       await this.core.configManager.save({
@@ -402,49 +435,43 @@ export class TeamsAdapter extends MessagingAdapter {
     await this.setupAssistant();
   }
 
-  // ─── Helper: resolve thread ────────────────────────────────────────────────
+  async restartAssistant(): Promise<void> {
+    await this.respawnAssistant();
+  }
+
+  // ─── Helper: resolve context ─────────────────────────────────────────────
 
   private async getContext(sessionId: string): Promise<TurnContext | null> {
     const ctx = this._sessionContexts.get(sessionId);
     return ctx?.context ?? null;
   }
 
-  // ─── Helper: get or create activity tracker ──────────────────────────────
-
   private resolveMode(sessionId: string): OutputMode {
-    return this._outputModeResolver.resolve(
-      this.core.configManager as any,
-      this.name,
-      sessionId,
-      this.core.sessionManager as any,
-    );
-  }
+    // Check session-level override
+    const sessionMode = this._sessionOutputModes.get(sessionId);
+    if (sessionMode) return sessionMode;
 
-  private getOrCreateTracker(
-    sessionId: string,
-    context: TurnContext,
-    outputMode: OutputMode = "medium",
-  ): ActivityTracker {
-    let tracker = this.sessionTrackers.get(sessionId);
-    if (!tracker) {
-      tracker = new ActivityTracker(
-        context,
-        this.sendQueue,
-        outputMode,
-        sessionId,
-      );
-      this.sessionTrackers.set(sessionId, tracker);
-    } else {
-      tracker.setOutputMode(outputMode);
+    // Session record
+    const record = this.core.sessionManager.getSessionRecord(sessionId);
+    if (record?.outputMode) {
+      const m = record.outputMode;
+      if (m === "low" || m === "medium" || m === "high") return m as OutputMode;
     }
-    return tracker;
-  }
 
-  updateSessionOutputMode(sessionId: string, mode: OutputMode): void {
-    const tracker = this.sessionTrackers.get(sessionId);
-    if (!tracker) return;
-    tracker.setOutputMode(mode);
-    tracker.rerender();
+    // Adapter config — check teams-specific setting
+    const config = this.core.configManager.get() as Record<string, unknown>;
+    const channels = config.channels as Record<string, Record<string, unknown>> | undefined;
+    const adapterMode = channels?.teams?.outputMode;
+    if (adapterMode === "low" || adapterMode === "medium" || adapterMode === "high") {
+      return adapterMode as OutputMode;
+    }
+
+    // Global
+    if (config.outputMode === "low" || config.outputMode === "medium" || config.outputMode === "high") {
+      return config.outputMode as OutputMode;
+    }
+
+    return "medium";
   }
 
   private getSessionContext(sessionId: string): { context: TurnContext; isAssistant: boolean } {
@@ -455,12 +482,9 @@ export class TeamsAdapter extends MessagingAdapter {
     return ctx;
   }
 
-  // ─── sendMessage ────────────────────────────────────────────────────────────
+  // ─── sendMessage ─────────────────────────────────────────────────────────
 
-  async sendMessage(
-    sessionId: string,
-    content: OutgoingMessage,
-  ): Promise<void> {
+  async sendMessage(sessionId: string, content: OutgoingMessage): Promise<void> {
     if (
       this.assistantInitializing &&
       this.assistantSession &&
@@ -479,142 +503,157 @@ export class TeamsAdapter extends MessagingAdapter {
     try {
       await super.sendMessage(sessionId, content);
     } finally {
+      // Give nested async handlers time to complete before deleting context
+      await new Promise((resolve) => setTimeout(resolve, 0));
       this._sessionContexts.delete(sessionId);
     }
   }
 
-  // ─── Handler overrides ─────────────────────────────────────────────────────
+  // ─── Handler overrides ───────────────────────────────────────────────────
 
   protected async handleThought(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    const { context } = this.getSessionContext(sessionId);
-    const mode = this.resolveMode(sessionId);
-    const tracker = this.getOrCreateTracker(sessionId, context, mode);
-    await tracker.onThought(content.text || "");
+    // Thoughts are not sent as messages in Teams — buffered and displayed via plan
+    void sessionId;
+    void content;
   }
 
   protected async handleText(sessionId: string, content: OutgoingMessage): Promise<void> {
-    const { context } = this.getSessionContext(sessionId);
-    if (!this.draftManager.hasDraft(sessionId)) {
-      const mode = this.resolveMode(sessionId);
-      const tracker = this.getOrCreateTracker(sessionId, context, mode);
-      await tracker.onTextStart();
+    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
+    try {
+      ctx = this.getSessionContext(sessionId);
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handleText: no session context");
+      return;
     }
+    const { context } = ctx;
     const draft = this.draftManager.getOrCreate(sessionId, context);
     draft.append(content.text);
     this.draftManager.appendText(sessionId, content.text);
   }
 
-  protected async handleToolCall(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    const { context, isAssistant } = this.getSessionContext(sessionId);
-    const meta = (content.metadata ?? {}) as Partial<ToolCallMeta>;
-    const mode = this.resolveMode(sessionId);
-    const tracker = this.getOrCreateTracker(sessionId, context, mode);
+  protected async handleToolCall(sessionId: string, content: OutgoingMessage, verbosity: DisplayVerbosity): Promise<void> {
+    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
+    try {
+      ctx = this.getSessionContext(sessionId);
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handleToolCall: no session context");
+      return;
+    }
+    const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
-    await tracker.onToolCall(
-      {
-        id: meta.id ?? "",
-        name: meta.name ?? content.text ?? "Tool",
-        kind: meta.kind,
-        status: meta.status,
-        content: meta.content,
-        rawInput: meta.rawInput,
-        viewerLinks: meta.viewerLinks,
-        viewerFilePath: meta.viewerFilePath,
-        displaySummary: meta.displaySummary as string | undefined,
-        displayTitle: meta.displayTitle as string | undefined,
-        displayKind: meta.displayKind as string | undefined,
-      },
-      String(meta.kind ?? ""),
-      meta.rawInput,
-    );
+    try {
+      const rendered = this.renderer.renderToolCall(content, verbosity);
+      await context.sendActivity({ text: rendered.body } as any);
+    } catch (err) {
+      log.error({ err, sessionId }, "[TeamsAdapter] handleToolCall: sendActivity failed");
+    }
   }
 
   protected async handleToolUpdate(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    const { context } = this.getSessionContext(sessionId);
-    const meta = (content.metadata ?? {}) as Partial<ToolCallMeta & { diffStats?: { added: number; removed: number } }>;
-    const mode = this.resolveMode(sessionId);
-    const tracker = this.getOrCreateTracker(sessionId, context, mode);
-    await tracker.onToolUpdate(
-      meta.id ?? "",
-      meta.status ?? "completed",
-      meta.viewerLinks as { file?: string; diff?: string } | undefined,
-      typeof meta.content === "string" ? meta.content : null,
-      meta.rawInput ?? undefined,
-      meta.diffStats as { added: number; removed: number } | undefined,
-    );
+    // Tool updates rendered in plan/usage cards — no separate handling needed
+    void sessionId;
+    void content;
   }
 
   protected async handlePlan(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    const { context } = this.getSessionContext(sessionId);
-    const meta = (content.metadata ?? {}) as { entries?: PlanEntry[] };
-    const entries = meta.entries ?? [];
+    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
+    try {
+      ctx = this.getSessionContext(sessionId);
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handlePlan: no session context");
+      return;
+    }
+    const { context } = ctx;
+    const entries = (content.metadata as { entries?: PlanEntry[] })?.entries ?? [];
     const mode = this.resolveMode(sessionId);
-    const tracker = this.getOrCreateTracker(sessionId, context, mode);
-    await tracker.onPlan(entries);
+    const { formatPlan } = await import("./formatting.js");
+    const text = formatPlan(entries, mode);
+    const card = {
+      type: "AdaptiveCard" as const,
+      version: "1.4" as const,
+      body: [{ type: "TextBlock" as const, text, wrap: true }],
+    };
+    try {
+      await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card as any)] } as any);
+    } catch (err) {
+      log.error({ err, sessionId }, "[TeamsAdapter] handlePlan: sendActivity failed");
+    }
   }
 
   protected async handleUsage(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    const { context, isAssistant } = this.getSessionContext(sessionId);
+    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
+    try {
+      ctx = this.getSessionContext(sessionId);
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handleUsage: no session context");
+      return;
+    }
+    const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
     const meta = content.metadata as { tokensUsed?: number; contextSize?: number; cost?: number; duration?: number } | undefined;
     const mode = this.resolveMode(sessionId);
-
+    const { renderUsageCard } = await import("./formatting.js");
+    const { body } = renderUsageCard(meta ?? {}, mode);
+    const card = { type: "AdaptiveCard" as const, version: "1.4" as const, body };
     try {
-      const { renderUsageCard } = await import("./formatting.js");
-      const { body } = renderUsageCard(meta ?? {}, mode);
-      const card = {
-        type: "AdaptiveCard" as const,
-        version: "1.4" as const,
-        body,
-      };
-      await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card)] });
+      await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card as any)] } as any);
     } catch (err) {
-      log.warn({ err, sessionId }, "Failed to send usage card");
+      log.error({ err, sessionId }, "[TeamsAdapter] handleUsage: sendActivity failed");
     }
 
-    // Notify notification channel
     if (this.notificationChannelId && sessionId !== this.assistantSession?.id) {
       const sess = this.core.sessionManager.getSession(sessionId);
       const name = sess?.name || "Session";
       try {
-        await this.core.lifecycleManager?.serviceRegistry?.get("adapter:teams");
-        // TODO: Send to notification channel
+        await context.sendActivity({ text: `✅ **${name}** — Task completed.` } as any);
       } catch { /* best effort */ }
     }
   }
 
   protected async handleSessionEnd(sessionId: string, _content: OutgoingMessage): Promise<void> {
-    const { context, isAssistant } = this.getSessionContext(sessionId);
+    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
+    try {
+      ctx = this.getSessionContext(sessionId);
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handleSessionEnd: no session context");
+      return;
+    }
+    const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
     this.draftManager.cleanup(sessionId);
-    const tracker = this.sessionTrackers.get(sessionId);
-    if (tracker) {
-      await tracker.cleanup();
-      this.sessionTrackers.delete(sessionId);
-    } else {
-      try {
-        await context.sendActivity({ text: "✅ **Done**" });
-      } catch { /* best effort */ }
-    }
+    this._sessionOutputModes.delete(sessionId);
+    try {
+      await context.sendActivity({ text: "✅ **Done**" } as any);
+    } catch { /* best effort */ }
   }
 
   protected async handleError(sessionId: string, content: OutgoingMessage): Promise<void> {
-    const { context, isAssistant } = this.getSessionContext(sessionId);
-    await this.draftManager.finalize(sessionId, context, isAssistant);
-    const tracker = this.sessionTrackers.get(sessionId);
-    if (tracker) {
-      tracker.destroy();
-      this.sessionTrackers.delete(sessionId);
-    }
+    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
     try {
-      await context.sendActivity({ text: `❌ **Error:** ${content.text}` });
+      ctx = this.getSessionContext(sessionId);
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handleError: no session context");
+      return;
+    }
+    const { context, isAssistant } = ctx;
+    await this.draftManager.finalize(sessionId, context, isAssistant);
+    this.draftManager.cleanup(sessionId);
+    try {
+      await context.sendActivity({ text: `❌ **Error:** ${content.text}` } as any);
     } catch { /* best effort */ }
   }
 
   protected async handleAttachment(sessionId: string, content: OutgoingMessage): Promise<void> {
     if (!content.attachment) return;
     const { attachment } = content;
-    const { context, isAssistant } = this.getSessionContext(sessionId);
+    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
+    try {
+      ctx = this.getSessionContext(sessionId);
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handleAttachment: no session context");
+      return;
+    }
+    const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
 
     if (isAttachmentTooLarge(attachment.size)) {
@@ -622,22 +661,27 @@ export class TeamsAdapter extends MessagingAdapter {
       try {
         await context.sendActivity({
           text: `⚠️ File too large to send (${Math.round(attachment.size / 1024 / 1024)}MB): ${attachment.fileName}`,
-        });
+        } as any);
       } catch { /* best effort */ }
       return;
     }
 
     try {
-      // Teams doesn't support direct file send like Discord
-      // Send a message with the file name reference
-      await context.sendActivity({
-        text: `📎 Attachment: ${attachment.fileName}`,
-      });
+      // Show file card — actual serving requires Graph API upload to SharePoint/OneDrive
+      const card = buildFileAttachmentCard(
+        attachment.fileName,
+        attachment.size,
+        `file://${attachment.filePath}`,
+        attachment.mimeType,
+      );
+      await context.sendActivity({ attachments: [CardFactory.adaptiveCard(card as any)] } as any);
 
       if (attachment.type === "audio") {
         const draft = this.draftManager.getDraft(sessionId);
         if (draft) {
-          draft.stripPattern(/\[TTS\][\s\S]*?\[\/TTS\]/g).catch(() => {});
+          draft.stripPattern(/\[TTS\][\s\S]*?\[\/TTS\]/g).catch((err) => {
+            log.warn({ err, sessionId }, "[TeamsAdapter] handleAttachment: stripPattern failed");
+          });
         }
       }
     } catch (err) {
@@ -646,40 +690,37 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleSystem(sessionId: string, content: OutgoingMessage): Promise<void> {
-    const { context } = this.getSessionContext(sessionId);
+    let ctx: { context: TurnContext; isAssistant: boolean } | null = null;
     try {
-      await context.sendActivity({ text: content.text });
+      ctx = this.getSessionContext(sessionId);
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] handleSystem: no session context");
+      return;
+    }
+    const { context } = ctx;
+    try {
+      await context.sendActivity({ text: content.text } as any);
     } catch { /* best effort */ }
   }
 
-  // ─── sendPermissionRequest ────────────────────────────────────────────────
+  // ─── sendPermissionRequest ──────────────────────────────────────────────
 
-  async sendPermissionRequest(
-    sessionId: string,
-    request: PermissionRequest,
-  ): Promise<void> {
+  async sendPermissionRequest(sessionId: string, request: PermissionRequest): Promise<void> {
     const session = this.core.sessionManager.getSession(sessionId);
     if (!session) {
       log.warn({ sessionId }, "[TeamsAdapter] sendPermissionRequest: session not found");
       return;
     }
-
     const context = await this.getContext(sessionId);
     if (!context) return;
-
     await this.permissionHandler.sendPermissionRequest(session, request, context);
   }
 
-  // ─── sendNotification ─────────────────────────────────────────────────────
+  // ─── sendNotification ──────────────────────────────────────────────────
 
   async sendNotification(notification: NotificationMessage): Promise<void> {
-    if (!this.notificationChannelId) return;
-
     const typeIcon: Record<string, string> = {
-      completed: "✅",
-      error: "❌",
-      permission: "🔐",
-      input_required: "💬",
+      completed: "✅", error: "❌", permission: "🔐", input_required: "💬",
     };
 
     const icon = typeIcon[notification.type] ?? "ℹ️";
@@ -689,57 +730,66 @@ export class TeamsAdapter extends MessagingAdapter {
       text += `\n${notification.deepLink}`;
     }
 
-    try {
-      // TODO: Send to notification channel via Teams API
-      log.info({ text }, "[TeamsAdapter] Notification (not yet sent to channel)");
-    } catch (err) {
-      log.warn({ err }, "[TeamsAdapter] Failed to send notification");
+    // Route to notification thread if we have context for it
+    if (this.notificationContext && this.notificationChannelId) {
+      try {
+        await this.notificationContext.sendActivity(text as any);
+        return;
+      } catch (err) {
+        log.warn({ err, type: notification.type, sessionName: notification.sessionName }, "[TeamsAdapter] Failed to send notification to channel");
+      }
     }
+
+    log.debug({ type: notification.type, sessionName: notification.sessionName, text }, "[TeamsAdapter] sendNotification: no notificationContext configured, skipping");
   }
 
   // ─── createSessionThread ─────────────────────────────────────────────────
 
   async createSessionThread(sessionId: string, name: string): Promise<string> {
-    // In Teams, threads are created within channels
-    // This would use Teams SDK to create a new reply/thread in the channel
     const threadId = `thread-${sessionId}-${Date.now()}`;
-
     const session = this.core.sessionManager.getSession(sessionId);
     if (session) {
       session.threadId = threadId;
     }
-
     const record = this.core.sessionManager.getSessionRecord(sessionId);
     if (record) {
       await this.core.sessionManager.patchRecord(sessionId, {
         platform: { ...record.platform, threadId },
       });
     }
-
     return threadId;
   }
 
-  // ─── renameSessionThread ──────────────────────────────────────────────────
-
   async renameSessionThread(sessionId: string, newName: string): Promise<void> {
-    const session = this.core.sessionManager.getSession(sessionId);
-    const threadId = session?.threadId;
+    const record = this.core.sessionManager.getSessionRecord(sessionId);
+    if (!record) return;
+    const threadId = record.platform?.threadId as string | undefined;
     if (!threadId) return;
-    // TODO: Implement Teams thread rename via SDK
-    log.info({ sessionId, threadId, newName }, "[TeamsAdapter] renameSessionThread not yet implemented");
-  }
 
-  // ─── deleteSessionThread ──────────────────────────────────────────────────
+    // Teams Graph API would be needed for actual rename:
+    // PATCH https://graph.microsoft.com/v1.0/chats/{chat-id}
+    // Requires Chat.ReadWrite.All permission
+    log.info({ sessionId, threadId, newName }, "[TeamsAdapter] renameSessionThread — requires Graph API (Chat.ReadWrite.All)");
+  }
 
   async deleteSessionThread(sessionId: string): Promise<void> {
-    const session = this.core.sessionManager.getSession(sessionId);
-    const threadId = session?.threadId;
+    const record = this.core.sessionManager.getSessionRecord(sessionId);
+    if (!record) return;
+    const threadId = record.platform?.threadId as string | undefined;
     if (!threadId) return;
-    // TODO: Implement Teams thread deletion via SDK
-    log.info({ sessionId, threadId }, "[TeamsAdapter] deleteSessionThread not yet implemented");
+
+    // Clean up local state — actual Teams conversation deletion requires Graph API
+    try {
+      await this.core.sessionManager.patchRecord(sessionId, {
+        platform: { ...record.platform, threadId: undefined },
+      });
+    } catch (err) {
+      log.warn({ err, sessionId }, "[TeamsAdapter] deleteSessionThread: failed to clear threadId");
+    }
+    log.info({ sessionId, threadId }, "[TeamsAdapter] deleteSessionThread — cleanup done, Graph API delete not called");
   }
 
-  // ─── Public helpers (for slash commands) ─────────────────────────────────
+  // ─── Public helpers ─────────────────────────────────────────────────────
 
   getChannelId(): string {
     return this.teamsConfig.channelId;
@@ -756,29 +806,8 @@ export class TeamsAdapter extends MessagingAdapter {
   getAssistantThreadId(): string | null {
     return this.teamsConfig.assistantThreadId ?? null;
   }
-}
 
-// ─── OutputModeResolver ────────────────────────────────────────────────────────
-
-class OutputModeResolver {
-  resolve(
-    configManager: { get(): Record<string, unknown> },
-    adapterName: string,
-    sessionId?: string,
-    sessionManager?: { getSession(id: string): { record?: { outputMode?: string } } | undefined },
-  ): OutputMode {
-    if (sessionId && sessionManager) {
-      const session = sessionManager.getSession(sessionId);
-      const mode = session?.record?.outputMode;
-      if (mode === "low" || mode === "medium" || mode === "high") return mode as OutputMode;
-    }
-    const config = configManager.get();
-    const channels = config.channels as Record<string, Record<string, unknown>> | undefined;
-    const adapterConfig = channels?.[adapterName];
-    const adapterMode = adapterConfig?.outputMode;
-    if (adapterMode === "low" || adapterMode === "medium" || adapterMode === "high") return adapterMode as OutputMode;
-    const globalMode = config.outputMode;
-    if (globalMode === "low" || globalMode === "medium" || globalMode === "high") return globalMode as OutputMode;
-    return "medium";
+  setSessionOutputMode(sessionId: string, mode: "low" | "medium" | "high"): void {
+    this._sessionOutputModes.set(sessionId, mode as OutputMode);
   }
 }

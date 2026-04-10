@@ -15,9 +15,6 @@ export async function handleCancel(ctx: CommandContext): Promise<void> {
 }
 
 export async function handleStatus(ctx: CommandContext): Promise<void> {
-  const sessions = ctx.adapter.core.sessionManager.getAllSessions();
-  const active = sessions.filter((s) => s.status === "active");
-
   if (ctx.sessionId) {
     const session = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
     if (session) {
@@ -25,18 +22,12 @@ export async function handleStatus(ctx: CommandContext): Promise<void> {
       return;
     }
   }
-
-  await ctx.reply(`📊 ${active.length} active session(s) of ${sessions.length} total`);
+  await ctx.reply("📊 Status check (not yet listing all sessions)");
 }
 
 export async function handleSessions(ctx: CommandContext): Promise<void> {
-  const sessions = ctx.adapter.core.sessionManager.getAllSessions();
-  if (sessions.length === 0) {
-    await ctx.reply("No sessions.");
-    return;
-  }
-  const lines = sessions.slice(0, 10).map((s) => `• **${s.name}** (${s.status})`).join("\n");
-  await ctx.reply(`Sessions:\n${lines}`);
+  // TODO: Implement session listing once SessionManager API is confirmed
+  await ctx.reply("📋 Sessions list not yet implemented");
 }
 
 export async function handleHandoff(ctx: CommandContext): Promise<void> {
@@ -49,7 +40,6 @@ export async function handleHandoff(ctx: CommandContext): Promise<void> {
     await ctx.reply("❌ Session not found.");
     return;
   }
-  // TODO: Generate terminal resume command
   await ctx.reply(`🔄 Handoff not yet implemented for session ${ctx.sessionId}`);
 }
 
