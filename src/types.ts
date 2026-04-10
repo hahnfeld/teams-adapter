@@ -1,6 +1,4 @@
-import type { IChannelAdapter } from "@openacp/plugin-sdk";
-
-export interface TeamsChannelConfig extends Partial<IChannelAdapter> {
+export interface TeamsChannelConfig {
   enabled: boolean;
   botAppId: string;
   botAppPassword: string;
@@ -19,10 +17,4 @@ export interface TeamsPlatformData {
   threadId?: string;
   messageId?: string;
   skillMsgId?: string;
-}
-
-export interface CommandsAssistantContext {
-  threadId: string;
-  getSession: () => import("@openacp/plugin-sdk").Session | null;
-  respawn: () => Promise<void>;
 }

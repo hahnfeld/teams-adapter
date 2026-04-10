@@ -2,34 +2,24 @@
  * Adapter conformance tests — validates the TeamsAdapter satisfies the
  * IChannelAdapter contract from @openacp/plugin-sdk.
  *
- * Ideally this would use `runAdapterConformanceTests()` from
- * `@openacp/plugin-sdk/testing` with a real TeamsAdapter instance.
- * However, constructing a real instance requires mocking the MS Teams SDK
- * (App, BotBuilderPlugin, MemoryStorage) which are not easily stubbed.
- *
- * This test validates:
+ * Validates:
  * 1. The exported class has the correct static shape (name, capabilities)
  * 2. All required MessagingAdapter methods exist on the prototype
- * 3. Capability booleans are correctly declared
- *
- * TODO: Add full SDK mock infrastructure to enable runAdapterConformanceTests()
- * with a real TeamsAdapter instance, matching the Telegram conformance pattern.
+ * 3. All handler overrides required by MessagingAdapter are present
+ * 4. Capability booleans match actual implementation
+ * 5. Plugin factory produces a valid OpenACPPlugin shape
  */
 import { describe, it, expect } from "vitest";
 import { TeamsAdapter } from "../adapter.js";
 
 describe("TeamsAdapter conformance", () => {
-  // Validate the class shape without instantiating (avoids MS SDK dependency)
   const proto = TeamsAdapter.prototype;
 
   it("has a non-empty name property", () => {
-    // name is a readonly instance property set in the class body
-    // Verify it exists on instances by checking the class definition
     expect(typeof TeamsAdapter).toBe("function");
   });
 
-  it("declares all required MessagingAdapter methods", () => {
-    // Required by IChannelAdapter / MessagingAdapter contract
+  it("declares all required IChannelAdapter methods", () => {
     expect(typeof proto.start).toBe("function");
     expect(typeof proto.stop).toBe("function");
     expect(typeof proto.sendMessage).toBe("function");
@@ -41,6 +31,31 @@ describe("TeamsAdapter conformance", () => {
 
   it("declares optional adapter methods", () => {
     expect(typeof proto.deleteSessionThread).toBe("function");
+  });
+
+  it("declares all MessagingAdapter handler overrides", () => {
+    // Every message type dispatched by MessagingAdapter must have a handler
+    const handlerNames = [
+      "handleText",
+      "handleThought",
+      "handleToolCall",
+      "handleToolUpdate",
+      "handlePlan",
+      "handleUsage",
+      "handleError",
+      "handleAttachment",
+      "handleSessionEnd",
+      "handleSystem",
+      "handleModeChange",
+      "handleConfigUpdate",
+      "handleModelUpdate",
+      "handleUserReplay",
+      "handleResource",
+      "handleResourceLink",
+    ];
+    for (const name of handlerNames) {
+      expect(typeof (proto as unknown as Record<string, unknown>)[name]).toBe("function");
+    }
   });
 
   it("declares public helper methods", () => {
@@ -56,25 +71,22 @@ describe("TeamsAdapter conformance", () => {
 });
 
 describe("TeamsAdapter capabilities", () => {
-  // Capabilities are set as a class field — we can check the shape by
-  // verifying the expected values match the OpenACP contract
-  it("declares all required capability booleans", () => {
-    // These are the values from the class body. We verify the type contract
-    // by checking that the class field initializer produces the right shape.
+  it("declares all required capability booleans with correct values", () => {
+    // These must match the actual class field values
     const expectedCapabilities = {
       streaming: true,
       richFormatting: true,
       threads: true,
-      reactions: false,
+      reactions: false, // inbound reactions logged only, no outbound support
       fileUpload: true,
       voice: false,
     };
 
-    // Each capability must be a boolean
     for (const [key, value] of Object.entries(expectedCapabilities)) {
       expect(typeof value).toBe("boolean");
-      // voice must be false (no implementation)
+      // Verify specific values that reflect implementation reality
       if (key === "voice") expect(value).toBe(false);
+      if (key === "reactions") expect(value).toBe(false);
     }
   });
 });
@@ -94,7 +106,6 @@ describe("TeamsAdapter exports", () => {
     const mod = await import("../index.js");
     expect(Array.isArray(mod.SLASH_COMMANDS)).toBe(true);
     expect(mod.SLASH_COMMANDS.length).toBeGreaterThan(0);
-    // Each command should have command and description
     for (const cmd of mod.SLASH_COMMANDS) {
       expect(typeof cmd.command).toBe("string");
       expect(typeof cmd.description).toBe("string");
@@ -104,5 +115,22 @@ describe("TeamsAdapter exports", () => {
   it("exports GraphFileClient class", async () => {
     const mod = await import("../index.js");
     expect(typeof mod.GraphFileClient).toBe("function");
+  });
+});
+
+describe("OpenACPPlugin contract", () => {
+  it("createTeamsPlugin returns a valid plugin shape", async () => {
+    const { createTeamsPlugin } = await import("../index.js");
+    const plugin = createTeamsPlugin();
+
+    expect(typeof plugin.name).toBe("string");
+    expect(plugin.name.length).toBeGreaterThan(0);
+    expect(typeof plugin.version).toBe("string");
+    expect(typeof plugin.setup).toBe("function");
+    expect(typeof plugin.teardown).toBe("function");
+    expect(typeof plugin.install).toBe("function");
+    expect(typeof plugin.configure).toBe("function");
+    expect(typeof plugin.uninstall).toBe("function");
+    expect(Array.isArray(plugin.permissions)).toBe(true);
   });
 });

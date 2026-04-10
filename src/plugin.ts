@@ -1,4 +1,4 @@
-import type { OpenACPPlugin, InstallContext } from "@openacp/plugin-sdk";
+import type { OpenACPPlugin, InstallContext, OpenACPCore } from "@openacp/plugin-sdk";
 import { log } from "@openacp/plugin-sdk";
 import { TeamsAdapter } from "./adapter.js";
 import type { TeamsChannelConfig } from "./types.js";
@@ -22,6 +22,9 @@ export default function createTeamsPlugin(): OpenACPPlugin {
     description: "Microsoft Teams adapter with Adaptive Cards, commands, and streaming",
     essential: false,
     permissions: ["services:register", "kernel:access", "events:read", "commands:register"],
+    // TODO: Add Zod settingsSchema when @openacp/plugin-sdk exports a schema builder.
+    // Required fields: enabled, botAppId, botAppPassword, tenantId, teamId, channelId
+    // Optional: notificationChannelId, assistantThreadId, graphClientSecret
 
     // ─── Interactive Install Wizard ──────────────────────────────────────
 
@@ -578,9 +581,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         return;
       }
 
-      const core = ctx.core as import("@openacp/plugin-sdk").OpenACPCore;
-
-      adapter = new TeamsAdapter(core, config as unknown as TeamsChannelConfig);
+      adapter = new TeamsAdapter(ctx.core as OpenACPCore, config as unknown as TeamsChannelConfig);
       ctx.registerService("adapter:teams", adapter);
       ctx.log.info("Teams adapter registered");
     },

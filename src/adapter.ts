@@ -25,13 +25,12 @@ import type { TeamsChannelConfig } from "./types.js";
 import { TeamsDraftManager } from "./draft-manager.js";
 import { PermissionHandler } from "./permissions.js";
 import { handleCommand, setupCardActionCallbacks, SLASH_COMMANDS } from "./commands/index.js";
-import { spawnAssistant, buildWelcomeMessage } from "./assistant.js";
+import { spawnAssistant } from "./assistant.js";
 import { downloadTeamsFile, isAttachmentTooLarge, buildFileAttachmentCard, uploadFileViaGraph } from "./media.js";
 import { GraphFileClient } from "./graph.js";
 import { ConversationStore } from "./conversation-store.js";
 import { sendText, sendCard, sendActivity } from "./send-utils.js";
-import type { StoredConversationReference } from "./conversation-store.js";
-import { formatPlan, renderUsageCard, renderToolCallCard, renderPlanCard, buildCitationEntities } from "./formatting.js";
+import { renderUsageCard, renderToolCallCard, renderPlanCard, buildCitationEntities } from "./formatting.js";
 import { buildNewSessionDialog, buildSettingsDialog, buildDialogMessage } from "./task-modules.js";
 import type { ToolCallMeta } from "@openacp/plugin-sdk";
 import type { OutputMode } from "./activity.js";
@@ -48,7 +47,7 @@ export class TeamsAdapter extends MessagingAdapter {
     streaming: true,
     richFormatting: true,
     threads: true,
-    reactions: true,
+    reactions: false,
     fileUpload: true,
     voice: false,
   };
@@ -61,8 +60,6 @@ export class TeamsAdapter extends MessagingAdapter {
   private permissionHandler!: PermissionHandler;
 
   private notificationChannelId?: string;
-  private notificationConversationId?: string;
-  private notificationContext?: TurnContext;
   private assistantSession: Session | null = null;
   private assistantInitializing = false;
   private fileService: FileServiceInterface;
@@ -81,6 +78,9 @@ export class TeamsAdapter extends MessagingAdapter {
    * SessionBridge fires sendMessage() as fire-and-forget, so multiple events can arrive
    * concurrently. Without serialization, fast handlers overtake slow ones, causing
    * out-of-order delivery. This queue ensures events are processed in arrival order.
+   *
+   * Entries are replaced with Promise.resolve() once their chain settles, preventing
+   * unbounded closure growth for long-lived sessions.
    */
   private _dispatchQueues = new Map<string, Promise<void>>();
 
@@ -88,7 +88,8 @@ export class TeamsAdapter extends MessagingAdapter {
   private _processedActivities = new Map<string, number>();
   private _processedCleanupTimer?: ReturnType<typeof setInterval>;
 
-  /** Messages buffered during assistant initialization — replayed once ready */
+  /** Messages buffered during assistant initialization — replayed once ready. Capped to prevent unbounded growth. */
+  private static readonly MAX_INIT_BUFFER = 50;
   private _assistantInitBuffer: Array<{ sessionId: string; content: OutgoingMessage }> = [];
 
   /** Bot token cache for proactive messaging via connector REST API */
@@ -105,11 +106,11 @@ export class TeamsAdapter extends MessagingAdapter {
     this.core = core;
     this.teamsConfig = config;
     this.sendQueue = new SendQueue({ minInterval: 1000 });
-    this.draftManager = new TeamsDraftManager(this.sendQueue as any);
+    this.draftManager = new TeamsDraftManager(this.sendQueue);
     this.fileService = core.fileService;
 
     // Persistent conversation reference store for proactive messaging
-    const storageDir = core.configManager.resolveDataDir?.() ?? process.cwd();
+    const storageDir = (core.configManager as any).instanceRoot ?? process.cwd();
     this.conversationStore = new ConversationStore(storageDir);
 
     // Initialize Graph API client for file operations (optional)
@@ -190,7 +191,6 @@ export class TeamsAdapter extends MessagingAdapter {
       this.assistantSession = null;
     }
 
-    this.notificationContext = undefined;
     this._sessionContexts.clear();
     this._sessionOutputModes.clear();
     this._dispatchQueues.clear();
@@ -263,23 +263,24 @@ export class TeamsAdapter extends MessagingAdapter {
 
         if (!text && !context.activity.attachments?.length) return;
 
-        // Persist conversation reference for proactive messaging (survives restarts)
+        // Persist conversation reference for proactive messaging (survives restarts).
+        // Validate serviceUrl against known Bot Framework endpoints to prevent
+        // SSRF via spoofed serviceUrl redirecting bot tokens to an attacker.
         if (context.activity.conversation?.id && context.activity.serviceUrl) {
-          this.conversationStore.upsert({
-            conversationId: context.activity.conversation.id,
-            serviceUrl: context.activity.serviceUrl,
-            tenantId: context.activity.conversation.tenantId ?? this.teamsConfig.tenantId,
-            channelId: context.activity.channelId,
-            botId: context.activity.recipient?.id ?? this.teamsConfig.botAppId,
-            botName: context.activity.recipient?.name ?? "OpenACP",
-            updatedAt: Date.now(),
-          });
-        }
-
-        // Capture notification channel context on first message
-        if (this.notificationChannelId && conversationId === this.notificationChannelId) {
-          this.notificationConversationId = conversationId;
-          this.notificationContext = context;
+          const serviceUrl = context.activity.serviceUrl as string;
+          if (TeamsAdapter.isValidServiceUrl(serviceUrl)) {
+            this.conversationStore.upsert({
+              conversationId: context.activity.conversation.id,
+              serviceUrl,
+              tenantId: context.activity.conversation.tenantId ?? this.teamsConfig.tenantId,
+              channelId: context.activity.channelId,
+              botId: context.activity.recipient?.id ?? this.teamsConfig.botAppId,
+              botName: context.activity.recipient?.name ?? "OpenACP",
+              updatedAt: Date.now(),
+            });
+          } else {
+            log.warn({ serviceUrl: serviceUrl.slice(0, 80) }, "[TeamsAdapter] Rejected untrusted serviceUrl");
+          }
         }
 
         const existingSession = this.core.sessionManager.getSessionByThread("teams", threadId);
@@ -427,56 +428,76 @@ export class TeamsAdapter extends MessagingAdapter {
       const verb = data.verb as string | undefined;
       if (!verb) return;
 
-      // Permission response: data has verb + sessionId + callbackKey + requestId
-      if (data.sessionId && data.callbackKey && data.requestId) {
-        const handled = await this.permissionHandler.handleCardAction(
-          context,
-          verb,
-          data.sessionId as string,
-          data.callbackKey as string,
-          data.requestId as string,
-        );
-        if (handled) return;
-      }
-
-      // Output mode change: verb = "om:<sessionId>:<mode>"
-      if (verb.startsWith("om:")) {
-        const parts = verb.split(":");
-        if (parts.length === 3) {
-          const [, sessionId, mode] = parts;
-          if (mode === "low" || mode === "medium" || mode === "high") {
-            this._sessionOutputModes.set(sessionId, mode as OutputMode);
-            await sendText(context, `🔄 Output mode: **${mode}**`);
-            return;
-          }
-        }
-      }
-
-      // Session cancel: verb = "cancel:<sessionId>"
-      if (verb.startsWith("cancel:")) {
-        const sessionId = verb.split(":")[1];
-        if (sessionId) {
-          const session = this.core.sessionManager.getSession(sessionId);
-          if (session) {
-            try {
-              await session.destroy();
-              await sendText(context, "❌ Session cancelled");
-            } catch (err) {
-              log.error({ err, sessionId }, "[TeamsAdapter] cancel: destroy failed");
-              await sendText(context, "❌ Failed to cancel session");
-            }
-          }
-        }
-        return;
-      }
-
-      // Command button: verb = "cmd:<command>"
-      if (verb.startsWith("cmd:")) {
-        await setupCardActionCallbacks(context, this);
-        return;
-      }
+      await this.dispatchCardVerb(context, verb, data);
     } catch (err) {
       log.error({ err }, "[TeamsAdapter] handleSubmitAction error");
+    }
+  }
+
+  /**
+   * Shared card action dispatch — handles verbs from both Action.Submit and
+   * Action.Execute (invoke) paths. Eliminates duplication between
+   * handleSubmitAction and cardActionHandler.
+   */
+  private async dispatchCardVerb(context: any, verb: string, data: Record<string, unknown>): Promise<void> {
+    // Permission response: data has verb + sessionId + callbackKey + requestId
+    if (data.sessionId && data.callbackKey && data.requestId) {
+      const handled = await this.permissionHandler.handleCardAction(
+        context,
+        verb,
+        data.sessionId as string,
+        data.callbackKey as string,
+        data.requestId as string,
+      );
+      if (handled) return;
+    }
+
+    // Output mode change: verb = "om:<sessionId>:<mode>"
+    if (verb.startsWith("om:")) {
+      const parts = verb.split(":");
+      if (parts.length === 3) {
+        const [, sessionId, mode] = parts;
+        // Validate the sessionId references a real session before acting
+        if (mode === "low" || mode === "medium" || mode === "high") {
+          const session = this.core.sessionManager.getSession(sessionId);
+          if (!session) {
+            log.warn({ sessionId }, "[TeamsAdapter] output mode change: session not found");
+            return;
+          }
+          this._sessionOutputModes.set(sessionId, mode as OutputMode);
+          await sendText(context, `🔄 Output mode: **${mode}**`);
+          return;
+        }
+      }
+    }
+
+    // Session cancel: verb = "cancel:<sessionId>"
+    if (verb.startsWith("cancel:")) {
+      const sessionId = verb.split(":")[1];
+      if (sessionId) {
+        const session = this.core.sessionManager.getSession(sessionId);
+        if (session) {
+          try {
+            await session.destroy();
+          } catch (err) {
+            log.error({ err, sessionId }, "[TeamsAdapter] cancel: destroy failed");
+            try {
+              await sendText(context, "❌ Failed to cancel session");
+            } catch { /* best effort */ }
+            return;
+          }
+          try {
+            await sendText(context, "❌ Session cancelled");
+          } catch { /* best effort */ }
+        }
+      }
+      return;
+    }
+
+    // Command button: verb = "cmd:<command>"
+    if (verb.startsWith("cmd:")) {
+      await setupCardActionCallbacks(context, this);
+      return;
     }
   }
 
@@ -512,7 +533,7 @@ export class TeamsAdapter extends MessagingAdapter {
 
             // Emit reaction event so plugins (usage tracking, analytics) can consume it
             if (this.core.eventBus) {
-              this.core.eventBus.emit("teams:reaction", {
+              (this.core.eventBus as any).emit("teams:reaction", {
                 type: reaction.type,
                 sentiment: positive ? "positive" : negative ? "negative" : "neutral",
                 replyToId,
@@ -706,52 +727,7 @@ export class TeamsAdapter extends MessagingAdapter {
 
       if (!verb) return;
 
-      if (data?.sessionId && data?.callbackKey && data?.requestId) {
-        const handled = await this.permissionHandler.handleCardAction(
-          context,
-          verb,
-          data.sessionId as string,
-          data.callbackKey as string,
-          data.requestId as string,
-        );
-        if (handled) return;
-      }
-
-      if (typeof verb === "string" && verb.startsWith("om:")) {
-        const parts = verb.split(":");
-        if (parts.length === 3) {
-          const [_prefix, sessionId, mode] = parts;
-          if (mode === "low" || mode === "medium" || mode === "high") {
-            this._sessionOutputModes.set(sessionId, mode as OutputMode);
-            await sendText(context, `🔄 Output mode: **${mode}**`);
-            return;
-          }
-        }
-      }
-
-      if (verb.startsWith("cancel:")) {
-        const sessionId = verb.split(":")[1];
-        if (sessionId) {
-          const session = this.core.sessionManager.getSession(sessionId);
-          if (session) {
-            try {
-              await session.destroy();
-            } catch (err) {
-              log.error({ err, sessionId }, "[TeamsAdapter] cancel: destroy failed");
-              try {
-                await sendText(context, "❌ Failed to cancel session");
-              } catch { /* best effort */ }
-              return;
-            }
-            try {
-              await sendText(context, "❌ Session cancelled");
-            } catch { /* best effort */ }
-          }
-        }
-        return;
-      }
-
-      await setupCardActionCallbacks(context, this);
+      await this.dispatchCardVerb(context, verb, data);
     } catch (err) {
       log.error({ err }, "[TeamsAdapter] card.action handler error");
     }
@@ -967,9 +943,25 @@ export class TeamsAdapter extends MessagingAdapter {
   // ─── Retry helper — matches Telegram's retryWithBackoff and 429 handling ──
 
   /**
-   * Send a Teams activity with exponential backoff retry on transient failures.
-   * Handles HTTP 429 (rate limited), 502, 504 per Microsoft best practices.
+   * Validate that a serviceUrl is a trusted Bot Framework endpoint.
+   * Prevents SSRF where a spoofed serviceUrl could redirect bot tokens.
+   *
+   * @see https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-api-reference
    */
+  private static readonly TRUSTED_SERVICE_URL_PATTERNS = [
+    /^https:\/\/[\w.-]+\.botframework\.com\b/i,
+    /^https:\/\/[\w.-]+\.teams\.microsoft\.com\b/i,
+    /^https:\/\/smba\.trafficmanager\.net\b/i,
+    /^https:\/\/[\w.-]+\.botframework\.azure\.us\b/i,
+    // Allow localhost for development
+    /^https?:\/\/localhost(:\d+)?\b/,
+    /^https?:\/\/127\.0\.0\.1(:\d+)?\b/,
+  ];
+
+  static isValidServiceUrl(url: string): boolean {
+    return TeamsAdapter.TRUSTED_SERVICE_URL_PATTERNS.some((pattern) => pattern.test(url));
+  }
+
   /** AI-generated content entity — attached to all outbound messages for the Teams "AI generated" badge */
   private static readonly AI_ENTITY = {
     type: "https://schema.org/Message",
@@ -978,6 +970,10 @@ export class TeamsAdapter extends MessagingAdapter {
     additionalType: ["AIGeneratedContent"],
   };
 
+  /**
+   * Send a Teams activity with exponential backoff retry on transient failures.
+   * Handles HTTP 429 (rate limited), 502, 504 per Microsoft best practices.
+   */
   private async sendActivityWithRetry(
     context: TurnContext,
     activity: Record<string, unknown>,
@@ -1072,7 +1068,11 @@ export class TeamsAdapter extends MessagingAdapter {
       this.assistantSession &&
       sessionId === this.assistantSession.id
     ) {
-      this._assistantInitBuffer.push({ sessionId, content });
+      if (this._assistantInitBuffer.length < TeamsAdapter.MAX_INIT_BUFFER) {
+        this._assistantInitBuffer.push({ sessionId, content });
+      } else {
+        log.warn({ sessionId }, "[TeamsAdapter] Assistant init buffer full, dropping message");
+      }
       return;
     }
 
@@ -1131,6 +1131,12 @@ export class TeamsAdapter extends MessagingAdapter {
     // Set immediately — before any await — so the next concurrent caller sees this entry
     this._dispatchQueues.set(sessionId, next);
     await next;
+    // Replace settled chain with a fresh resolved promise to prevent unbounded
+    // closure growth for long-lived sessions. Only replace if no new work was
+    // chained while we were awaiting (i.e., the entry still points to `next`).
+    if (this._dispatchQueues.get(sessionId) === next) {
+      this._dispatchQueues.set(sessionId, Promise.resolve());
+    }
   }
 
   // ─── Handler overrides ───────────────────────────────────────────────────
@@ -1286,14 +1292,35 @@ export class TeamsAdapter extends MessagingAdapter {
     return {};
   }
 
+  /**
+   * Clean up all per-session state (contexts, drafts, dispatch queues, output modes).
+   * Removes both sessionId and threadId entries from _sessionContexts to prevent leaks.
+   */
+  private cleanupSessionState(sessionId: string): void {
+    // Find and remove the threadId entry that may also reference this session's context
+    const session = this.core.sessionManager.getSession(sessionId);
+    const threadId = session?.threadId;
+    if (threadId && threadId !== sessionId) {
+      this._sessionContexts.delete(threadId);
+    }
+    const record = this.core.sessionManager.getSessionRecord(sessionId);
+    const recordThreadId = (record?.platform as Record<string, unknown>)?.threadId as string | undefined;
+    if (recordThreadId && recordThreadId !== sessionId && recordThreadId !== threadId) {
+      this._sessionContexts.delete(recordThreadId);
+    }
+
+    this._sessionContexts.delete(sessionId);
+    this._sessionOutputModes.delete(sessionId);
+    this._dispatchQueues.delete(sessionId);
+    this.draftManager.cleanup(sessionId);
+  }
+
   protected async handleSessionEnd(sessionId: string, _content: OutgoingMessage): Promise<void> {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
-    this.draftManager.cleanup(sessionId);
-    this._sessionOutputModes.delete(sessionId);
-    this._dispatchQueues.delete(sessionId);
+    this.cleanupSessionState(sessionId);
     try {
       await this.sendActivityWithRetry(context, {
         text: "✅ **Done**",
@@ -1308,9 +1335,7 @@ export class TeamsAdapter extends MessagingAdapter {
     if (!ctx) return;
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
-    this.draftManager.cleanup(sessionId);
-    this._sessionOutputModes.delete(sessionId);
-    this._dispatchQueues.delete(sessionId);
+    this.cleanupSessionState(sessionId);
     try {
       await this.sendActivityWithRetry(context, {
         text: `❌ **Error:** ${content.text}`,
@@ -1325,6 +1350,18 @@ export class TeamsAdapter extends MessagingAdapter {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const { context, isAssistant } = ctx;
+
+    // Strip TTS markers from the draft BEFORE finalizing — finalize() deletes
+    // the draft from the map, so getDraft() would return undefined after it.
+    if (attachment.type === "audio") {
+      const draft = this.draftManager.getDraft(sessionId);
+      if (draft) {
+        await draft.stripPattern(/\[TTS\][\s\S]*?\[\/TTS\]/g).catch((err) => {
+          log.warn({ err, sessionId }, "[TeamsAdapter] handleAttachment: stripPattern failed");
+        });
+      }
+    }
+
     await this.draftManager.finalize(sessionId, context, isAssistant);
 
     if (isAttachmentTooLarge(attachment.size)) {
@@ -1349,15 +1386,6 @@ export class TeamsAdapter extends MessagingAdapter {
 
       const card = buildFileAttachmentCard(attachment.fileName, attachment.size, attachment.mimeType, shareUrl ?? undefined);
       await this.sendActivityWithRetry(context, { attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)] });
-
-      if (attachment.type === "audio") {
-        const draft = this.draftManager.getDraft(sessionId);
-        if (draft) {
-          draft.stripPattern(/\[TTS\][\s\S]*?\[\/TTS\]/g).catch((err) => {
-            log.warn({ err, sessionId }, "[TeamsAdapter] handleAttachment: stripPattern failed");
-          });
-        }
-      }
     } catch (err) {
       log.error({ err, sessionId, fileName: attachment.fileName }, "[TeamsAdapter] Failed to send attachment");
     }
@@ -1369,6 +1397,65 @@ export class TeamsAdapter extends MessagingAdapter {
     const { context } = ctx;
     try {
       await this.sendActivityWithRetry(context, { text: content.text });
+    } catch { /* best effort */ }
+  }
+
+  protected async handleModeChange(sessionId: string, content: OutgoingMessage): Promise<void> {
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
+    const renderer = this.renderer as TeamsRenderer;
+    const rendered = renderer.renderModeChange(content);
+    try {
+      await this.sendActivityWithRetry(ctx.context, { text: rendered.body });
+    } catch { /* best effort */ }
+  }
+
+  protected async handleConfigUpdate(sessionId: string, content: OutgoingMessage): Promise<void> {
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
+    const renderer = this.renderer as TeamsRenderer;
+    const rendered = renderer.renderConfigUpdate(content);
+    try {
+      await this.sendActivityWithRetry(ctx.context, { text: rendered.body });
+    } catch { /* best effort */ }
+  }
+
+  protected async handleModelUpdate(sessionId: string, content: OutgoingMessage): Promise<void> {
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
+    const renderer = this.renderer as TeamsRenderer;
+    const rendered = renderer.renderModelUpdate(content);
+    try {
+      await this.sendActivityWithRetry(ctx.context, { text: rendered.body });
+    } catch { /* best effort */ }
+  }
+
+  protected async handleUserReplay(sessionId: string, content: OutgoingMessage): Promise<void> {
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
+    try {
+      await this.sendActivityWithRetry(ctx.context, { text: content.text });
+    } catch { /* best effort */ }
+  }
+
+  protected async handleResource(sessionId: string, content: OutgoingMessage): Promise<void> {
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
+    try {
+      await this.sendActivityWithRetry(ctx.context, { text: content.text });
+    } catch { /* best effort */ }
+  }
+
+  protected async handleResourceLink(sessionId: string, content: OutgoingMessage): Promise<void> {
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
+    const url = (content.metadata as Record<string, unknown>)?.url as string | undefined;
+    const rawName = (content.metadata as Record<string, unknown>)?.name as string | undefined;
+    // Sanitize name to prevent markdown injection — strip characters that break link syntax
+    const name = rawName?.replace(/[\[\]\(\)]/g, "") || undefined;
+    const text = url ? `📎 [${name || url}](${url})` : content.text;
+    try {
+      await this.sendActivityWithRetry(ctx.context, { text });
     } catch { /* best effort */ }
   }
 
@@ -1392,7 +1479,7 @@ export class TeamsAdapter extends MessagingAdapter {
 
   async sendNotification(notification: NotificationMessage): Promise<void> {
     const typeIcon: Record<string, string> = {
-      completed: "✅", error: "❌", permission: "🔐", input_required: "💬",
+      completed: "✅", error: "❌", permission: "🔐", input_required: "💬", budget_warning: "⚠️",
     };
 
     const icon = typeIcon[notification.type] ?? "ℹ️";
@@ -1402,20 +1489,12 @@ export class TeamsAdapter extends MessagingAdapter {
       text += `\n${notification.deepLink}`;
     }
 
-    // Route to notification thread if we have a live context
-    if (this.notificationContext && this.notificationChannelId) {
-      try {
-        await sendText(this.notificationContext, text);
-        return;
-      } catch (err) {
-        log.warn({ err, type: notification.type }, "[TeamsAdapter] Failed to send notification via live context, trying proactive");
-      }
-    }
-
-    // Fallback: proactive messaging via stored conversation reference + bot token
+    // Proactive messaging via stored conversation reference + bot token.
+    // We do NOT use a stored TurnContext here — TurnContexts are scoped to a
+    // single HTTP request/response cycle and go stale after the turn ends.
     if (this.notificationChannelId) {
       const ref = this.conversationStore.get(this.notificationChannelId) ?? this.conversationStore.getAny();
-      if (ref) {
+      if (ref && TeamsAdapter.isValidServiceUrl(ref.serviceUrl)) {
         try {
           const botToken = await this.acquireBotToken();
           if (botToken) {
@@ -1447,14 +1526,17 @@ export class TeamsAdapter extends MessagingAdapter {
       }
     }
 
-    // Session-specific context fallback
+    // Session-specific context fallback — last resort, may fail if the
+    // TurnContext's HTTP response stream has closed since the turn ended.
     if (notification.sessionId) {
       const ctx = this._sessionContexts.get(notification.sessionId);
       if (ctx) {
         try {
           await sendText(ctx.context, text);
           return;
-        } catch { /* best effort */ }
+        } catch (err) {
+          log.debug({ err, sessionId: notification.sessionId }, "[TeamsAdapter] Session context fallback failed (context may be stale)");
+        }
       }
     }
 
@@ -1473,7 +1555,7 @@ export class TeamsAdapter extends MessagingAdapter {
   async createSessionThread(sessionId: string, name: string): Promise<string> {
     // Try to create a real Teams conversation thread
     const ref = this.conversationStore.getAny();
-    if (ref) {
+    if (ref && TeamsAdapter.isValidServiceUrl(ref.serviceUrl)) {
       try {
         const botToken = await this.acquireBotToken();
         if (!botToken) throw new Error("No bot token available");
@@ -1487,7 +1569,7 @@ export class TeamsAdapter extends MessagingAdapter {
             tenantId: ref.tenantId,
             activity: {
               type: "message",
-              text: `**${name}** — New session started`,
+              text: `**${name.replace(/[*_~`[\]()\\]/g, "")}** — New session started`,
             },
             channelData: {
               channel: { id: this.teamsConfig.channelId },
@@ -1534,16 +1616,24 @@ export class TeamsAdapter extends MessagingAdapter {
     return threadId;
   }
 
+  /**
+   * Rename a session thread. This is a no-op for Teams — the Teams API does not
+   * support renaming channel conversations. Renaming a group chat requires
+   * Graph API with Chat.ReadWrite.All permission, which most bot registrations
+   * don't have. The new name is stored in the session record for display purposes.
+   */
   async renameSessionThread(sessionId: string, newName: string): Promise<void> {
     const record = this.core.sessionManager.getSessionRecord(sessionId);
     if (!record) return;
-    const threadId = record.platform?.threadId as string | undefined;
-    if (!threadId) return;
 
-    // Teams Graph API would be needed for actual rename:
-    // PATCH https://graph.microsoft.com/v1.0/chats/{chat-id}
-    // Requires Chat.ReadWrite.All permission
-    log.info({ sessionId, threadId, newName }, "[TeamsAdapter] renameSessionThread — requires Graph API (Chat.ReadWrite.All)");
+    // Persist the name in the session record even though Teams can't be updated
+    try {
+      await this.core.sessionManager.patchRecord(sessionId, {
+        platform: { ...record.platform, displayName: newName },
+      });
+    } catch { /* best effort */ }
+
+    log.debug({ sessionId, newName }, "[TeamsAdapter] renameSessionThread — name stored locally (Teams API does not support conversation rename)");
   }
 
   async deleteSessionThread(sessionId: string): Promise<void> {

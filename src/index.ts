@@ -1,4 +1,6 @@
-export { default as createTeamsPlugin } from "./plugin.js";
+import createTeamsPlugin from "./plugin.js";
+export { createTeamsPlugin };
+export default createTeamsPlugin();
 export { TeamsAdapter } from "./adapter.js";
 export { TeamsRenderer } from "./renderer.js";
 export type { TeamsChannelConfig, TeamsPlatformData } from "./types.js";

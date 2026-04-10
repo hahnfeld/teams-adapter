@@ -127,6 +127,7 @@ describe("PermissionHandler", () => {
 
       // Now handle the card action
       const actionContext = {
+        activity: { from: { id: "user-1", name: "Test User" } },
         sendActivity: vi.fn().mockResolvedValue(undefined),
         updateActivity: mockUpdateActivity,
       };

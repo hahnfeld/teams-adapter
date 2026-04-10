@@ -30,6 +30,11 @@ export class TeamsMessageDraft {
     private sessionId: string,
   ) {}
 
+  /** Update the TurnContext to the latest inbound turn (prevents stale context refs) */
+  updateContext(context: TurnContext): void {
+    this.context = context;
+  }
+
   append(text: string): void {
     if (!text) return;
     this.buffer += text;
@@ -240,6 +245,10 @@ export class TeamsDraftManager {
     if (!draft) {
       draft = new TeamsMessageDraft(context, this.sendQueue, sessionId);
       this.drafts.set(sessionId, draft);
+    } else {
+      // Re-bind to the latest TurnContext to prevent stale context references
+      // when a new inbound message arrives on the same session (new turn).
+      draft.updateContext(context);
     }
     return draft;
   }

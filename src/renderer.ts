@@ -53,8 +53,10 @@ export class TeamsRenderer extends BaseRenderer {
     return { body: `🔄 **Mode:** ${modeId}`, format: "markdown" };
   }
 
-  renderConfigUpdate(): { body: string; format: "markdown" } {
-    return { body: "⚙️ **Config updated**", format: "markdown" };
+  renderConfigUpdate(content?: OutgoingMessage): { body: string; format: "markdown" } {
+    const key = content ? (content.metadata as Record<string, unknown>)?.key : undefined;
+    const detail = key ? ` \`${key}\`` : "";
+    return { body: `⚙️ **Config updated**${detail}`, format: "markdown" };
   }
 
   renderModelUpdate(content: OutgoingMessage): { body: string; format: "markdown" } {

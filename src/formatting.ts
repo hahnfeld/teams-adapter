@@ -112,7 +112,7 @@ export function extractContentText(content: unknown): string {
 }
 
 export function stripCodeFences(text: string): string {
-  return text.replace(/^```[\w]*\n?/gm, "").replace(/\n?```$/gm, "");
+  return text.replace(/^```[\w]*\n?/gm, "").replace(/\n?```$/gm, "").trim();
 }
 
 export function resolveToolIcon(kind: string, displayKind?: string, status?: string): string {

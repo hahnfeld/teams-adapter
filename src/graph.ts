@@ -183,7 +183,7 @@ export class GraphFileClient {
         Authorization: `Bearer ${token}`,
         "Content-Type": contentType,
       },
-      body: content,
+      body: new Uint8Array(content),
     });
 
     if (!response.ok) {
@@ -243,7 +243,7 @@ export class GraphFileClient {
           "Content-Length": String(chunk.length),
           "Content-Range": `bytes ${offset}-${end - 1}/${totalSize}`,
         },
-        body: chunk,
+        body: new Uint8Array(chunk),
       });
 
       if (!lastResponse.ok && lastResponse.status !== 202) {
