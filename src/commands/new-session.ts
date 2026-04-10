@@ -1,5 +1,6 @@
 import type { CommandContext } from "./index.js";
 import { log } from "@openacp/plugin-sdk";
+import { sendCard } from "../send-utils.js";
 
 /**
  * Handle /new [agent] [workspace] — create a new agent session.
@@ -10,13 +11,24 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
   const workspace = args[1];
 
   if (!agentName) {
-    const agents = ctx.adapter.core.agentManager.getAvailableAgents();
-    const agentList = agents.map((a) => `- ${a.name}`).join("\n");
-    await ctx.reply(
-      `**Create a new session**\n\n` +
-      `Usage: \`/new <agent> [workspace]\`\n\n` +
-      `**Available agents:**\n${agentList || "_No agents installed_"}`,
-    );
+    // Offer the Task Module dialog for a guided session creation experience
+    const card = {
+      type: "AdaptiveCard",
+      version: "1.2",
+      body: [
+        { type: "TextBlock", text: "**Create a New Session**", weight: "Bolder", size: "Medium" },
+        { type: "TextBlock", text: "Choose an agent and workspace to start a coding session.", wrap: true, isSubtle: true },
+        { type: "TextBlock", text: "Or use: `/new <agent> [workspace]`", size: "Small", isSubtle: true, spacing: "Medium" },
+      ],
+      actions: [
+        {
+          type: "Action.Submit",
+          title: "Open Session Wizard",
+          data: { msteams: { type: "task/fetch" }, dialogId: "new-session" },
+        },
+      ],
+    };
+    await sendCard(ctx.context, card as Record<string, unknown>);
     return;
   }
 

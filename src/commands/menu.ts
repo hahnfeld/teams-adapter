@@ -1,5 +1,5 @@
 import type { CommandContext } from "./index.js";
-import { sendCard } from "../send-utils.js";
+import { sendCard, sendActivity } from "../send-utils.js";
 
 /**
  * Handle /menu — show the main action menu as an Adaptive Card with buttons.
@@ -14,10 +14,21 @@ export async function handleMenu(ctx: CommandContext): Promise<void> {
       { type: "TextBlock", text: "Quick actions for managing sessions and agents.", wrap: true, isSubtle: true },
     ],
     actions: [
-      { type: "Action.Submit", title: "➕ New Session", data: { verb: "cmd:new" } },
+      // Task Module dialog — opens a modal form for session creation
+      {
+        type: "Action.Submit",
+        title: "➕ New Session",
+        data: { msteams: { type: "task/fetch" }, dialogId: "new-session" },
+      },
+      // Task Module dialog — opens settings modal
+      {
+        type: "Action.Submit",
+        title: "⚙️ Settings",
+        data: { msteams: { type: "task/fetch" }, dialogId: "settings", sessionId: ctx.sessionId },
+      },
+      // Inline commands
       { type: "Action.Submit", title: "📊 Status", data: { verb: "cmd:status" } },
       { type: "Action.Submit", title: "📋 Sessions", data: { verb: "cmd:sessions" } },
-      { type: "Action.Submit", title: "🤖 Agents", data: { verb: "cmd:agents" } },
       { type: "Action.Submit", title: "🔍 Doctor", data: { verb: "cmd:doctor" } },
     ],
   };
@@ -57,7 +68,18 @@ export async function handleHelp(ctx: CommandContext): Promise<void> {
     "`/restart` — Restart OpenACP",
     "`/clear` — Reset assistant session",
   ];
-  await ctx.reply(commands.join("\n"));
+  // Send with suggested action buttons for quick access (1:1 chat only)
+  await sendActivity(ctx.context, {
+    text: commands.join("\n"),
+    suggestedActions: {
+      actions: [
+        { type: "imBack", title: "➕ New", value: "/new" },
+        { type: "imBack", title: "📊 Status", value: "/status" },
+        { type: "imBack", title: "🤖 Agents", value: "/agents" },
+        { type: "imBack", title: "📋 Menu", value: "/menu" },
+      ],
+    },
+  });
 }
 
 /**

@@ -3,7 +3,10 @@ import { log } from "@openacp/plugin-sdk";
 import { splitMessage } from "./formatting.js";
 import { sendText, updateActivity as updateTeamsActivity } from "./send-utils.js";
 
-const FLUSH_INTERVAL = 5000;
+/** First flush fires quickly so the user sees content fast */
+const FIRST_FLUSH_INTERVAL = 500;
+/** Subsequent flushes are slower to avoid rate limits (Teams: 7 ops/sec/conversation) */
+const UPDATE_FLUSH_INTERVAL = 3000;
 const MAX_DISPLAY_LENGTH = 1900;
 
 export interface MessageRef {
@@ -39,10 +42,12 @@ export class TeamsMessageDraft {
 
   private scheduleFlush(): void {
     if (this.flushTimer) return;
+    // Fast first flush (500ms) for perceived responsiveness, then slower updates (3s)
+    const interval = this.ref?.activityId ? UPDATE_FLUSH_INTERVAL : FIRST_FLUSH_INTERVAL;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
       this.flushPromise = this.flushPromise.then(() => this.flush()).catch(() => {});
-    }, FLUSH_INTERVAL);
+    }, interval);
   }
 
   async flush(): Promise<void> {

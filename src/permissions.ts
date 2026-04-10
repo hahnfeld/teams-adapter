@@ -10,6 +10,29 @@ interface PendingPermission {
   options: { id: string; isAllow: boolean }[];
   activityId?: string;
   conversationId?: string;
+  createdAt: number;
+}
+
+/** Try to extract a tool/action name from the permission description text */
+function parseDescriptionContext(description: string): { tool?: string; target?: string; risk: "high" | "normal" } {
+  let tool: string | undefined;
+  let target: string | undefined;
+  let risk: "high" | "normal" = "normal";
+
+  // Common patterns: "Allow Read /path/to/file", "Execute: bash command", "Edit src/foo.ts"
+  const toolMatch = description.match(/^(Read|Write|Edit|Execute|Bash|Delete|Install|Command|Fetch|Search|Agent)\b/i);
+  if (toolMatch) tool = toolMatch[1];
+
+  // Extract file paths
+  const pathMatch = description.match(/[`"]?([/~][\w./\-@]+|[a-zA-Z]:\\[\w\\.\-]+)[`"]?/);
+  if (pathMatch) target = pathMatch[1];
+
+  // High-risk keywords
+  if (/\b(delete|remove|drop|rm\b|force|sudo|--hard|--force|push)\b/i.test(description)) {
+    risk = "high";
+  }
+
+  return { tool, target, risk };
 }
 
 export class PermissionHandler {
@@ -25,7 +48,7 @@ export class PermissionHandler {
     const MAX_PENDING = 100;
     if (this.pending.size < MAX_PENDING) return;
     const now = Date.now();
-    const staleThreshold = 10 * 60 * 1000; // 10 minutes
+    const staleThreshold = 10 * 60 * 1000;
     for (const [key, ts] of this.pendingTimestamps) {
       if (now - ts > staleThreshold) {
         this.pending.delete(key);
@@ -41,39 +64,68 @@ export class PermissionHandler {
   ): Promise<void> {
     this.evictStale();
     const callbackKey = nanoid(8);
+    const now = Date.now();
     this.pending.set(callbackKey, {
       sessionId: session.id,
       requestId: request.id,
       options: request.options.map((o) => ({ id: o.id, isAllow: o.isAllow })),
       activityId: context.activity.id as string | undefined,
       conversationId: context.activity.conversation?.id as string | undefined,
+      createdAt: now,
     });
-    this.pendingTimestamps.set(callbackKey, Date.now());
+    this.pendingTimestamps.set(callbackKey, now);
 
-    // Use Adaptive Card v1.2 + Action.Submit for Teams mobile compatibility
-    // (Teams mobile only reliably supports schema ≤1.2; Action.Execute requires 1.4)
+    const { tool, target, risk } = parseDescriptionContext(request.description);
+    const headerColor = risk === "high" ? "Attention" : "Warning";
+
+    // Build rich permission card (Adaptive Card v1.2 for mobile compatibility)
+    const body: unknown[] = [
+      // Header with risk-colored icon
+      {
+        type: "ColumnSet",
+        columns: [
+          { type: "Column", width: "auto", items: [{ type: "TextBlock", text: risk === "high" ? "⚠️" : "🔐", size: "Large" }] },
+          {
+            type: "Column", width: "stretch", items: [
+              { type: "TextBlock", text: "Permission Request", weight: "Bolder", size: "Medium", color: headerColor },
+              ...(session.name ? [{ type: "TextBlock", text: session.name, size: "Small", isSubtle: true, spacing: "None" }] : []),
+            ],
+          },
+        ],
+      },
+      // Description
+      { type: "TextBlock", text: request.description, wrap: true, spacing: "Medium" },
+    ];
+
+    // Context facts (tool, target)
+    const facts: Array<{ title: string; value: string }> = [];
+    if (tool) facts.push({ title: "Action", value: tool });
+    if (target) facts.push({ title: "Target", value: target });
+    if (facts.length > 0) {
+      body.push({ type: "FactSet", facts, spacing: "Small" });
+    }
+
+    // Risk warning for destructive operations
+    if (risk === "high") {
+      body.push({
+        type: "TextBlock",
+        text: "⚠️ This action may be destructive or hard to reverse.",
+        color: "Attention",
+        size: "Small",
+        wrap: true,
+        spacing: "Medium",
+      });
+    }
+
     const card = {
       type: "AdaptiveCard" as const,
       version: "1.2" as const,
-      body: [
-        {
-          type: "TextBlock" as const,
-          text: "🔐 Permission Request",
-          weight: "Bolder" as const,
-          color: "Warning" as const,
-          size: "Medium" as const,
-        },
-        {
-          type: "TextBlock" as const,
-          text: request.description,
-          wrap: true,
-          spacing: "Medium" as const,
-        },
-      ],
-      // Action.Submit sends activity.value as the flat data object directly
+      body,
+      // Action.Submit sends activity.value as the flat data object
       actions: request.options.map((option) => ({
         type: "Action.Submit" as const,
         title: `${option.isAllow ? "✅" : "❌"} ${option.label}`,
+        ...(risk === "high" && !option.isAllow ? { style: "destructive" } : {}),
         data: { verb: option.isAllow ? "allow" : "deny", sessionId: session.id, callbackKey, requestId: request.id },
       })),
     };
@@ -110,8 +162,9 @@ export class PermissionHandler {
 
     const pending = this.pending.get(callbackKey);
     if (!pending) {
+      // Update the original card to show expired state
       try {
-        await sendText(context, "❌ Permission request expired");
+        await sendText(context, "❌ Permission request expired or already responded to.");
       } catch (err) {
         log.warn({ err, callbackKey }, "[PermissionHandler] Failed to send expired message");
       }
@@ -119,8 +172,10 @@ export class PermissionHandler {
     }
 
     const session = this.getSession(pending.sessionId);
+    const respondedBy = context.activity.from?.name ?? context.activity.from?.id ?? "Unknown";
+    const elapsed = Math.round((Date.now() - pending.createdAt) / 1000);
 
-    log.info({ requestId: pending.requestId, verb, sessionId }, "[PermissionHandler] Permission responded");
+    log.info({ requestId: pending.requestId, verb, sessionId, respondedBy, elapsedSec: elapsed }, "[PermissionHandler] Permission responded");
 
     if (session?.permissionGate?.requestId === pending.requestId) {
       const wantAllow = verb === "allow" || verb === "always";
@@ -128,9 +183,8 @@ export class PermissionHandler {
       if (option) {
         session.permissionGate.resolve(option.id);
       } else {
-        // Fallback: resolve with the first option matching intent, or the first option
         const fallback = pending.options[wantAllow ? 0 : pending.options.length - 1];
-        log.warn({ requestId: pending.requestId, verb, optionCount: pending.options.length }, "[PermissionHandler] No matching option for verb, using fallback");
+        log.warn({ requestId: pending.requestId, verb, optionCount: pending.options.length }, "[PermissionHandler] No matching option, using fallback");
         session.permissionGate.resolve(fallback?.id ?? pending.options[0]?.id ?? "denied");
       }
     }
@@ -138,20 +192,36 @@ export class PermissionHandler {
     this.pending.delete(callbackKey);
     this.pendingTimestamps.delete(callbackKey);
 
-    try {
-      await sendText(context, `✅ Permission ${verb === "always" ? "always-allowed" : verb === "allow" ? "Allowed" : "Denied"}`);
-    } catch (err) {
-      log.warn({ err, callbackKey }, "[PermissionHandler] Failed to send response message");
-    }
-
+    // Update the original card to show the response with who/when
     if (pending.activityId && pending.conversationId) {
       try {
+        const decision = verb === "always" ? "Always Allowed" : verb === "allow" ? "Allowed" : "Denied";
+        const decisionColor = verb === "deny" ? "Attention" : "Good";
+        const decisionIcon = verb === "deny" ? "❌" : "✅";
+
         const updatedCard = {
           type: "AdaptiveCard" as const,
           version: "1.2" as const,
           body: [
-            { type: "TextBlock" as const, text: "🔐 Permission Request — Responded", weight: "Bolder" as const, isSubtle: true },
-            { type: "TextBlock" as const, text: `✅ ${verb === "always" ? "Always Allowed" : verb === "allow" ? "Allowed" : "Denied"}`, wrap: true },
+            {
+              type: "ColumnSet",
+              columns: [
+                { type: "Column", width: "auto", items: [{ type: "TextBlock", text: decisionIcon, size: "Large" }] },
+                {
+                  type: "Column", width: "stretch", items: [
+                    { type: "TextBlock", text: `Permission — ${decision}`, weight: "Bolder", color: decisionColor },
+                  ],
+                },
+              ],
+            },
+            {
+              type: "FactSet",
+              facts: [
+                { title: "Responded by", value: respondedBy },
+                { title: "Response time", value: elapsed < 60 ? `${elapsed}s` : `${Math.round(elapsed / 60)}m` },
+              ],
+              spacing: "Small",
+            },
           ],
           actions: [] as unknown[],
         };
@@ -160,7 +230,7 @@ export class PermissionHandler {
           conversation: { id: pending.conversationId },
           attachments: [adaptiveCardAttachment(updatedCard as Record<string, unknown>)],
         });
-      } catch { /* ignore */ }
+      } catch { /* ignore update failures */ }
     }
 
     return true;

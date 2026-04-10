@@ -31,7 +31,9 @@ import { GraphFileClient } from "./graph.js";
 import { ConversationStore } from "./conversation-store.js";
 import { sendText, sendCard, sendActivity } from "./send-utils.js";
 import type { StoredConversationReference } from "./conversation-store.js";
-import { formatPlan, renderUsageCard } from "./formatting.js";
+import { formatPlan, renderUsageCard, renderToolCallCard, renderPlanCard, buildCitationEntities } from "./formatting.js";
+import { buildNewSessionDialog, buildSettingsDialog, buildDialogMessage } from "./task-modules.js";
+import type { ToolCallMeta } from "@openacp/plugin-sdk";
 import type { OutputMode } from "./activity.js";
 
 /** Max retry attempts for transient Teams API failures */
@@ -46,7 +48,7 @@ export class TeamsAdapter extends MessagingAdapter {
     streaming: true,
     richFormatting: true,
     threads: true,
-    reactions: false,
+    reactions: true,
     fileUpload: true,
     voice: false,
   };
@@ -142,6 +144,8 @@ export class TeamsAdapter extends MessagingAdapter {
 
       this.setupMessageHandler();
       this.setupCardActionHandler();
+      this.setupTaskModuleHandlers();
+      this.setupReactionHandler();
 
       // Periodic cleanup of processed activity IDs (deduplication cache)
       this._processedCleanupTimer = setInterval(() => {
@@ -382,6 +386,9 @@ export class TeamsAdapter extends MessagingAdapter {
           this.draftManager.cleanup(sessionId);
         }
 
+        // Show typing indicator while the agent processes the message
+        this.sendTyping(context);
+
         await this.core.handleMessage({
           channelId: "teams",
           threadId,
@@ -409,6 +416,14 @@ export class TeamsAdapter extends MessagingAdapter {
    */
   private async handleSubmitAction(context: any, data: Record<string, unknown>): Promise<void> {
     try {
+      // Task Module dialog triggers: Action.Submit with msteams.type = "task/fetch"
+      // sends dialogId but no verb. Handle these by sending the dialog card inline.
+      const dialogId = data.dialogId as string | undefined;
+      if (dialogId && !data.verb) {
+        await this.handleInlineDialog(context, dialogId, data);
+        return;
+      }
+
       const verb = data.verb as string | undefined;
       if (!verb) return;
 
@@ -463,6 +478,213 @@ export class TeamsAdapter extends MessagingAdapter {
     } catch (err) {
       log.error({ err }, "[TeamsAdapter] handleSubmitAction error");
     }
+  }
+
+  // ─── Reaction handler ────────────────────────────────────────────────────
+
+  /**
+   * Handle message reactions (like, heart, laugh, surprised, sad, angry).
+   *
+   * Teams sends messageReaction activities when users react to bot messages.
+   * We log them as engagement signals and emit an event so plugins can act
+   * on them (e.g., aggregate feedback, adjust behavior).
+   */
+  private setupReactionHandler(): void {
+    this.app.on("messageReaction" as any, async (context: any) => {
+      try {
+        const added = context.activity.reactionsAdded as Array<{ type: string }> | undefined;
+        const removed = context.activity.reactionsRemoved as Array<{ type: string }> | undefined;
+        const replyToId = context.activity.replyToId as string | undefined;
+        const userId = context.activity.from?.id ?? "unknown";
+        const userName = context.activity.from?.name;
+        const conversationId = context.activity.conversation?.id;
+
+        if (added?.length) {
+          for (const reaction of added) {
+            log.info(
+              { reaction: reaction.type, replyToId, userId, userName, conversationId },
+              "[TeamsAdapter] Reaction added",
+            );
+
+            // Map Teams reactions to sentiment signals
+            const positive = ["like", "heart", "laugh"].includes(reaction.type);
+            const negative = ["sad", "angry"].includes(reaction.type);
+
+            // Emit reaction event so plugins (usage tracking, analytics) can consume it
+            if (this.core.eventBus) {
+              this.core.eventBus.emit("teams:reaction", {
+                type: reaction.type,
+                sentiment: positive ? "positive" : negative ? "negative" : "neutral",
+                replyToId,
+                userId,
+                userName,
+                conversationId,
+              });
+            }
+          }
+        }
+
+        if (removed?.length) {
+          for (const reaction of removed) {
+            log.debug(
+              { reaction: reaction.type, replyToId, userId },
+              "[TeamsAdapter] Reaction removed",
+            );
+          }
+        }
+      } catch (err) {
+        log.warn({ err }, "[TeamsAdapter] Reaction handler error");
+      }
+    });
+  }
+
+  // ─── Task Module handlers (modal dialogs) ────────────────────────────────
+
+  /**
+   * Register task/fetch and task/submit invoke handlers for Teams modal dialogs.
+   * Task Modules are triggered by Action.Submit with msteams.type = "task/fetch".
+   */
+  private setupTaskModuleHandlers(): void {
+    // task/fetch — return the dialog card
+    this.app.on("task.fetch" as any, async (context: any) => {
+      try {
+        const data = context.activity.value?.data as Record<string, unknown> | undefined;
+        const dialogId = data?.dialogId as string | undefined;
+
+        if (dialogId === "new-session") {
+          const agents = this.core.agentManager.getAvailableAgents();
+          const workspace = this.core.configManager.resolveWorkspace?.() ?? process.cwd();
+          return buildNewSessionDialog(agents, workspace);
+        }
+
+        if (dialogId === "settings") {
+          const sessionId = data?.sessionId as string | undefined;
+          const session = sessionId ? this.core.sessionManager.getSession(sessionId) : undefined;
+          const config = this.core.configManager.get();
+          return buildSettingsDialog({
+            defaultAgent: config.defaultAgent,
+            workspace: this.core.configManager.resolveWorkspace?.(),
+            outputMode: "medium",
+            sessionId: sessionId ?? undefined,
+            sessionAgent: session?.agentName,
+            sessionModel: session?.getConfigByCategory?.("model")?.currentValue as string | undefined,
+            sessionBypass: !!session?.clientOverrides?.bypassPermissions,
+            sessionTts: session?.voiceMode,
+          });
+        }
+
+        return buildDialogMessage("Unknown dialog");
+      } catch (err) {
+        log.error({ err }, "[TeamsAdapter] task.fetch error");
+        return buildDialogMessage("Failed to load dialog");
+      }
+    });
+
+    // task/submit — process form data from the dialog
+    this.app.on("task.submit" as any, async (context: any) => {
+      try {
+        const data = context.activity.value?.data as Record<string, unknown> | undefined;
+        const action = data?.dialogAction as string | undefined;
+
+        if (action === "new-session") {
+          const agentName = data?.agent as string;
+          const workspace = data?.workspace as string;
+          if (!agentName || !workspace) {
+            return buildDialogMessage("Agent and workspace are required.");
+          }
+
+          try {
+            const session = await this.core.sessionManager.createSession(
+              "teams",
+              agentName,
+              workspace,
+              this.core.agentManager,
+            );
+            const threadId = await this.createSessionThread(session.id, session.name || agentName);
+            session.threadId = threadId;
+            session.threadIds.set("teams", threadId);
+
+            // Store context for the new session
+            const conversationId = context.activity.conversation?.id;
+            if (conversationId) {
+              this._sessionContexts.set(session.id, {
+                context,
+                isAssistant: false,
+              });
+            }
+
+            return buildDialogMessage(`Session created with ${agentName} in ${workspace}`);
+          } catch (err) {
+            log.error({ err, agentName, workspace }, "[TeamsAdapter] task.submit new-session error");
+            return buildDialogMessage(`Failed to create session: ${(err as Error).message}`);
+          }
+        }
+
+        if (action === "save-settings") {
+          const outputMode = data?.outputMode as string | undefined;
+          const bypass = data?.bypass as string | undefined;
+          const sessionId = data?.sessionId as string | undefined;
+
+          if (outputMode && sessionId) {
+            this.setSessionOutputMode(sessionId, outputMode as "low" | "medium" | "high");
+          }
+          if (bypass !== undefined && sessionId) {
+            const session = this.core.sessionManager.getSession(sessionId);
+            if (session) {
+              session.clientOverrides = { ...session.clientOverrides, bypassPermissions: bypass === "true" };
+            }
+          }
+
+          return buildDialogMessage("Settings saved");
+        }
+
+        return buildDialogMessage("Unknown action");
+      } catch (err) {
+        log.error({ err }, "[TeamsAdapter] task.submit error");
+        return buildDialogMessage("Failed to process");
+      }
+    });
+  }
+
+  /**
+   * Handle a dialog request that arrived via Action.Submit (not invoke).
+   * Since Action.Submit doesn't trigger the task/fetch invoke path,
+   * we send the dialog card as a regular inline message instead.
+   */
+  private async handleInlineDialog(context: any, dialogId: string, data: Record<string, unknown>): Promise<void> {
+    if (dialogId === "new-session") {
+      const agents = this.core.agentManager.getAvailableAgents();
+      const workspace = this.core.configManager.resolveWorkspace?.() ?? process.cwd();
+      const dialog = buildNewSessionDialog(agents, workspace);
+      const cardContent = (dialog.task as any)?.value?.card?.content;
+      if (cardContent) {
+        await sendCard(context, cardContent);
+      }
+      return;
+    }
+
+    if (dialogId === "settings") {
+      const sessionId = data.sessionId as string | undefined;
+      const session = sessionId ? this.core.sessionManager.getSession(sessionId) : undefined;
+      const config = this.core.configManager.get();
+      const dialog = buildSettingsDialog({
+        defaultAgent: config.defaultAgent,
+        workspace: this.core.configManager.resolveWorkspace?.(),
+        outputMode: "medium",
+        sessionId: sessionId ?? undefined,
+        sessionAgent: session?.agentName,
+        sessionModel: session?.getConfigByCategory?.("model")?.currentValue as string | undefined,
+        sessionBypass: !!session?.clientOverrides?.bypassPermissions,
+        sessionTts: session?.voiceMode,
+      });
+      const cardContent = (dialog.task as any)?.value?.card?.content;
+      if (cardContent) {
+        await sendCard(context, cardContent);
+      }
+      return;
+    }
+
+    await sendText(context, "Unknown dialog");
   }
 
   // ─── Card action handler (for Action.Execute / invoke activities) ─────
@@ -644,27 +866,30 @@ export class TeamsAdapter extends MessagingAdapter {
       const { session, ready } = await spawnAssistant(this.core, threadId);
       this.assistantSession = session;
 
-      // Safety timeout: if ready never resolves, clear the initializing flag after 60s
-      const timeout = setTimeout(() => {
-        if (this.assistantInitializing) {
-          log.warn("[TeamsAdapter] Assistant ready timeout — clearing initializing flag");
-          this.assistantInitializing = false;
-          this._assistantInitBuffer.splice(0); // discard stale buffered messages
+      // Guard ensures only one of timeout/ready acts on the buffer (prevents race)
+      let settled = false;
+      const settle = (replay: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.assistantInitializing = false;
+        const buffered = this._assistantInitBuffer.splice(0);
+        if (replay) {
+          for (const { sessionId: sid, content: msg } of buffered) {
+            this.sendMessage(sid, msg).catch((err) => {
+              log.warn({ err, sessionId: sid }, "[TeamsAdapter] Failed to replay buffered assistant message");
+            });
+          }
         }
+      };
+
+      const timeout = setTimeout(() => {
+        log.warn("[TeamsAdapter] Assistant ready timeout — clearing initializing flag");
+        settle(false); // discard stale messages on timeout
       }, 60_000);
       if (timeout.unref) timeout.unref();
 
-      ready.finally(() => {
-        clearTimeout(timeout);
-        this.assistantInitializing = false;
-        // Replay any messages buffered during initialization
-        const buffered = this._assistantInitBuffer.splice(0);
-        for (const { sessionId: sid, content: msg } of buffered) {
-          this.sendMessage(sid, msg).catch((err) => {
-            log.warn({ err, sessionId: sid }, "[TeamsAdapter] Failed to replay buffered assistant message");
-          });
-        }
-      });
+      ready.finally(() => settle(true)); // replay buffered messages on success
     } catch (err) {
       this.assistantInitializing = false;
       this._assistantInitBuffer.splice(0);
@@ -684,6 +909,13 @@ export class TeamsAdapter extends MessagingAdapter {
 
   async restartAssistant(): Promise<void> {
     await this.respawnAssistant();
+  }
+
+  // ─── Typing indicator ────────────────────────────────────────────────────
+
+  /** Send a typing indicator to the user. Non-critical — failures are silently ignored. */
+  private sendTyping(context: TurnContext): void {
+    sendActivity(context, { type: "typing" }).catch(() => {});
   }
 
   // ─── Bot token for proactive messaging ────────────────────────────────────
@@ -738,10 +970,31 @@ export class TeamsAdapter extends MessagingAdapter {
    * Send a Teams activity with exponential backoff retry on transient failures.
    * Handles HTTP 429 (rate limited), 502, 504 per Microsoft best practices.
    */
+  /** AI-generated content entity — attached to all outbound messages for the Teams "AI generated" badge */
+  private static readonly AI_ENTITY = {
+    type: "https://schema.org/Message",
+    "@type": "Message",
+    "@context": "https://schema.org",
+    additionalType: ["AIGeneratedContent"],
+  };
+
   private async sendActivityWithRetry(
     context: TurnContext,
     activity: Record<string, unknown>,
   ): Promise<unknown> {
+    // Attach AI-generated content label to all message activities.
+    // Clone the activity to avoid mutating the caller's object (and duplicating on retries).
+    if (!activity.type || activity.type === "message") {
+      const existing = (activity.entities as unknown[] | undefined) ?? [];
+      // Skip if an AIGeneratedContent entity is already present (e.g., citation entities)
+      const hasAiLabel = existing.some((e: any) =>
+        Array.isArray(e?.additionalType) && e.additionalType.includes("AIGeneratedContent"),
+      );
+      if (!hasAiLabel) {
+        activity = { ...activity, entities: [...existing, TeamsAdapter.AI_ENTITY] };
+      }
+    }
+
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         return await sendActivity(context, activity);
@@ -892,6 +1145,10 @@ export class TeamsAdapter extends MessagingAdapter {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const { context } = ctx;
+    // Send typing indicator on first text chunk (before draft exists)
+    if (!this.draftManager.hasDraft(sessionId)) {
+      this.sendTyping(context);
+    }
     const draft = this.draftManager.getOrCreate(sessionId, context);
     draft.append(content.text);
   }
@@ -900,10 +1157,48 @@ export class TeamsAdapter extends MessagingAdapter {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const { context, isAssistant } = ctx;
+    this.sendTyping(context);
     await this.draftManager.finalize(sessionId, context, isAssistant);
     try {
-      const rendered = this.renderer.renderToolCall(content, verbosity);
-      await this.sendActivityWithRetry(context, { text: rendered.body });
+      const meta = (content.metadata ?? {}) as Partial<ToolCallMeta>;
+      const cardData = renderToolCallCard({
+        id: meta.id ?? "",
+        name: meta.name ?? content.text ?? "Tool",
+        kind: meta.kind,
+        status: meta.status,
+        rawInput: meta.rawInput,
+        content: meta.content,
+        displaySummary: meta.displaySummary as string | undefined,
+        displayTitle: meta.displayTitle as string | undefined,
+        displayKind: meta.displayKind as string | undefined,
+        viewerLinks: meta.viewerLinks as { file?: string; diff?: string } | undefined,
+        viewerFilePath: meta.viewerFilePath as string | undefined,
+      }, verbosity);
+      const card = { type: "AdaptiveCard", version: "1.2", ...cardData };
+
+      // Build citation entities for file references (hover popup with source info)
+      const citationSources: Array<{ name: string; url: string; abstract?: string }> = [];
+      const filePath = meta.viewerFilePath as string | undefined;
+      const links = meta.viewerLinks as { file?: string; diff?: string } | undefined;
+      if (filePath && links?.file) {
+        citationSources.push({ name: filePath.split("/").pop() || filePath, url: links.file, abstract: `Source: ${filePath}` });
+      }
+      if (filePath && links?.diff) {
+        citationSources.push({ name: `${filePath.split("/").pop() || filePath} (diff)`, url: links.diff, abstract: `Changes to ${filePath}` });
+      }
+      const citationEntities = buildCitationEntities(citationSources);
+
+      // Citations require [N] markers in the text field — Teams ignores citation entities
+      // on card-only activities with no text anchor. Add a text field with markers.
+      const citationText = citationSources.length > 0
+        ? citationSources.map((s, i) => `[${i + 1}]`).join(" ")
+        : undefined;
+
+      await this.sendActivityWithRetry(context, {
+        ...(citationText ? { text: citationText } : {}),
+        attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)],
+        ...(citationEntities.length > 0 ? { entities: citationEntities } : {}),
+      });
     } catch (err) {
       log.error({ err, sessionId }, "[TeamsAdapter] handleToolCall: sendActivity failed");
     }
@@ -929,12 +1224,8 @@ export class TeamsAdapter extends MessagingAdapter {
     const { context } = ctx;
     const entries = (content.metadata as { entries?: PlanEntry[] })?.entries ?? [];
     const mode = this.resolveMode(sessionId);
-    const text = formatPlan(entries, mode);
-    const card = {
-      type: "AdaptiveCard" as const,
-      version: "1.2" as const,
-      body: [{ type: "TextBlock" as const, text, wrap: true }],
-    };
+    const cardData = renderPlanCard(entries, mode);
+    const card = { type: "AdaptiveCard", version: "1.2", ...cardData };
     try {
       await this.sendActivityWithRetry(context, { attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)] });
     } catch (err) {
@@ -952,7 +1243,11 @@ export class TeamsAdapter extends MessagingAdapter {
     const { body } = renderUsageCard(meta ?? {}, mode);
     const card = { type: "AdaptiveCard" as const, version: "1.2" as const, body };
     try {
-      await this.sendActivityWithRetry(context, { attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)] });
+      // Feedback buttons on usage/completion messages — Teams shows thumbs up/down
+      await this.sendActivityWithRetry(context, {
+        attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)],
+        channelData: { feedbackLoop: { type: "default" } },
+      });
     } catch (err) {
       log.error({ err, sessionId }, "[TeamsAdapter] handleUsage: sendActivity failed");
     }
@@ -970,6 +1265,27 @@ export class TeamsAdapter extends MessagingAdapter {
     }
   }
 
+  /** Suggested quick-reply actions (Teams restricts these to 1:1 personal chat only) */
+  private static readonly QUICK_ACTIONS = {
+    suggestedActions: {
+      actions: [
+        { type: "imBack", title: "➕ New Session", value: "/new" },
+        { type: "imBack", title: "📊 Status", value: "/status" },
+        { type: "imBack", title: "📋 Sessions", value: "/sessions" },
+        { type: "imBack", title: "📋 Menu", value: "/menu" },
+      ],
+    },
+  };
+
+  /** Return QUICK_ACTIONS only if the conversation is 1:1 personal chat (Teams requirement) */
+  private getQuickActions(context: TurnContext): Record<string, unknown> {
+    const convType = (context.activity as Record<string, unknown>).conversation as Record<string, unknown> | undefined;
+    if (convType?.conversationType === "personal") {
+      return TeamsAdapter.QUICK_ACTIONS;
+    }
+    return {};
+  }
+
   protected async handleSessionEnd(sessionId: string, _content: OutgoingMessage): Promise<void> {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
@@ -979,7 +1295,11 @@ export class TeamsAdapter extends MessagingAdapter {
     this._sessionOutputModes.delete(sessionId);
     this._dispatchQueues.delete(sessionId);
     try {
-      await this.sendActivityWithRetry(context, { text: "✅ **Done**" });
+      await this.sendActivityWithRetry(context, {
+        text: "✅ **Done**",
+        channelData: { feedbackLoop: { type: "default" } },
+        ...this.getQuickActions(context),
+      });
     } catch { /* best effort */ }
   }
 
@@ -989,8 +1309,13 @@ export class TeamsAdapter extends MessagingAdapter {
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
     this.draftManager.cleanup(sessionId);
+    this._sessionOutputModes.delete(sessionId);
+    this._dispatchQueues.delete(sessionId);
     try {
-      await this.sendActivityWithRetry(context, { text: `❌ **Error:** ${content.text}` });
+      await this.sendActivityWithRetry(context, {
+        text: `❌ **Error:** ${content.text}`,
+        ...this.getQuickActions(context),
+      });
     } catch { /* best effort */ }
   }
 
