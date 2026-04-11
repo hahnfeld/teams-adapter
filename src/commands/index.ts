@@ -219,6 +219,9 @@ export async function setupCardActionCallbacks(
         case "doctor":
           await handleDoctor(ctx);
           break;
+        case "settings":
+          await handleSettings(ctx);
+          break;
         case "noop":
           break;
         default:

@@ -515,8 +515,14 @@ export class TeamsAdapter extends MessagingAdapter {
    */
   private async handleSubmitAction(context: any, data: Record<string, unknown>): Promise<void> {
     try {
-      // Task Module dialog triggers: Action.Submit with msteams.type = "task/fetch"
-      // sends dialogId but no verb. Handle these by sending the dialog card inline.
+      // Inline dialog form submissions (dialogAction from inline wizard cards)
+      const dialogAction = data.dialogAction as string | undefined;
+      if (dialogAction) {
+        await this.handleDialogAction(context, dialogAction, data);
+        return;
+      }
+
+      // Legacy: Task Module dialog triggers (dialogId without verb)
       const dialogId = data.dialogId as string | undefined;
       if (dialogId && !data.verb) {
         await this.handleInlineDialog(context, dialogId, data);
@@ -602,6 +608,13 @@ export class TeamsAdapter extends MessagingAdapter {
           } catch { /* best effort */ }
         }
       }
+      return;
+    }
+
+    // Inline dialog form submission: verb = "dialog:<action>"
+    if (verb.startsWith("dialog:")) {
+      const action = verb.slice(7);
+      await this.handleDialogAction(context, action, data);
       return;
     }
 
@@ -800,9 +813,75 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   /**
-   * Handle a dialog request that arrived via Action.Submit (not invoke).
-   * Since Action.Submit doesn't trigger the task/fetch invoke path,
-   * we send the dialog card as a regular inline message instead.
+   * Handle form submissions from inline wizard cards (dialogAction payloads).
+   * These come from Action.Submit buttons on cards rendered directly in chat.
+   */
+  private async handleDialogAction(context: any, action: string, data: Record<string, unknown>): Promise<void> {
+    if (action === "new-session") {
+      const agentName = data.agent as string;
+      const workspace = data.workspace as string;
+      if (!agentName || !workspace) {
+        await sendText(context, "❌ Agent and workspace are required.");
+        return;
+      }
+
+      const availableAgents = this.core.agentManager.getAvailableAgents();
+      if (!availableAgents.some((a) => a.name === agentName)) {
+        await sendText(context, `❌ Unknown agent: ${agentName}`);
+        return;
+      }
+
+      try {
+        await sendText(context, `🔄 Creating session with **${agentName}**...`);
+        const session = await this.core.sessionManager.createSession(
+          "teams",
+          agentName,
+          workspace,
+          this.core.agentManager,
+        );
+        const threadId = await this.createSessionThread(session.id, session.name || agentName);
+        session.threadId = threadId;
+        session.threadIds.set("teams", threadId);
+
+        await sendText(context,
+          `✅ Session created\n\n` +
+          `**Agent:** ${agentName}\n\n` +
+          `**Workspace:** \`${workspace}\`\n\n` +
+          `**Session:** ${session.id.slice(0, 8)}`,
+        );
+      } catch (err) {
+        log.error({ err, agentName, workspace }, "[TeamsAdapter] handleDialogAction new-session error");
+        await sendText(context, `❌ Failed to create session: ${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (action === "save-settings") {
+      const outputMode = data.outputMode as string | undefined;
+      const sessionId = data.sessionId as string | undefined;
+      const bypass = data.bypass as string | undefined;
+
+      if (outputMode && (outputMode === "low" || outputMode === "medium" || outputMode === "high")) {
+        if (sessionId) {
+          this._sessionOutputModes.set(sessionId, outputMode as OutputMode);
+        }
+      }
+      if (bypass !== undefined && sessionId) {
+        const session = this.core.sessionManager.getSession(sessionId);
+        if (session?.clientOverrides) {
+          session.clientOverrides.bypassPermissions = bypass === "true";
+        }
+      }
+      await sendText(context, "✅ Settings saved");
+      return;
+    }
+
+    await sendText(context, `Unknown action: ${action}`);
+  }
+
+  /**
+   * Legacy: Handle a dialog request that arrived via Action.Submit with dialogId (not invoke).
+   * Kept for backwards compatibility with older card payloads.
    */
   private async handleInlineDialog(context: any, dialogId: string, data: Record<string, unknown>): Promise<void> {
     if (dialogId === "new-session") {

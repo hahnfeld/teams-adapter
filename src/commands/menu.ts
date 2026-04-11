@@ -14,18 +14,8 @@ export async function handleMenu(ctx: CommandContext): Promise<void> {
       { type: "TextBlock", text: "Quick actions for managing sessions and agents.", wrap: true, isSubtle: true },
     ],
     actions: [
-      // Task Module dialog — opens a modal form for session creation
-      {
-        type: "Action.Submit",
-        title: "➕ New Session",
-        data: { msteams: { type: "task/fetch" }, dialogId: "new-session" },
-      },
-      // Task Module dialog — opens settings modal
-      {
-        type: "Action.Submit",
-        title: "⚙️ Settings",
-        data: { msteams: { type: "task/fetch" }, dialogId: "settings", sessionId: ctx.sessionId },
-      },
+      { type: "Action.Submit", title: "➕ New Session", data: { verb: "cmd:new" } },
+      { type: "Action.Submit", title: "⚙️ Settings", data: { verb: "cmd:settings" } },
       // Inline commands
       { type: "Action.Submit", title: "📊 Status", data: { verb: "cmd:status" } },
       { type: "Action.Submit", title: "📋 Sessions", data: { verb: "cmd:sessions" } },

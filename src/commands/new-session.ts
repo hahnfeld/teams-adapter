@@ -11,21 +11,28 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
   const workspace = args[1];
 
   if (!agentName) {
-    // Offer the Task Module dialog for a guided session creation experience
+    // Send the session wizard inline as an Adaptive Card.
+    // Task modules (task/fetch popups) don't work reliably for sideloaded apps,
+    // so we render the wizard directly in the chat.
+    const agents = ctx.adapter.core.agentManager.getAvailableAgents();
+    const workspace = ctx.adapter.core.configManager.resolveWorkspace?.() ?? process.cwd();
+    const agentChoices = agents.map((a: { name: string }) => ({ title: a.name, value: a.name }));
+    if (agentChoices.length === 0) {
+      agentChoices.push({ title: "openacp", value: "openacp" });
+    }
     const card = {
       type: "AdaptiveCard",
-      version: "1.2",
+      version: "1.4",
       body: [
-        { type: "TextBlock", text: "**Create a New Session**", weight: "Bolder", size: "Medium" },
-        { type: "TextBlock", text: "Choose an agent and workspace to start a coding session.", wrap: true, isSubtle: true },
-        { type: "TextBlock", text: "Or use: `/new <agent> [workspace]`", size: "Small", isSubtle: true, spacing: "Medium" },
+        { type: "TextBlock", text: "**New Session**", weight: "Bolder", size: "Large" },
+        { type: "TextBlock", text: "Select an agent and workspace to start a coding session.", wrap: true, isSubtle: true, spacing: "Small" },
+        { type: "TextBlock", text: "Agent", weight: "Bolder", spacing: "Large" },
+        { type: "Input.ChoiceSet", id: "agent", style: "compact", value: agentChoices[0].value, choices: agentChoices },
+        { type: "TextBlock", text: "Workspace (project directory)", weight: "Bolder", spacing: "Large" },
+        { type: "Input.Text", id: "workspace", placeholder: "/path/to/project", value: workspace },
       ],
       actions: [
-        {
-          type: "Action.Submit",
-          title: "Open Session Wizard",
-          data: { msteams: { type: "task/fetch" }, dialogId: "new-session" },
-        },
+        { type: "Action.Execute", title: "Create Session", verb: "dialog:new-session" },
       ],
     };
     await sendCard(ctx.context, card as Record<string, unknown>);
