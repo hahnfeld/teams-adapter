@@ -11,14 +11,15 @@ Microsoft Teams adapter plugin for [OpenACP](https://github.com/Open-ACP/OpenACP
 - **Permissions** — Allow/Deny/Always Allow via Adaptive Card buttons
 - **Output Modes** — Low/Medium/High detail levels
 - **File Sharing** — Upload and share files via Microsoft Graph / OneDrive
-- **Interactive Install Wizard** — Guided setup with credential validation and auto-discovery
+- **Interactive Install Wizard** — Guided setup with credential validation, auto-discovery, and app package generation
+- **Auto-session Creation** — First message automatically creates a session with the default agent
 
 ## Prerequisites
 
 - [OpenACP CLI](https://github.com/Open-ACP/OpenACP) `>= 2026.0.0`
 - Node.js 18+
 - An **Azure Bot registration** with the Microsoft Teams channel enabled
-- A Microsoft 365 tenant with a Teams team and channel
+- A Microsoft 365 tenant with a Teams team and channel (a [Business Basic trial](https://www.microsoft.com/en-us/microsoft-365/business/compare-all-plans) works for testing)
 
 ## Installation
 
@@ -28,7 +29,7 @@ Microsoft Teams adapter plugin for [OpenACP](https://github.com/Open-ACP/OpenACP
 openacp plugin install @openacp/teams-adapter
 ```
 
-This launches an interactive wizard that walks you through Azure Bot setup, credential validation, and team/channel selection.
+This launches an interactive wizard that walks you through Azure Bot setup, credential validation, team/channel selection, and generates a Teams app package for sideloading.
 
 ### Option B: Manual npm install
 
@@ -46,7 +47,7 @@ Before configuring the adapter you need an Azure Bot registration. If you don't 
 2. Fill in:
    - **Bot handle**: any unique name (e.g. `openacp-bot`)
    - **Pricing tier**: Free (F0) for testing
-   - **App type**: "Single Tenant" for enterprise use, "Multi Tenant" for public bots
+   - **App type**: "Single Tenant" for enterprise use
    - **Creation type**: "Create new Microsoft App ID"
 3. Click **Create** and wait for deployment
 4. Go to the Bot resource > **Settings** > **Configuration**
@@ -73,6 +74,19 @@ The wizard guides you through:
 3. Team and channel selection — auto-discovered via Graph API, or paste a Teams channel link
 4. Optional notification channel for session completions and errors
 5. Optional Graph API file sharing (OneDrive)
+6. **Auto-generates a Teams app package** (`openacp-bot.zip`) for sideloading
+
+### Adding the bot to Teams
+
+After the wizard completes, you need to upload the app package to Teams:
+
+1. The wizard generates `openacp-bot.zip` — note the path it prints
+2. Open Microsoft Teams
+3. Go to **Apps** (left sidebar) > **Manage your apps** > **Upload a custom app**
+4. Select the `openacp-bot.zip` file
+5. Click **Add to a team** > select your team > **Set up a bot**
+
+The bot will now appear in your team. You can @mention it in channels or DM it directly.
 
 ### Manual configuration
 
@@ -113,6 +127,8 @@ channels:
 2. Right-click the channel name > **Get link to channel**
 3. The link contains `groupId` (Team ID) and the channel path
 
+Both `teams.microsoft.com` and `teams.cloud.microsoft` link formats are supported.
+
 **From the Azure/Graph API:**
 - Team ID = the `groupId` parameter from the Teams URL
 - Channel ID = the encoded string like `19:xxx@thread.tacv2`
@@ -123,7 +139,28 @@ After installation, set the bot's messaging endpoint in Azure:
 
 1. Azure Portal > Bot resource > **Configuration** > **Messaging endpoint**
 2. Set it to: `https://your-server.com/api/messages`
-3. Make sure your server is publicly reachable (use a tunnel like ngrok for local development)
+3. Make sure your server is publicly reachable (use a tunnel for local development)
+
+### Local development with Dev Tunnels
+
+For local testing, use [Microsoft Dev Tunnels](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/get-started) to expose port 3978 (the Bot Framework messaging endpoint):
+
+```bash
+# Install
+brew install --cask devtunnel   # macOS
+
+# Login and create a persistent tunnel
+devtunnel user login
+devtunnel create --allow-anonymous
+devtunnel port create -p 3978
+
+# Host it (use the same tunnel ID each time for a stable URL)
+devtunnel host <tunnel-id> --allow-anonymous
+```
+
+Set the tunnel URL as the messaging endpoint in Azure: `https://<id>.devtunnels.ms/api/messages`
+
+> **Important:** Always use `--allow-anonymous` — Azure Bot Service cannot authenticate with Dev Tunnel auth.
 
 ## Slash Commands
 
@@ -186,6 +223,7 @@ src/
 ├── index.ts             # Plugin entry point & public exports
 ├── plugin.ts            # Plugin factory (install wizard, configure, setup/teardown)
 ├── adapter.ts           # TeamsAdapter — extends MessagingAdapter
+├── app-package.ts       # Teams app manifest package generator
 ├── renderer.ts          # TeamsRenderer (Adaptive Card rendering)
 ├── activity.ts          # ActivityTracker (tool card state, streaming)
 ├── formatting.ts        # Tool card formatting, usage cards, citations
@@ -194,7 +232,7 @@ src/
 ├── graph.ts             # GraphFileClient (OneDrive file sharing)
 ├── media.ts             # File download/upload utilities
 ├── conversation-store.ts # Conversation reference storage
-├── send-utils.ts        # Message sending helpers
+├── send-utils.ts        # Message sending helpers (Teams SDK compat)
 ├── task-modules.ts      # Task module dialogs (new session, settings)
 ├── assistant.ts         # Assistant session spawning
 ├── validators.ts        # Credential & tenant validation, Teams link parsing
@@ -216,6 +254,8 @@ src/
 - [`@microsoft/teams.apps`](https://www.npmjs.com/package/@microsoft/teams.apps) — App class, server hosting, activity routing
 - [`@microsoft/teams.botbuilder`](https://www.npmjs.com/package/@microsoft/teams.botbuilder) — Bot Framework adapter plugin
 - [`@microsoft/agents-hosting`](https://www.npmjs.com/package/@microsoft/agents-hosting) — Express server hosting
+- [`botbuilder`](https://www.npmjs.com/package/botbuilder) — CloudAdapter for single-tenant auth
+- [`botframework-connector`](https://www.npmjs.com/package/botframework-connector) — Credential factory for token validation
 - [`adaptivecards-templating`](https://www.npmjs.com/package/adaptivecards-templating) — Adaptive Card templating
 - [`@openacp/plugin-sdk`](https://github.com/Open-ACP/OpenACP) — OpenACP plugin interface
 
