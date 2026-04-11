@@ -4,6 +4,18 @@ import { TeamsAdapter } from "./adapter.js";
 import type { TeamsChannelConfig } from "./types.js";
 
 /**
+ * Log the new messaging endpoint when tunnel URL changes.
+ * Auto-updating Azure Bot's endpoint requires ARM API access (subscription ID,
+ * resource group) which isn't available from bot credentials alone.
+ * Use a persistent tunnel ID to avoid URL changes entirely.
+ */
+function logEndpointUpdate(endpoint: string): void {
+  log.warn(`[teams] Tunnel URL changed — update Azure Bot messaging endpoint to: ${endpoint}`);
+  log.info("[teams] Azure Portal → Bot resource → Configuration → Messaging endpoint");
+  log.info("[teams] Tip: Use a persistent tunnel ID to keep a stable URL across restarts.");
+}
+
+/**
  * Factory for the Teams adapter plugin.
  *
  * Includes a full interactive `install()` wizard that guides users through:
@@ -599,6 +611,18 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       adapter = new TeamsAdapter(ctx.core as OpenACPCore, config as unknown as TeamsChannelConfig);
       ctx.registerService("adapter:teams", adapter);
       ctx.log.info("Teams adapter registered");
+
+      // Listen for tunnel URL changes and notify about the new messaging endpoint.
+      ctx.on("devtunnel-provider:url-changed", (data: unknown) => {
+        const { newUrl } = data as { oldUrl: string; newUrl: string };
+        logEndpointUpdate(`${newUrl}/api/messages`);
+      });
+
+      // Log the endpoint on initial tunnel start
+      ctx.on("devtunnel-provider:started", (data: unknown) => {
+        const { publicUrl } = data as { publicUrl: string; port: number };
+        ctx.log.info(`Tunnel active — Azure Bot messaging endpoint: ${publicUrl}/api/messages`);
+      });
     },
 
     async teardown() {
