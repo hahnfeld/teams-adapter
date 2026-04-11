@@ -164,18 +164,11 @@ export async function generateTeamsAppPackage(
     { name: "outline.png", data: outlinePng },
   ]);
 
-  // Write to the plugin's data directory.
-  // The .path property exists on the concrete SettingsManager instance but not
-  // on the SettingsAPI interface — access it defensively.
-  const settingsPath = (ctx.settings as any).path ?? "";
-  const dataDir = settingsPath ? dirname(settingsPath) : "";
-  if (!dataDir) {
-    // Cannot determine the plugin data directory — app package generation skipped.
-    // This is expected in test contexts where settings is a mock.
+  if (!ctx.dataDir) {
     return null;
   }
 
-  const outPath = join(dataDir, "openacp-bot.zip");
+  const outPath = join(ctx.dataDir, "openacp-bot.zip");
   mkdirSync(dirname(outPath), { recursive: true });
   writeFileSync(outPath, zip);
   return outPath;
