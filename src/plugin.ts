@@ -448,7 +448,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       const tunnelMethod = await terminal.select({
         message: "How should the bot port be tunneled?",
         options: [
-          { value: "devtunnel", label: "@openacp/devtunnel-adapter (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
+          { value: "devtunnel", label: "@hahnfeld/devtunnel-provider (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
           { value: "builtin", label: "Built-in tunnel service", hint: "Uses the system tunnel service if available" },
           { value: "manual", label: "Manual", hint: "I'll set up my own tunnel (ngrok, cloudflared, etc.)" },
         ],
@@ -501,7 +501,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       if (tunnelMethod === "devtunnel") {
         tunnelStep =
           `  2. Install the Dev Tunnels plugin:\n` +
-          "     openacp install @openacp/devtunnel-adapter\n" +
+          "     openacp plugin install @hahnfeld/devtunnel-provider\n" +
           `     It will automatically tunnel port ${botPort} with a persistent URL.`;
       } else if (tunnelMethod === "builtin") {
         tunnelStep =
@@ -550,6 +550,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           { value: "notifications", label: "Change notification channel" },
           { value: "graph", label: "Configure file sharing (Graph API)" },
           { value: "tunnel", label: `Change tunnel method (current: ${(current.tunnelMethod as string) || "devtunnel"})` },
+          { value: "appPackage", label: "Regenerate Teams app package (openacp-bot.zip)" },
           { value: "done", label: "Done" },
         ],
       });
@@ -658,7 +659,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           const method = await terminal.select({
             message: "How should the bot port be tunneled?",
             options: [
-              { value: "devtunnel", label: "@openacp/devtunnel-adapter (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
+              { value: "devtunnel", label: "@hahnfeld/devtunnel-provider (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
               { value: "builtin", label: "Built-in tunnel service", hint: "Uses the system tunnel service if available" },
               { value: "manual", label: "Manual", hint: "I'll set up my own tunnel (ngrok, cloudflared, etc.)" },
             ],
@@ -666,7 +667,28 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           await settings.set("tunnelMethod", method);
           terminal.log.success(`Tunnel method: ${method === "builtin" ? "built-in (auto-create)" : method === "devtunnel" ? "devtunnel plugin" : "manual"}`);
           if (method === "devtunnel") {
-            terminal.log.info("Install with: openacp install @openacp/devtunnel-adapter");
+            terminal.log.info("Install with: openacp plugin install @hahnfeld/devtunnel-provider");
+          }
+          break;
+        }
+
+        case "appPackage": {
+          const appId = (current.botAppId as string) ?? "";
+          if (!appId) {
+            terminal.log.error("Bot App ID is not configured. Set credentials first.");
+            break;
+          }
+          try {
+            const { generateTeamsAppPackage } = await import("./app-package.js");
+            const path = await generateTeamsAppPackage(appId, ctx);
+            if (path) {
+              terminal.log.success(`Teams app package created: ${path}`);
+              terminal.log.info("Upload it in Teams → Apps → Manage your apps → Upload a custom app");
+            } else {
+              terminal.log.error("Failed to generate app package");
+            }
+          } catch (err) {
+            terminal.log.error(`App package generation failed: ${err instanceof Error ? err.message : String(err)}`);
           }
           break;
         }
@@ -720,7 +742,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       ctx.log.info("Teams adapter registered");
 
       // Only create a tunnel if the user opted into the built-in tunnel service during install.
-      // Most users should use @openacp/devtunnel-adapter instead (persistent URLs, auto-managed).
+      // Most users should use @hahnfeld/devtunnel-provider instead (persistent URLs, auto-managed).
       const tunnelMethod = ((ctx.pluginConfig as Record<string, unknown>).tunnelMethod as string) || "devtunnel";
 
       if (tunnelMethod === "builtin") {
@@ -739,11 +761,11 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           } catch (err) {
             ctx.log.warn(`Could not create tunnel for bot port ${botPort}: ${(err as Error).message}`);
             ctx.log.info(`Tunnel your bot manually: <tunnel-url> → localhost:${botPort}`);
-            ctx.log.info("Tip: Install @openacp/devtunnel-adapter for Microsoft Dev Tunnels integration");
+            ctx.log.info("Tip: Install @hahnfeld/devtunnel-provider for Microsoft Dev Tunnels integration");
           }
         } else {
           ctx.log.warn(`Auto-tunnel enabled but no tunnel service available — install a tunnel plugin`);
-          ctx.log.info("Recommended: openacp install @openacp/devtunnel-adapter");
+          ctx.log.info("Recommended: openacp plugin install @hahnfeld/devtunnel-provider");
         }
       } else {
         ctx.log.info(`Bot listening on port ${botPort} — tunnel method: ${tunnelMethod}`);
