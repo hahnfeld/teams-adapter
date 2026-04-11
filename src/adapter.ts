@@ -2,6 +2,12 @@ import { App } from "@microsoft/teams.apps";
 import { BotBuilderPlugin } from "@microsoft/teams.botbuilder";
 import { CardFactory, MemoryStorage } from "@microsoft/agents-hosting";
 import type { TurnContext } from "@microsoft/agents-hosting";
+import {
+  CloudAdapter,
+  ConfigurationBotFrameworkAuthentication,
+} from "botbuilder";
+import { PasswordServiceClientCredentialFactory } from "botframework-connector";
+
 import type { InvokeResponse } from "@microsoft/teams.api";
 import type {
   OutgoingMessage,
@@ -123,8 +129,31 @@ export class TeamsAdapter extends MessagingAdapter {
       log.info("[TeamsAdapter] Graph API file client initialized");
     }
 
-    const botBuilderPlugin = new BotBuilderPlugin();
+    const isSingleTenant = config.tenantId && config.tenantId !== "botframework.com";
+
+    // Custom credential factory that accepts both the bot's app ID and the
+    // Bot Framework audience URI. Azure Bot Service sends single-tenant tokens
+    // with aud=https://api.botframework.com, but the SDK's default factory only
+    // accepts the bot's own app ID — causing "Invalid AppId" errors.
+    const credFactory = new PasswordServiceClientCredentialFactory(
+      config.botAppId,
+      config.botAppPassword,
+      isSingleTenant ? config.tenantId : "",
+    );
+    const origIsValidAppId = credFactory.isValidAppId.bind(credFactory);
+    credFactory.isValidAppId = async (appId: string): Promise<boolean> => {
+      if (appId === "https://api.botframework.com") return true;
+      return origIsValidAppId(appId);
+    };
+
+    const botAuth = new ConfigurationBotFrameworkAuthentication({}, credFactory);
+    const cloudAdapter = new CloudAdapter(botAuth);
+    const botBuilderPlugin = new BotBuilderPlugin({ adapter: cloudAdapter });
     this.app = new App({
+      clientId: config.botAppId,
+      clientSecret: config.botAppPassword,
+      tenantId: isSingleTenant ? config.tenantId : undefined,
+      skipAuth: true, // App-level JWT validation skipped; CloudAdapter handles auth
       storage: new MemoryStorage(),
       plugins: [botBuilderPlugin],
     } as any);
@@ -242,7 +271,11 @@ export class TeamsAdapter extends MessagingAdapter {
         return;
       }
 
-      const text = (context.activity.text ?? "").trim();
+      const rawActivityText = context.activity.text ?? "";
+      // Teams may prepend the bot @mention (e.g., "<at>BotName</at> /new") — strip it
+      const text = rawActivityText.replace(/<at[^>]*>.*?<\/at>/gi, "").trim();
+      log.info({ rawText: rawActivityText.slice(0, 100), cleanText: text.slice(0, 100), activityType: context.activity.type }, "[TeamsAdapter] Incoming activity");
+
       const userId = context.activity.from?.id ?? "unknown";
       // Use conversation.id as the thread discriminator — NOT activity.channelId
       // which is always "msteams" for Teams. Conversation ID uniquely identifies
@@ -296,8 +329,14 @@ export class TeamsAdapter extends MessagingAdapter {
           this._sessionContexts.set(sessionId, { context, isAssistant });
         }
 
-        // Route slash commands — matches Telegram's CommandRegistry dispatch pattern
+        // Route slash commands — local handler first (handles /new, /help, etc.
+        // with Teams-specific UX), then fall back to core command registry.
         if (text.startsWith("/")) {
+          // Always try local command handler first — it has Teams-specific implementations
+          const handled = await handleCommand(context, this, userId, sessionId !== "unknown" ? sessionId : null);
+          if (handled) return;
+
+          // Fall back to core command registry for commands not handled locally
           const registry = this.getCommandRegistry();
           if (registry) {
             const rawCommand = text.split(" ")[0].slice(1).toLowerCase();
@@ -325,9 +364,6 @@ export class TeamsAdapter extends MessagingAdapter {
               return;
             }
           }
-
-          // Fallback: try local handleCommand for commands not in registry
-          await handleCommand(context, this, userId, sessionId !== "unknown" ? sessionId : null);
           return;
         }
 
@@ -389,6 +425,50 @@ export class TeamsAdapter extends MessagingAdapter {
 
         // Show typing indicator while the agent processes the message
         this.sendTyping(context);
+
+        const existingSessionBeforeSend = this.core.sessionManager.getSessionByThread("teams", threadId);
+        if (!existingSessionBeforeSend) {
+          const defaultAgent = (this.core.configManager as any)?.get?.("defaultAgent") ?? "claude";
+          log.info({ threadId, text: messageText.slice(0, 50), defaultAgent }, "[TeamsAdapter] No session — auto-creating via /new");
+          // Auto-create a session for first-time messages
+          const registry = this.getCommandRegistry();
+          if (registry) {
+            try {
+              const response = await registry.execute(`/new ${defaultAgent}`, {
+                raw: messageText,
+                sessionId: null,
+                channelId: "teams",
+                userId,
+                reply: async (content: string) => {
+                  if (typeof content === "string") {
+                    await sendText(context, content);
+                  }
+                },
+              });
+              if (response.type !== "silent") {
+                await this.renderCommandResponse(response, context);
+              }
+              // After session creation, route the original message to the new session
+              const newSession = this.core.sessionManager.getSessionByThread("teams", threadId);
+              if (newSession && messageText) {
+                this._sessionContexts.set(newSession.id, { context, isAssistant: false });
+                await this.core.handleMessage({
+                  channelId: "teams",
+                  threadId,
+                  userId,
+                  text: messageText,
+                  ...(attachments.length > 0 ? { attachments } : {}),
+                });
+              }
+            } catch (err) {
+              log.error({ err }, "[TeamsAdapter] Auto-create session failed");
+              await sendText(context, "👋 Send /new to start a session.");
+            }
+            return;
+          }
+          await sendText(context, "👋 Send /new to start a session.");
+          return;
+        }
 
         await this.core.handleMessage({
           channelId: "teams",

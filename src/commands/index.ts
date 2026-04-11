@@ -52,9 +52,9 @@ export async function handleCommand(
   adapter: TeamsAdapter,
   userId: string,
   sessionId: string | null,
-): Promise<void> {
-  const text = context.activity.text ?? "";
-  if (!text.startsWith(COMMAND_PREFIX)) return;
+): Promise<boolean> {
+  const text = (context.activity?.text ?? "").replace(/<at[^>]*>.*?<\/at>/gi, "").trim();
+  if (!text.startsWith(COMMAND_PREFIX)) return false;
 
   const parts = text.slice(1).split(/\s+/);
   const commandName = parts[0].toLowerCase();
@@ -66,7 +66,11 @@ export async function handleCommand(
     userId,
     sessionId,
     reply: async (content: string) => {
-      await (context.sendActivity as Function)({ text: content });
+      if (typeof (context as any).send === "function") {
+        await (context as any).send({ type: "message", text: content.replace(/(?<!\n)\n(?!\n)/g, "\n\n"), textFormat: "markdown" });
+      } else {
+        await (context.sendActivity as Function)({ text: content });
+      }
     },
   };
 
@@ -145,14 +149,16 @@ export async function handleCommand(
         await handleThoughtLevel(ctx, args[0]);
         break;
       default:
-        await ctx.reply(`Unknown command: /${commandName}`);
+        return false; // Not a locally handled command — let registry try
     }
+    return true;
   } catch (err) {
     log.error({ err, commandName }, "[teams-router] Command handler failed");
     const errMsg = `❌ Command failed: ${err instanceof Error ? err.message : String(err)}`;
     try {
-      await (context.sendActivity as Function)({ text: errMsg });
+      await ctx.reply(errMsg);
     } catch { /* ignore */ }
+    return true;
   }
 }
 
@@ -176,7 +182,11 @@ export async function setupCardActionCallbacks(
     userId: context.activity.from?.id ?? "unknown",
     sessionId: (data.sessionId as string | undefined) ?? null,
     reply: async (content: string) => {
-      await (context.sendActivity as Function)({ text: content });
+      if (typeof (context as any).send === "function") {
+        await (context as any).send({ type: "message", text: content.replace(/(?<!\n)\n(?!\n)/g, "\n\n"), textFormat: "markdown" });
+      } else {
+        await (context.sendActivity as Function)({ text: content });
+      }
     },
   };
 

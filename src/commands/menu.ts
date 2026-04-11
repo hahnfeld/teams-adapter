@@ -69,6 +69,7 @@ export async function handleHelp(ctx: CommandContext): Promise<void> {
     "`/clear` — Reset assistant session",
   ];
   // Send with suggested action buttons for quick access (1:1 chat only)
+  // Teams collapses single \n — use \n\n for paragraph breaks
   await sendActivity(ctx.context, {
     text: commands.join("\n"),
     suggestedActions: {

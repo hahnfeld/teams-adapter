@@ -1,33 +1,64 @@
 /**
- * Type-safe wrappers for Teams Bot Framework SDK calls.
+ * Type-safe wrappers for sending messages via Teams SDK contexts.
  *
- * The @microsoft/agents-hosting SDK has strict Activity types that don't
- * align perfectly with the simple patterns we use (sending text, cards).
- * These helpers provide type-safe alternatives to `as any` casts.
+ * The @microsoft/teams.apps SDK uses a different context API than the
+ * Bot Framework TurnContext. These helpers detect which context type
+ * is available and call the appropriate method:
+ *   - teams.apps context: context.send({ text }) / context.reply({ text })
+ *   - Bot Framework TurnContext: context.sendActivity({ text })
  */
 import { CardFactory } from "@microsoft/agents-hosting";
 import type { TurnContext } from "@microsoft/agents-hosting";
 
-/** Send a text message via TurnContext */
+/**
+ * Normalize newlines for Teams rendering.
+ * Teams collapses single \n in markdown — use \n\n for line breaks.
+ * Avoids doubling already-doubled newlines.
+ */
+function teamsNewlines(text: string): string {
+  return text.replace(/(?<!\n)\n(?!\n)/g, "\n\n");
+}
+
+/** Send a text message via context (supports both TurnContext and teams.apps context) */
 export async function sendText(context: TurnContext, text: string): Promise<unknown> {
-  return (context.sendActivity as Function)({ text });
-}
-
-/** Send an Adaptive Card via TurnContext */
-export async function sendCard(context: TurnContext, card: Record<string, unknown>): Promise<unknown> {
-  return (context.sendActivity as Function)({
-    attachments: [CardFactory.adaptiveCard(card)],
-  });
-}
-
-/** Send a message with attachments via TurnContext */
-export async function sendActivity(context: TurnContext, activity: Record<string, unknown>): Promise<unknown> {
+  const activity = { type: "message", text: teamsNewlines(text), textFormat: "markdown" };
+  if (typeof (context as any).send === "function") {
+    return (context as any).send(activity);
+  }
   return (context.sendActivity as Function)(activity);
+}
+
+/** Send an Adaptive Card via context */
+export async function sendCard(context: TurnContext, card: Record<string, unknown>): Promise<unknown> {
+  const activity = {
+    type: "message",
+    attachments: [CardFactory.adaptiveCard(card)],
+  };
+  if (typeof (context as any).send === "function") {
+    return (context as any).send(activity);
+  }
+  return (context.sendActivity as Function)(activity);
+}
+
+/** Send a message with attachments via context */
+export async function sendActivity(context: TurnContext, activity: Record<string, unknown>): Promise<unknown> {
+  const merged: Record<string, unknown> = { type: "message", textFormat: "markdown", ...activity };
+  if (typeof merged.text === "string") {
+    merged.text = teamsNewlines(merged.text);
+  }
+  if (typeof (context as any).send === "function") {
+    return (context as any).send(merged);
+  }
+  return (context.sendActivity as Function)(merged);
 }
 
 /** Update an existing activity */
 export async function updateActivity(context: TurnContext, activity: Record<string, unknown>): Promise<unknown> {
-  return (context.updateActivity as Function)(activity);
+  if (typeof (context as any).updateActivity === "function") {
+    return (context.updateActivity as Function)(activity);
+  }
+  // teams.apps SDK doesn't have updateActivity on context — skip silently
+  return undefined;
 }
 
 /**

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.0",
+  "id": "3679e555-5ec6-4fd1-a4c8-267e6be177d3",
+  "developer": {
+    "name": "OpenACP",
+    "websiteUrl": "https://openacp.dev",
+    "privacyUrl": "https://openacp.dev/privacy",
+    "termsOfUseUrl": "https://openacp.dev/terms"
+  },
+  "name": {
+    "short": "OpenACP Bot",
+    "full": "OpenACP Teams Bot"
+  },
+  "description": {
+    "short": "OpenACP AI assistant for Teams",
+    "full": "OpenACP AI assistant that integrates with Microsoft Teams for interactive agent sessions."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#4F6BED",
+  "bots": [
+    {
+      "botId": "3679e555-5ec6-4fd1-a4c8-267e6be177d3",
+      "scopes": ["personal", "team", "groupChat"],
+      "supportsFiles": true,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": ["personal", "team", "groupChat"],
+          "commands": [
+            { "title": "help", "description": "Show available commands" },
+            { "title": "new", "description": "Start a new agent session" },
+            { "title": "agents", "description": "List available agents" },
+            { "title": "status", "description": "Show session status" },
+            { "title": "cancel", "description": "Cancel current session" },
+            { "title": "menu", "description": "Show action menu" }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": [
+    "53zr0p7w-21420.usw2.devtunnels.ms"
+  ]
+}
