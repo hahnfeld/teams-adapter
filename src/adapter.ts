@@ -28,6 +28,7 @@ import { log, MessagingAdapter, SendQueue } from "@openacp/plugin-sdk";
 import type { CommandRegistry } from "@openacp/plugin-sdk";
 import { TeamsRenderer } from "./renderer.js";
 import type { TeamsChannelConfig } from "./types.js";
+import { DEFAULT_BOT_PORT } from "./types.js";
 import { TeamsDraftManager } from "./draft-manager.js";
 import { PermissionHandler } from "./permissions.js";
 import { handleCommand, setupCardActionCallbacks, SLASH_COMMANDS } from "./commands/index.js";
@@ -76,7 +77,7 @@ export class TeamsAdapter extends MessagingAdapter {
    * Per-session TurnContext references, set during inbound message handling.
    * Handler overrides read from this map during sendMessage dispatch.
    */
-  private _sessionContexts = new Map<string, { context: TurnContext; isAssistant: boolean }>();
+  private _sessionContexts = new Map<string, { context: TurnContext; isAssistant: boolean; threadId?: string }>();
   private _sessionOutputModes = new Map<string, OutputMode>();
 
   /**
@@ -153,6 +154,7 @@ export class TeamsAdapter extends MessagingAdapter {
       clientId: config.botAppId,
       clientSecret: config.botAppPassword,
       tenantId: isSingleTenant ? config.tenantId : undefined,
+      port: config.botPort ?? DEFAULT_BOT_PORT,
       skipAuth: true, // App-level JWT validation skipped; CloudAdapter handles auth
       storage: new MemoryStorage(),
       plugins: [botBuilderPlugin],
@@ -187,6 +189,8 @@ export class TeamsAdapter extends MessagingAdapter {
       if (this._processedCleanupTimer.unref) this._processedCleanupTimer.unref();
 
       await this.app.start();
+      const botPort = this.teamsConfig.botPort ?? DEFAULT_BOT_PORT;
+      log.info(`[TeamsAdapter] Bot Framework server listening on port ${botPort}`);
 
       // Spawn assistant session if configured (non-blocking — matches Telegram's pattern)
       if (this.teamsConfig.assistantThreadId) {
@@ -226,6 +230,7 @@ export class TeamsAdapter extends MessagingAdapter {
     this._processedActivities.clear();
     this.sendQueue.clear();
     this.conversationStore.destroy();
+    this.permissionHandler.dispose();
 
     await this.app.stop();
     log.info("[TeamsAdapter] Stopped");
@@ -324,9 +329,9 @@ export class TeamsAdapter extends MessagingAdapter {
         // then sendMessage is called with the new sessionId. We also store under sessionId
         // when known, and under threadId as a universal fallback.
         const isAssistant = this.assistantSession != null && sessionId === this.assistantSession?.id;
-        this._sessionContexts.set(threadId, { context, isAssistant });
+        this._sessionContexts.set(threadId, { context, isAssistant, threadId });
         if (sessionId !== "unknown") {
-          this._sessionContexts.set(sessionId, { context, isAssistant });
+          this._sessionContexts.set(sessionId, { context, isAssistant, threadId });
         }
 
         // Route slash commands — local handler first (handles /new, /help, etc.
@@ -367,8 +372,13 @@ export class TeamsAdapter extends MessagingAdapter {
           return;
         }
 
+        // Process attachments only when a session already exists — saving files
+        // requires a valid sessionId for the file service to scope storage correctly.
+        // First messages (sessionId === "unknown") skip attachment processing; the
+        // auto-session-creation path below handles the text, and the user can resend
+        // the attachment once the session is established.
         const attachments: Attachment[] = [];
-        if (context.activity.attachments?.length) {
+        if (sessionId !== "unknown" && context.activity.attachments?.length) {
           for (const att of context.activity.attachments) {
             try {
               const buffer = await downloadTeamsFile(
@@ -428,7 +438,7 @@ export class TeamsAdapter extends MessagingAdapter {
 
         const existingSessionBeforeSend = this.core.sessionManager.getSessionByThread("teams", threadId);
         if (!existingSessionBeforeSend) {
-          const defaultAgent = (this.core.configManager as any)?.get?.("defaultAgent") ?? "claude";
+          const defaultAgent = (this.core.configManager.get() as Record<string, unknown>)?.defaultAgent as string ?? "claude";
           log.info({ threadId, text: messageText.slice(0, 50), defaultAgent }, "[TeamsAdapter] No session — auto-creating via /new");
           // Auto-create a session for first-time messages
           const registry = this.getCommandRegistry();
@@ -537,11 +547,17 @@ export class TeamsAdapter extends MessagingAdapter {
       const parts = verb.split(":");
       if (parts.length === 3) {
         const [, sessionId, mode] = parts;
-        // Validate the sessionId references a real session before acting
         if (mode === "low" || mode === "medium" || mode === "high") {
           const session = this.core.sessionManager.getSession(sessionId);
           if (!session) {
             log.warn({ sessionId }, "[TeamsAdapter] output mode change: session not found");
+            return;
+          }
+          // Verify the action came from the session's conversation
+          const conversationId = context.activity.conversation?.id;
+          const sessionThread = session.threadIds.get("teams");
+          if (sessionThread && conversationId && sessionThread !== conversationId) {
+            log.warn({ sessionId, conversationId, sessionThread }, "[TeamsAdapter] om: conversation mismatch");
             return;
           }
           this._sessionOutputModes.set(sessionId, mode as OutputMode);
@@ -557,6 +573,13 @@ export class TeamsAdapter extends MessagingAdapter {
       if (sessionId) {
         const session = this.core.sessionManager.getSession(sessionId);
         if (session) {
+          // Verify the action came from the session's conversation
+          const conversationId = context.activity.conversation?.id;
+          const sessionThread = session.threadIds.get("teams");
+          if (sessionThread && conversationId && sessionThread !== conversationId) {
+            log.warn({ sessionId, conversationId, sessionThread }, "[TeamsAdapter] cancel: conversation mismatch");
+            return;
+          }
           try {
             await session.destroy();
           } catch (err) {
@@ -694,11 +717,24 @@ export class TeamsAdapter extends MessagingAdapter {
             return buildDialogMessage("Agent and workspace are required.");
           }
 
+          // Validate agent name against registered agents
+          const availableAgents = this.core.agentManager.getAvailableAgents();
+          if (!availableAgents.some((a) => a.name === agentName)) {
+            return buildDialogMessage(`Unknown agent: ${agentName}`);
+          }
+
+          // Validate workspace — must match the configured workspace to prevent path traversal
+          const allowedWorkspace = this.core.configManager.resolveWorkspace?.() ?? process.cwd();
+          if (workspace !== allowedWorkspace) {
+            log.warn({ workspace, allowedWorkspace }, "[TeamsAdapter] task.submit: workspace mismatch");
+            return buildDialogMessage("Invalid workspace path.");
+          }
+
           try {
             const session = await this.core.sessionManager.createSession(
               "teams",
               agentName,
-              workspace,
+              allowedWorkspace,
               this.core.agentManager,
             );
             const threadId = await this.createSessionThread(session.id, session.name || agentName);
@@ -726,14 +762,22 @@ export class TeamsAdapter extends MessagingAdapter {
           const bypass = data?.bypass as string | undefined;
           const sessionId = data?.sessionId as string | undefined;
 
+          // Verify the submitting user's conversation owns the target session
+          const conversationId = context.activity.conversation?.id;
+          const session = sessionId ? this.core.sessionManager.getSession(sessionId) : undefined;
+          if (session && conversationId) {
+            const sessionThread = session.threadIds.get("teams");
+            if (sessionThread && sessionThread !== conversationId) {
+              log.warn({ sessionId, conversationId, sessionThread }, "[TeamsAdapter] save-settings: conversation mismatch");
+              return buildDialogMessage("You do not have access to this session.");
+            }
+          }
+
           if (outputMode && sessionId) {
             this.setSessionOutputMode(sessionId, outputMode as "low" | "medium" | "high");
           }
-          if (bypass !== undefined && sessionId) {
-            const session = this.core.sessionManager.getSession(sessionId);
-            if (session) {
-              session.clientOverrides = { ...session.clientOverrides, bypassPermissions: bypass === "true" };
-            }
+          if (bypass !== undefined && session) {
+            session.clientOverrides = { ...session.clientOverrides, bypassPermissions: bypass === "true" };
           }
 
           return buildDialogMessage("Settings saved");
@@ -945,7 +989,13 @@ export class TeamsAdapter extends MessagingAdapter {
       }, 60_000);
       if (timeout.unref) timeout.unref();
 
-      ready.finally(() => settle(true)); // replay buffered messages on success
+      ready.then(
+        () => settle(true),  // replay buffered messages on success
+        (err) => {
+          log.error({ err }, "[TeamsAdapter] Assistant ready promise rejected");
+          settle(false); // discard buffer on failure
+        },
+      );
     } catch (err) {
       this.assistantInitializing = false;
       this._assistantInitBuffer.splice(0);
@@ -954,6 +1004,10 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   async respawnAssistant(): Promise<void> {
+    // Reset init state to prevent stale closures from a previous setupAssistant()
+    // call (e.g., its 60s timeout) from interfering with the new spawn.
+    this.assistantInitializing = false;
+    this._assistantInitBuffer.splice(0);
     if (this.assistantSession) {
       try {
         await this.assistantSession.destroy();
@@ -1236,7 +1290,7 @@ export class TeamsAdapter extends MessagingAdapter {
       this.sendTyping(context);
     }
     const draft = this.draftManager.getOrCreate(sessionId, context);
-    draft.append(content.text);
+    if (content.text) draft.append(content.text);
   }
 
   protected async handleToolCall(sessionId: string, content: OutgoingMessage, verbosity: DisplayVerbosity): Promise<void> {
@@ -1377,15 +1431,24 @@ export class TeamsAdapter extends MessagingAdapter {
    * Removes both sessionId and threadId entries from _sessionContexts to prevent leaks.
    */
   private cleanupSessionState(sessionId: string): void {
-    // Find and remove the threadId entry that may also reference this session's context
+    // Find and remove the threadId entry that may also reference this session's context.
+    // First try the stored threadId on the context entry itself (reliable even if the
+    // session has already been removed from the session manager).
+    const entry = this._sessionContexts.get(sessionId);
+    const storedThreadId = entry?.threadId;
+    if (storedThreadId && storedThreadId !== sessionId) {
+      this._sessionContexts.delete(storedThreadId);
+    }
+    // Fallback: also check session manager and session record in case the context entry
+    // was already removed or the threadId wasn't stored.
     const session = this.core.sessionManager.getSession(sessionId);
     const threadId = session?.threadId;
-    if (threadId && threadId !== sessionId) {
+    if (threadId && threadId !== sessionId && threadId !== storedThreadId) {
       this._sessionContexts.delete(threadId);
     }
     const record = this.core.sessionManager.getSessionRecord(sessionId);
     const recordThreadId = (record?.platform as Record<string, unknown>)?.threadId as string | undefined;
-    if (recordThreadId && recordThreadId !== sessionId && recordThreadId !== threadId) {
+    if (recordThreadId && recordThreadId !== sessionId && recordThreadId !== threadId && recordThreadId !== storedThreadId) {
       this._sessionContexts.delete(recordThreadId);
     }
 
@@ -1472,6 +1535,7 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleSystem(sessionId: string, content: OutgoingMessage): Promise<void> {
+    if (!content.text) return;
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const { context } = ctx;
@@ -1511,6 +1575,7 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleUserReplay(sessionId: string, content: OutgoingMessage): Promise<void> {
+    if (!content.text) return;
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     try {
@@ -1519,6 +1584,7 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleResource(sessionId: string, content: OutgoingMessage): Promise<void> {
+    if (!content.text) return;
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     try {
@@ -1529,8 +1595,10 @@ export class TeamsAdapter extends MessagingAdapter {
   protected async handleResourceLink(sessionId: string, content: OutgoingMessage): Promise<void> {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
-    const url = (content.metadata as Record<string, unknown>)?.url as string | undefined;
+    const rawUrl = (content.metadata as Record<string, unknown>)?.url as string | undefined;
     const rawName = (content.metadata as Record<string, unknown>)?.name as string | undefined;
+    // Only allow http/https URLs to prevent javascript: or data: scheme injection
+    const url = rawUrl && /^https?:\/\//i.test(rawUrl) ? rawUrl : undefined;
     // Sanitize name to prevent markdown injection — strip characters that break link syntax
     const name = rawName?.replace(/[\[\]\(\)]/g, "") || undefined;
     const text = url ? `📎 [${name || url}](${url})` : content.text;

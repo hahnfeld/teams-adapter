@@ -49,9 +49,9 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
     session.threadIds.set("teams", threadId);
 
     await ctx.reply(
-      `✅ Session created\n` +
-      `**Agent:** ${agentName}\n` +
-      `**Workspace:** \`${workDir}\`\n` +
+      `✅ Session created\n\n` +
+      `**Agent:** ${agentName}\n\n` +
+      `**Workspace:** \`${workDir}\`\n\n` +
       `**Session:** ${session.id.slice(0, 8)}`,
     );
   } catch (err) {
@@ -94,8 +94,8 @@ export async function handleNewChat(ctx: CommandContext): Promise<void> {
     newSession.threadIds.set("teams", threadId);
 
     await ctx.reply(
-      `✅ New chat started\n` +
-      `**Agent:** ${agentName}\n` +
+      `✅ New chat started\n\n` +
+      `**Agent:** ${agentName}\n\n` +
       `**Session:** ${newSession.id.slice(0, 8)}`,
     );
   } catch (err) {

@@ -101,6 +101,7 @@ channels:
     tenantId: "${TEAMS_TENANT_ID}"
     teamId: "${TEAMS_TEAM_ID}"
     channelId: "${TEAMS_CHANNEL_ID}"
+    botPort: 3978                                                # Bot Framework port (default)
     notificationChannelId: "${TEAMS_NOTIFICATION_CHANNEL_ID}"  # optional
     assistantThreadId: null  # auto-set after first run
     graphClientSecret: "${TEAMS_GRAPH_CLIENT_SECRET}"           # optional, for file sharing
@@ -116,6 +117,7 @@ channels:
 | `tenantId` | `string` | Yes | Microsoft tenant ID (GUID), or `botframework.com` for multi-tenant |
 | `teamId` | `string` | Yes | Default team ID (groupId GUID) |
 | `channelId` | `string` | Yes | Primary channel for sessions (e.g. `19:abc@thread.tacv2`) |
+| `botPort` | `number` | No | Bot Framework HTTP server port (default: `3978`) |
 | `notificationChannelId` | `string \| null` | No | Separate channel for notifications |
 | `assistantThreadId` | `string \| null` | No | Thread for the assistant (auto-populated) |
 | `graphClientSecret` | `string` | No | Azure AD client secret for Graph API file sharing |
@@ -133,20 +135,41 @@ Both `teams.microsoft.com` and `teams.cloud.microsoft` link formats are supporte
 - Team ID = the `groupId` parameter from the Teams URL
 - Channel ID = the encoded string like `19:xxx@thread.tacv2`
 
+### Networking: Bot port vs API port
+
+The Teams adapter runs its **own HTTP server** for Bot Framework webhook traffic. This is separate from the OpenACP API server:
+
+| Server | Default Port | Purpose |
+|--------|-------------|---------|
+| **Bot Framework** (this adapter) | `3978` | Receives messages from Azure Bot Service |
+| **OpenACP API** | `21420` | REST API, SSE, web UI |
+
+**Your tunnel must point to the bot port (3978), not the OpenACP API port.** If you use OpenACP's built-in tunnel, it tunnels the API port — the Teams adapter requests its own separate tunnel on the bot port automatically.
+
+The bot port is configurable via the `botPort` setting (default: `3978`, the Bot Framework standard).
+
 ### Messaging endpoint
 
 After installation, set the bot's messaging endpoint in Azure:
 
 1. Azure Portal > Bot resource > **Configuration** > **Messaging endpoint**
-2. Set it to: `https://your-server.com/api/messages`
-3. Make sure your server is publicly reachable (use a tunnel for local development)
+2. Set it to: `https://<your-tunnel-url>/api/messages`
+3. The URL must reach port 3978 (or your configured `botPort`) on the machine running OpenACP
 
-### Local development with Dev Tunnels
+### Tunneling
 
-For local testing, use [Microsoft Dev Tunnels](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/get-started) to expose port 3978 (the Bot Framework messaging endpoint):
+The adapter automatically requests a tunnel on the bot port at startup if an OpenACP tunnel provider is available. The tunnel URL is logged on boot.
+
+**Recommended: `@openacp/devtunnel-adapter`** — a tunnel provider plugin using [Microsoft Dev Tunnels](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/get-started), which aligns with the Microsoft/Azure ecosystem:
 
 ```bash
-# Install
+openacp plugin install @openacp/devtunnel-adapter
+```
+
+**Manual tunnel setup** (if not using an OpenACP tunnel provider):
+
+```bash
+# Install Dev Tunnels CLI
 brew install --cask devtunnel   # macOS
 
 # Login and create a persistent tunnel
@@ -256,7 +279,6 @@ src/
 - [`@microsoft/agents-hosting`](https://www.npmjs.com/package/@microsoft/agents-hosting) — Express server hosting
 - [`botbuilder`](https://www.npmjs.com/package/botbuilder) — CloudAdapter for single-tenant auth
 - [`botframework-connector`](https://www.npmjs.com/package/botframework-connector) — Credential factory for token validation
-- [`adaptivecards-templating`](https://www.npmjs.com/package/adaptivecards-templating) — Adaptive Card templating
 - [`@openacp/plugin-sdk`](https://github.com/Open-ACP/OpenACP) — OpenACP plugin interface
 
 ## License

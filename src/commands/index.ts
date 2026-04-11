@@ -67,7 +67,7 @@ export async function handleCommand(
     sessionId,
     reply: async (content: string) => {
       if (typeof (context as any).send === "function") {
-        await (context as any).send({ type: "message", text: content.replace(/(?<!\n)\n(?!\n)/g, "\n\n"), textFormat: "markdown" });
+        await (context as any).send({ type: "message", text: content, textFormat: "markdown" });
       } else {
         await (context.sendActivity as Function)({ text: content });
       }
@@ -183,7 +183,7 @@ export async function setupCardActionCallbacks(
     sessionId: (data.sessionId as string | undefined) ?? null,
     reply: async (content: string) => {
       if (typeof (context as any).send === "function") {
-        await (context as any).send({ type: "message", text: content.replace(/(?<!\n)\n(?!\n)/g, "\n\n"), textFormat: "markdown" });
+        await (context as any).send({ type: "message", text: content, textFormat: "markdown" });
       } else {
         await (context.sendActivity as Function)({ text: content });
       }

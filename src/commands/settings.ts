@@ -35,22 +35,22 @@ export async function handleSettings(ctx: CommandContext): Promise<void> {
   if (ctx.sessionId) {
     const session = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
     if (session) {
-      sessionInfo = `\n\n**Session Settings:**\n` +
-        `- Agent: ${session.agentName}\n` +
-        `- Mode: ${session.getConfigByCategory?.("mode")?.currentValue ?? "default"}\n` +
-        `- Model: ${session.getConfigByCategory?.("model")?.currentValue ?? "default"}\n` +
-        `- Bypass: ${session.clientOverrides?.bypassPermissions ? "on" : "off"}\n` +
+      sessionInfo = `\n\n---\n\n**Session Settings:**\n\n` +
+        `- Agent: ${session.agentName}\n\n` +
+        `- Mode: ${session.getConfigByCategory?.("mode")?.currentValue ?? "default"}\n\n` +
+        `- Model: ${session.getConfigByCategory?.("model")?.currentValue ?? "default"}\n\n` +
+        `- Bypass: ${session.clientOverrides?.bypassPermissions ? "on" : "off"}\n\n` +
         `- TTS: ${session.voiceMode ?? "off"}`;
     }
   }
 
   await ctx.reply(
     `**⚙️ Configuration**\n\n` +
-    `**Global:**\n` +
-    `- Default agent: ${defaultAgent}\n` +
-    `- Workspace: \`${workspace}\`\n` +
-    `- Teams channel: ${ctx.adapter.getChannelId() || "not set"}\n` +
-    `- Notification channel: ${ctx.adapter.getAssistantThreadId() ? "configured" : "not set"}\n` +
+    `**Global:**\n\n` +
+    `- Default agent: ${defaultAgent}\n\n` +
+    `- Workspace: \`${workspace}\`\n\n` +
+    `- Teams channel: ${ctx.adapter.getChannelId() || "not set"}\n\n` +
+    `- Notification channel: ${ctx.adapter.getAssistantThreadId() ? "configured" : "not set"}\n\n` +
     `- Graph API: ${ctx.adapter.getTeamId() ? "configured" : "not configured"}` +
     sessionInfo,
   );

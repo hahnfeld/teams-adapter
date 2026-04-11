@@ -40,10 +40,10 @@ export async function handleStatus(ctx: CommandContext): Promise<void> {
     const session = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
     if (session) {
       await ctx.reply(
-        `**Session:** ${session.name || session.id.slice(0, 8)}\n` +
-        `**Agent:** ${session.agentName}\n` +
-        `**Status:** ${session.status}\n` +
-        `**Workspace:** \`${session.workingDirectory}\`\n` +
+        `**Session:** ${session.name || session.id.slice(0, 8)}\n\n` +
+        `**Agent:** ${session.agentName}\n\n` +
+        `**Status:** ${session.status}\n\n` +
+        `**Workspace:** \`${session.workingDirectory}\`\n\n` +
         `**Queue:** ${session.queueDepth} pending`,
       );
       return;
@@ -53,9 +53,9 @@ export async function handleStatus(ctx: CommandContext): Promise<void> {
     const record = ctx.adapter.core.sessionManager.getSessionRecord(ctx.sessionId);
     if (record) {
       await ctx.reply(
-        `**Session:** ${record.name || record.sessionId.slice(0, 8)}\n` +
-        `**Agent:** ${record.agentName}\n` +
-        `**Status:** ${record.status} (not loaded)\n` +
+        `**Session:** ${record.name || record.sessionId.slice(0, 8)}\n\n` +
+        `**Agent:** ${record.agentName}\n\n` +
+        `**Status:** ${record.status} (not loaded)\n\n` +
         `**Workspace:** \`${record.workingDir}\``,
       );
       return;
@@ -68,9 +68,9 @@ export async function handleStatus(ctx: CommandContext): Promise<void> {
   const errors = allRecords.filter((r) => r.status === "error");
 
   await ctx.reply(
-    `**OpenACP Status**\n` +
-    `Active sessions: ${active.length}\n` +
-    `Error sessions: ${errors.length}\n` +
+    `**OpenACP Status**\n\n` +
+    `Active sessions: ${active.length}\n\n` +
+    `Error sessions: ${errors.length}\n\n` +
     `Total sessions: ${allRecords.length}`,
   );
 }
@@ -101,9 +101,9 @@ export async function handleSessions(ctx: CommandContext): Promise<void> {
     return `${emoji} **${name}** — ${r.status}`;
   });
 
-  const truncated = allRecords.length > 20 ? `\n\n_...and ${allRecords.length - 20} more_` : "";
+  const truncated = allRecords.length > 20 ? `\n\n...and ${allRecords.length - 20} more` : "";
 
-  await ctx.reply(`**Sessions: ${allRecords.length}**\n\n${lines.join("\n")}${truncated}`);
+  await ctx.reply(`**Sessions: ${allRecords.length}**\n\n${lines.join("\n\n")}${truncated}`);
 }
 
 /**

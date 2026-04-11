@@ -19,32 +19,32 @@ export async function handleAgents(ctx: CommandContext): Promise<void> {
   let text = "**🤖 Agents**\n\n";
 
   if (installed.length > 0) {
-    text += "**Installed:**\n";
+    text += "**Installed:**\n\n";
     for (const item of installed) {
       text += `✅ **${item.name}**`;
-      if (item.description) text += ` — _${truncate(item.description, 50)}_`;
-      text += "\n";
+      if (item.description) text += ` — ${truncate(item.description, 50)}`;
+      text += "\n\n";
     }
-    text += "\n";
   }
 
   if (available.length > 0) {
-    text += "**Available to install:**\n";
+    if (installed.length > 0) text += "---\n\n";
+    text += "**Available to install:**\n\n";
     for (const item of available.slice(0, 10)) {
       if (item.available) {
         text += `⬇️ **${item.name}**`;
       } else {
         const deps = item.missingDeps?.join(", ") ?? "requirements not met";
-        text += `⚠️ **${item.name}** _(needs: ${deps})_`;
+        text += `⚠️ **${item.name}** (needs: ${deps})`;
       }
-      if (item.description) text += `\n    _${truncate(item.description, 60)}_`;
-      text += "\n";
+      if (item.description) text += `\n\n    ${truncate(item.description, 60)}`;
+      text += "\n\n";
     }
     if (available.length > 10) {
-      text += `\n_...and ${available.length - 10} more. Use \`/install <name>\` to install._`;
+      text += `...and ${available.length - 10} more. Use \`/install <name>\` to install.`;
     }
   } else if (installed.length > 0) {
-    text += "_All agents are already installed!_";
+    text += "All agents are already installed!";
   }
 
   await ctx.reply(text);
@@ -80,9 +80,9 @@ export async function handleInstall(ctx: CommandContext, name?: string): Promise
     if (result.ok) {
       let msg = `✅ **${name}** installed!`;
       if (result.setupSteps?.length) {
-        msg += "\n\n**Setup steps:**\n";
+        msg += "\n\n**Setup steps:**\n\n";
         for (const step of result.setupSteps) {
-          msg += `- ${step}\n`;
+          msg += `- ${step}\n\n`;
         }
       }
       await ctx.reply(msg);

@@ -38,15 +38,30 @@ function parseDescriptionContext(description: string): { tool?: string; target?:
 export class PermissionHandler {
   private pending: Map<string, PendingPermission> = new Map();
   private pendingTimestamps: Map<string, number> = new Map();
+  private _evictionTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
     private getSession: (sessionId: string) => Session | undefined,
     private sendNotification: (notification: NotificationMessage) => Promise<void>,
-  ) {}
+  ) {
+    // Periodically evict stale pending permissions even when idle
+    this._evictionTimer = setInterval(() => this.evictStale(true), 5 * 60 * 1000);
+    this._evictionTimer.unref();
+  }
 
-  private evictStale(): void {
+  dispose(): void {
+    if (this._evictionTimer) {
+      clearInterval(this._evictionTimer);
+      this._evictionTimer = undefined;
+    }
+    this.pending.clear();
+    this.pendingTimestamps.clear();
+  }
+
+  private evictStale(force = false): void {
     const MAX_PENDING = 100;
-    if (this.pending.size < MAX_PENDING) return;
+    if (!force && this.pending.size < MAX_PENDING) return;
+    if (this.pending.size === 0) return;
     const now = Date.now();
     const staleThreshold = 10 * 60 * 1000;
     for (const [key, ts] of this.pendingTimestamps) {
@@ -143,11 +158,13 @@ export class PermissionHandler {
       return;
     }
 
-    void this.sendNotification({
+    this.sendNotification({
       sessionId: session.id,
       sessionName: session.name,
       type: "permission",
       summary: request.description,
+    }).catch((err) => {
+      log.warn({ err }, "[PermissionHandler] Notification failed");
     });
   }
 

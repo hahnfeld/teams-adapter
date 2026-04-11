@@ -2,18 +2,7 @@ import type { OpenACPPlugin, InstallContext, OpenACPCore } from "@openacp/plugin
 import { log } from "@openacp/plugin-sdk";
 import { TeamsAdapter } from "./adapter.js";
 import type { TeamsChannelConfig } from "./types.js";
-
-/**
- * Log the new messaging endpoint when tunnel URL changes.
- * Auto-updating Azure Bot's endpoint requires ARM API access (subscription ID,
- * resource group) which isn't available from bot credentials alone.
- * Use a persistent tunnel ID to avoid URL changes entirely.
- */
-function logEndpointUpdate(endpoint: string): void {
-  log.warn(`[teams] Tunnel URL changed — update Azure Bot messaging endpoint to: ${endpoint}`);
-  log.info("[teams] Azure Portal → Bot resource → Configuration → Messaging endpoint");
-  log.info("[teams] Tip: Use a persistent tunnel ID to keep a stable URL across restarts.");
-}
+import { DEFAULT_BOT_PORT } from "./types.js";
 
 /**
  * Factory for the Teams adapter plugin.
@@ -414,6 +403,59 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
       // ── Step 8: Save & Summary ──
 
+      // ── Step 8b: Bot Port ──
+
+      terminal.log.info("");
+      terminal.note(
+        "The Teams adapter runs its own HTTP server for Bot Framework messages.\n" +
+        "This is separate from the OpenACP API server.\n" +
+        "\n" +
+        `  Default port: ${DEFAULT_BOT_PORT} (Bot Framework standard)\n` +
+        "  Your tunnel must point to this port, not the OpenACP API port.",
+        "Bot Port",
+      );
+
+      const useDefaultPort = await terminal.confirm({
+        message: `Use the default bot port (${DEFAULT_BOT_PORT})?`,
+        initialValue: true,
+      });
+
+      let botPort = DEFAULT_BOT_PORT;
+      if (!useDefaultPort) {
+        const portInput = await terminal.text({
+          message: "Bot port:",
+          defaultValue: String(DEFAULT_BOT_PORT),
+          validate: (v) => {
+            const n = Number(v.trim());
+            if (isNaN(n) || !Number.isInteger(n) || n < 1 || n > 65535) return "Port must be 1–65535";
+            return undefined;
+          },
+        });
+        botPort = Number(portInput.trim());
+      }
+
+      // ── Step 8c: Tunnel Method ──
+
+      terminal.log.info("");
+      terminal.note(
+        "Azure Bot Service needs a public URL to reach your bot.\n" +
+        "A tunnel exposes your local bot port to the internet.\n" +
+        "\n" +
+        `  Your bot port: ${botPort}`,
+        "Tunnel Setup",
+      );
+
+      const tunnelMethod = await terminal.select({
+        message: "How should the bot port be tunneled?",
+        options: [
+          { value: "devtunnel", label: "@openacp/devtunnel-adapter (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
+          { value: "builtin", label: "Built-in tunnel service", hint: "Uses the system tunnel service if available" },
+          { value: "manual", label: "Manual", hint: "I'll set up my own tunnel (ngrok, cloudflared, etc.)" },
+        ],
+      });
+
+      // ── Step 8d: Save Settings ──
+
       await settings.setAll({
         enabled: true,
         botAppId,
@@ -423,6 +465,8 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         channelId,
         notificationChannelId,
         assistantThreadId: null,
+        botPort,
+        tunnelMethod,
         ...(graphClientSecret ? { graphClientSecret } : {}),
       });
 
@@ -433,10 +477,12 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         `Tenant:           ${tenantId === "botframework.com" ? "Multi-tenant" : tenantId}\n` +
         `Team ID:          ${teamId}\n` +
         `Channel ID:       ${channelId}\n` +
+        `Bot port:         ${botPort}\n` +
         `Notifications:    ${notificationChannelId ?? "Not configured"}\n` +
         `File sharing:     ${graphClientSecret ? "Enabled (Graph API)" : "Disabled"}`,
         "Configuration Summary",
       );
+
       // ── Step 9: Generate Teams App Package ──
 
       let appPackagePath: string | null = null;
@@ -450,6 +496,23 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         // Non-fatal — user can create manually
       }
 
+      // Tunnel-specific guidance for next steps
+      let tunnelStep: string;
+      if (tunnelMethod === "devtunnel") {
+        tunnelStep =
+          `  2. Install the Dev Tunnels plugin:\n` +
+          "     openacp install @openacp/devtunnel-adapter\n" +
+          `     It will automatically tunnel port ${botPort} with a persistent URL.`;
+      } else if (tunnelMethod === "builtin") {
+        tunnelStep =
+          `  2. Tunnel: Will be created automatically on startup via the built-in tunnel service.\n` +
+          `     Ensure a tunnel service plugin is installed and running.`;
+      } else {
+        tunnelStep =
+          `  2. Set up a tunnel to expose port ${botPort} (the Bot Framework port):\n` +
+          "     Use ngrok, cloudflared, or any tunnel pointing to localhost:" + botPort;
+      }
+
       terminal.log.info("");
       terminal.note(
         "Next steps:\n" +
@@ -458,10 +521,13 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           ? `     File: ${appPackagePath}\n`
           : "     Generate it with: openacp plugin configure @openacp/teams-adapter\n") +
         "     Teams → Apps → Manage your apps → Upload a custom app\n" +
-        "  2. Set the bot's messaging endpoint to your OpenACP URL:\n" +
+        tunnelStep + "\n" +
+        "  3. Set the bot's messaging endpoint in Azure:\n" +
         "     Azure Portal → Bot resource → Configuration → Messaging endpoint\n" +
-        "     Example: https://your-server.com/api/messages\n" +
-        "  3. Start OpenACP: openacp start",
+        "     Example: https://<your-tunnel-url>/api/messages\n" +
+        `  4. Note: The bot port (${botPort}) is NOT the same as the OpenACP API port.\n` +
+        "     Your tunnel must point to the bot port.\n" +
+        "  5. Start OpenACP: openacp start",
         "Next Steps",
       );
     },
@@ -480,8 +546,10 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           { value: "credentials", label: "Change bot credentials (App ID / Password)" },
           { value: "tenant", label: "Change tenant ID" },
           { value: "team", label: "Change team / channel" },
+          { value: "botPort", label: `Change bot port (current: ${(current.botPort as number) ?? DEFAULT_BOT_PORT})` },
           { value: "notifications", label: "Change notification channel" },
           { value: "graph", label: "Configure file sharing (Graph API)" },
+          { value: "tunnel", label: `Change tunnel method (current: ${(current.tunnelMethod as string) || "devtunnel"})` },
           { value: "done", label: "Done" },
         ],
       });
@@ -546,6 +614,22 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           break;
         }
 
+        case "botPort": {
+          const portInput = await terminal.text({
+            message: `Bot port (Bot Framework HTTP server, default ${DEFAULT_BOT_PORT}):`,
+            defaultValue: String((current.botPort as number) ?? DEFAULT_BOT_PORT),
+            validate: (v) => {
+              const n = Number(v.trim());
+              if (isNaN(n) || !Number.isInteger(n) || n < 1 || n > 65535) return "Port must be 1–65535";
+              return undefined;
+            },
+          });
+          await settings.set("botPort", Number(portInput.trim()));
+          terminal.log.success(`Bot port updated to ${portInput.trim()}`);
+          terminal.log.info("Remember to update your tunnel to point to this port.");
+          break;
+        }
+
         case "notifications": {
           const nid = await terminal.text({
             message: "Notification channel ID (empty to disable):",
@@ -566,6 +650,23 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           } else {
             await settings.delete("graphClientSecret");
             terminal.log.success("File sharing disabled");
+          }
+          break;
+        }
+
+        case "tunnel": {
+          const method = await terminal.select({
+            message: "How should the bot port be tunneled?",
+            options: [
+              { value: "devtunnel", label: "@openacp/devtunnel-adapter (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
+              { value: "builtin", label: "Built-in tunnel service", hint: "Uses the system tunnel service if available" },
+              { value: "manual", label: "Manual", hint: "I'll set up my own tunnel (ngrok, cloudflared, etc.)" },
+            ],
+          });
+          await settings.set("tunnelMethod", method);
+          terminal.log.success(`Tunnel method: ${method === "builtin" ? "built-in (auto-create)" : method === "devtunnel" ? "devtunnel plugin" : "manual"}`);
+          if (method === "devtunnel") {
+            terminal.log.info("Install with: openacp install @openacp/devtunnel-adapter");
           }
           break;
         }
@@ -594,12 +695,17 @@ export default function createTeamsPlugin(): OpenACPPlugin {
     // ─── Runtime Setup ───────────────────────────────────────────────────
 
     async setup(ctx) {
+      const rawPort = (ctx.pluginConfig as Record<string, unknown>).botPort;
+      const botPort = typeof rawPort === "number" ? rawPort : (typeof rawPort === "string" ? Number(rawPort) : DEFAULT_BOT_PORT) || DEFAULT_BOT_PORT;
+
       ctx.registerEditableFields([
         { key: "enabled", displayName: "Enabled", type: "toggle", scope: "safe", hotReload: false },
         { key: "botAppId", displayName: "Bot App ID", type: "string", scope: "sensitive", hotReload: false },
         { key: "tenantId", displayName: "Tenant ID", type: "string", scope: "safe", hotReload: false },
         { key: "teamId", displayName: "Team ID", type: "string", scope: "safe", hotReload: false },
         { key: "channelId", displayName: "Channel ID", type: "string", scope: "safe", hotReload: false },
+        { key: "botPort", displayName: "Bot Port", type: "number", scope: "safe", hotReload: false },
+        { key: "tunnelMethod", displayName: "Tunnel method", type: "string", scope: "safe", hotReload: false },
       ]);
 
       const config = ctx.pluginConfig as Record<string, unknown>;
@@ -609,20 +715,39 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       }
 
       adapter = new TeamsAdapter(ctx.core as OpenACPCore, config as unknown as TeamsChannelConfig);
+      await adapter.start();
       ctx.registerService("adapter:teams", adapter);
       ctx.log.info("Teams adapter registered");
 
-      // Listen for tunnel URL changes and notify about the new messaging endpoint.
-      ctx.on("devtunnel-provider:url-changed", (data: unknown) => {
-        const { newUrl } = data as { oldUrl: string; newUrl: string };
-        logEndpointUpdate(`${newUrl}/api/messages`);
-      });
+      // Only create a tunnel if the user opted into the built-in tunnel service during install.
+      // Most users should use @openacp/devtunnel-adapter instead (persistent URLs, auto-managed).
+      const tunnelMethod = ((ctx.pluginConfig as Record<string, unknown>).tunnelMethod as string) || "devtunnel";
 
-      // Log the endpoint on initial tunnel start
-      ctx.on("devtunnel-provider:started", (data: unknown) => {
-        const { publicUrl } = data as { publicUrl: string; port: number };
-        ctx.log.info(`Tunnel active — Azure Bot messaging endpoint: ${publicUrl}/api/messages`);
-      });
+      if (tunnelMethod === "builtin") {
+        // Note: addTunnel() exists on the concrete TunnelService class but is not on
+        // the exported TunnelServiceInterface type — use runtime typeof check.
+        const tunnelSvc = ctx.getService("tunnel") as Record<string, unknown> | undefined;
+        if (tunnelSvc && typeof tunnelSvc.addTunnel === "function") {
+          try {
+            const entry = await (tunnelSvc.addTunnel as (port: number, opts?: { label?: string }) => Promise<{ publicUrl?: string }>)(
+              botPort, { label: "teams-bot" },
+            );
+            if (entry?.publicUrl) {
+              ctx.log.info(`Teams bot tunnel active — messaging endpoint: ${entry.publicUrl}/api/messages`);
+              ctx.log.info("Set this URL as the messaging endpoint in Azure Portal → Bot resource → Configuration");
+            }
+          } catch (err) {
+            ctx.log.warn(`Could not create tunnel for bot port ${botPort}: ${(err as Error).message}`);
+            ctx.log.info(`Tunnel your bot manually: <tunnel-url> → localhost:${botPort}`);
+            ctx.log.info("Tip: Install @openacp/devtunnel-adapter for Microsoft Dev Tunnels integration");
+          }
+        } else {
+          ctx.log.warn(`Auto-tunnel enabled but no tunnel service available — install a tunnel plugin`);
+          ctx.log.info("Recommended: openacp install @openacp/devtunnel-adapter");
+        }
+      } else {
+        ctx.log.info(`Bot listening on port ${botPort} — tunnel method: ${tunnelMethod}`);
+      }
     },
 
     async teardown() {

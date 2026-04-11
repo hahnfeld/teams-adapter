@@ -21,8 +21,8 @@ export async function handleIntegrate(ctx: CommandContext): Promise<void> {
         if (response.type !== "silent") {
           if (response.type === "text") await ctx.reply(response.text);
           else if (response.type === "list") {
-            const items = response.items.map((i: any) => `- **${i.label}**${i.detail ? ` — ${i.detail}` : ""}`).join("\n");
-            await ctx.reply(`${response.title}\n${items}`);
+            const items = response.items.map((i: any) => `- **${i.label}**${i.detail ? ` — ${i.detail}` : ""}`).join("\n\n");
+            await ctx.reply(`${response.title}\n\n${items}`);
           }
         }
         return;
@@ -40,7 +40,7 @@ export async function handleIntegrate(ctx: CommandContext): Promise<void> {
   const lines = agents.map((a) => `- **${a.name}**`);
   await ctx.reply(
     `**🔗 Integrations**\n\n` +
-    `Installed agents:\n${lines.join("\n")}\n\n` +
+    `Installed agents:\n\n${lines.join("\n\n")}\n\n` +
     `Use \`openacp integrate <agent>\` from the terminal for detailed integration management.`,
   );
 }

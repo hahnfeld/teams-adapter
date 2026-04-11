@@ -1,0 +1,10 @@
+src/
+tsconfig.json
+vitest.config.ts
+.editorconfig
+.gitignore
+*.test.ts
+__tests__/
+teams-app/
+CODE_REVIEW.md
+.claude/

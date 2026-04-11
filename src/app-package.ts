@@ -5,8 +5,9 @@
  * placeholder icon PNGs, then bundles them into a zip file that can
  * be uploaded via Teams → Apps → Manage your apps → Upload a custom app.
  */
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { deflateSync, crc32 } from "node:zlib";
 import type { InstallContext } from "@openacp/plugin-sdk";
 
 /** Minimal solid-color 1x1 PNG (valid but tiny — Teams accepts it). */
@@ -24,7 +25,6 @@ function createPlaceholderPng(): Buffer {
   ]));
   // Raw pixel data: filter byte (0) + RGB
   const raw = Buffer.from([0x00, 0x4f, 0x6b, 0xed]);
-  const { deflateSync } = require("node:zlib") as typeof import("node:zlib");
   const idat = createChunk("IDAT", deflateSync(raw));
   const iend = createChunk("IEND", Buffer.alloc(0));
   return Buffer.concat([header, ihdr, idat, iend]);
@@ -35,7 +35,6 @@ function createChunk(type: string, data: Buffer): Buffer {
   len.writeUInt32BE(data.length);
   const typeBytes = Buffer.from(type, "ascii");
   const crcInput = Buffer.concat([typeBytes, data]);
-  const { crc32 } = require("node:zlib") as typeof import("node:zlib");
   const crcVal = Buffer.alloc(4);
   crcVal.writeUInt32BE(crc32(crcInput) >>> 0);
   return Buffer.concat([len, typeBytes, data, crcVal]);
@@ -57,7 +56,6 @@ function createZip(files: { name: string; data: Buffer }[]): Buffer {
     localHeader.writeUInt16LE(0, 10);           // mod time
     localHeader.writeUInt16LE(0, 12);           // mod date
     // CRC-32
-    const { crc32 } = require("node:zlib") as typeof import("node:zlib");
     const crc = crc32(file.data) >>> 0;
     localHeader.writeUInt32LE(crc, 14);
     localHeader.writeUInt32LE(file.data.length, 18); // compressed size
@@ -166,10 +164,16 @@ export async function generateTeamsAppPackage(
     { name: "outline.png", data: outlinePng },
   ]);
 
-  // Write to the plugin's data directory
+  // Write to the plugin's data directory.
+  // The .path property exists on the concrete SettingsManager instance but not
+  // on the SettingsAPI interface — access it defensively.
   const settingsPath = (ctx.settings as any).path ?? "";
   const dataDir = settingsPath ? dirname(settingsPath) : "";
-  if (!dataDir) return null;
+  if (!dataDir) {
+    // Cannot determine the plugin data directory — app package generation skipped.
+    // This is expected in test contexts where settings is a mock.
+    return null;
+  }
 
   const outPath = join(dataDir, "openacp-bot.zip");
   mkdirSync(dirname(outPath), { recursive: true });

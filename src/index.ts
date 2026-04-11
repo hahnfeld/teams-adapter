@@ -4,6 +4,7 @@ export default createTeamsPlugin();
 export { TeamsAdapter } from "./adapter.js";
 export { TeamsRenderer } from "./renderer.js";
 export type { TeamsChannelConfig, TeamsPlatformData } from "./types.js";
+export { DEFAULT_BOT_PORT } from "./types.js";
 export type { ToolCardSnapshot, ToolDisplaySpec } from "./activity.js";
 export type { OutputMode } from "./activity.js";
 export type { TeamsDraftManager, TeamsMessageDraft } from "./draft-manager.js";

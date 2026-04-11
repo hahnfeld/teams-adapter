@@ -11,8 +11,9 @@
       "import": "./dist/index.js"
     }
   },
-  "keywords": ["openacp-plugin", "openacp", "teams", "adapter", "microsoft-teams"],
+  "keywords": ["openacp", "openacp-plugin", "teams", "adapter", "microsoft-teams"],
   "engines": {
+    "node": ">=20",
     "openacp": ">=2026.0.0"
   },
   "scripts": {
@@ -21,22 +22,31 @@
     "test": "vitest",
     "prepublishOnly": "pnpm run build"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Open-ACP/teams-adapter"
+  },
+  "homepage": "https://github.com/Open-ACP/teams-adapter",
+  "author": "OpenACP Contributors",
   "peerDependencies": {
-    "@openacp/cli": ">=2026.0.0"
+    "@openacp/cli": ">=2026.0.0",
+    "@openacp/plugin-sdk": ">=2026.0.0"
   },
   "dependencies": {
     "@microsoft/agents-hosting": "^1.4.0",
     "@microsoft/teams.api": "^2.0.0",
     "@microsoft/teams.apps": "^2.0.0",
     "@microsoft/teams.botbuilder": "^2.0.0",
+    "botbuilder": "^4.23.0",
+    "botframework-connector": "^4.23.0",
     "nanoid": "^5.0.0"
   },
   "devDependencies": {
-    "@openacp/plugin-sdk": "^2026.331.1",
+    "@openacp/plugin-sdk": "^2026.0.0",
     "typescript": "^5.4.0",
     "vitest": "^3.0.0"
   },
-  "files": ["dist", "!dist/__tests__"],
-  "packageManager": "pnpm@9.15.0",
+  "files": ["dist"],
+  "packageManager": "pnpm@10.5.0",
   "license": "MIT"
 }

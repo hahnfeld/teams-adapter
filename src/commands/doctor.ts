@@ -50,7 +50,7 @@ export async function handleDoctor(ctx: CommandContext): Promise<void> {
   const assistantId = ctx.adapter.getAssistantSessionId();
   checks.push(`${assistantId ? "✅" : "ℹ️"} Assistant session: ${assistantId ? "active" : "not configured"}`);
 
-  await ctx.reply(`**🔍 System Diagnostics**\n\n${checks.join("\n")}`);
+  await ctx.reply(`**🔍 System Diagnostics**\n\n${checks.join("\n\n")}`);
 }
 
 export async function handleDoctorButton(ctx: CommandContext): Promise<void> {

@@ -225,6 +225,12 @@ export class GraphFileClient {
     const session = (await sessionResponse.json()) as { uploadUrl: string };
     const uploadUrl = session.uploadUrl;
 
+    // Validate the upload URL points to a Microsoft-controlled host to prevent SSRF
+    // if the Graph API response were compromised or intercepted.
+    if (!/^https:\/\/[\w-]+(\.[\w-]+)*\.microsoft\.com(\/|$)/i.test(uploadUrl)) {
+      throw new Error(`Untrusted upload URL from Graph API: ${uploadUrl.slice(0, 80)}`);
+    }
+
     // Step 2: Upload in 10MB chunks
     const chunkSize = 10 * 1024 * 1024; // 10MB — must be multiple of 320KB
     const totalSize = content.length;

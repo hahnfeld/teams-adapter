@@ -11,6 +11,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { TeamsAdapter } from "../adapter.js";
+import { DEFAULT_BOT_PORT } from "../types.js";
 
 describe("TeamsAdapter conformance", () => {
   const proto = TeamsAdapter.prototype;
@@ -115,6 +116,48 @@ describe("TeamsAdapter exports", () => {
   it("exports GraphFileClient class", async () => {
     const mod = await import("../index.js");
     expect(typeof mod.GraphFileClient).toBe("function");
+  });
+
+  it("exports DEFAULT_BOT_PORT constant", async () => {
+    const mod = await import("../index.js");
+    expect(mod.DEFAULT_BOT_PORT).toBe(3978);
+  });
+});
+
+describe("Bot port configuration", () => {
+  it("DEFAULT_BOT_PORT is the Bot Framework standard port 3978", () => {
+    expect(DEFAULT_BOT_PORT).toBe(3978);
+    expect(typeof DEFAULT_BOT_PORT).toBe("number");
+  });
+
+  it("TeamsChannelConfig accepts botPort field", () => {
+    // Type-level check: ensure the config shape compiles with botPort
+    const config = {
+      enabled: true,
+      botAppId: "test-id",
+      botAppPassword: "test-pw",
+      tenantId: "test-tenant",
+      teamId: "test-team",
+      channelId: "test-channel",
+      notificationChannelId: null,
+      assistantThreadId: null,
+      botPort: 4000,
+    } satisfies import("../types.js").TeamsChannelConfig;
+    expect(config.botPort).toBe(4000);
+  });
+
+  it("TeamsChannelConfig defaults botPort to undefined when omitted", () => {
+    const config = {
+      enabled: true,
+      botAppId: "test-id",
+      botAppPassword: "test-pw",
+      tenantId: "test-tenant",
+      teamId: "test-team",
+      channelId: "test-channel",
+      notificationChannelId: null,
+      assistantThreadId: null,
+    } satisfies import("../types.js").TeamsChannelConfig;
+    expect(config.botPort).toBeUndefined();
   });
 });
 

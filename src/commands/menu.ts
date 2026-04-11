@@ -40,38 +40,44 @@ export async function handleMenu(ctx: CommandContext): Promise<void> {
  * Handle /help — show available commands.
  */
 export async function handleHelp(ctx: CommandContext): Promise<void> {
-  const commands = [
-    "**Session Management:**",
-    "`/new [agent] [workspace]` — Create new session",
-    "`/newchat` — New chat, same agent & workspace",
-    "`/cancel` — Abort current prompt",
-    "`/status` — Show session status",
-    "`/sessions` — List all sessions",
-    "`/handoff` — Generate terminal resume command",
-    "",
-    "**Agent Management:**",
-    "`/agents` — List available agents",
-    "`/install <name>` — Install an agent",
-    "",
-    "**Settings:**",
-    "`/outputmode low|medium|high` — Set output detail",
-    "`/bypass` — Toggle auto-approve permissions",
-    "`/tts on|off` — Toggle text-to-speech",
-    "`/mode <mode>` — Switch session mode",
-    "`/model <model>` — Switch AI model",
-    "`/thought <level>` — Adjust thinking level",
-    "`/settings` — Show configuration",
-    "",
-    "**System:**",
-    "`/menu` — Show action menu",
-    "`/doctor` — Run diagnostics",
-    "`/restart` — Restart OpenACP",
-    "`/clear` — Reset assistant session",
+  const sections = [
+    [
+      "**Session Management:**",
+      "`/new [agent] [workspace]` — Create new session",
+      "`/newchat` — New chat, same agent & workspace",
+      "`/cancel` — Abort current prompt",
+      "`/status` — Show session status",
+      "`/sessions` — List all sessions",
+      "`/handoff` — Generate terminal resume command",
+    ],
+    [
+      "**Agent Management:**",
+      "`/agents` — List available agents",
+      "`/install <name>` — Install an agent",
+    ],
+    [
+      "**Settings:**",
+      "`/outputmode low|medium|high` — Set output detail",
+      "`/bypass` — Toggle auto-approve permissions",
+      "`/tts on|off` — Toggle text-to-speech",
+      "`/mode <mode>` — Switch session mode",
+      "`/model <model>` — Switch AI model",
+      "`/thought <level>` — Adjust thinking level",
+      "`/settings` — Show configuration",
+    ],
+    [
+      "**System:**",
+      "`/menu` — Show action menu",
+      "`/doctor` — Run diagnostics",
+      "`/restart` — Restart OpenACP",
+      "`/clear` — Reset assistant session",
+    ],
   ];
+  // Teams requires \n\n for any visible line break; separate sections with ---
+  const text = sections.map((s) => s.join("\n\n")).join("\n\n---\n\n");
   // Send with suggested action buttons for quick access (1:1 chat only)
-  // Teams collapses single \n — use \n\n for paragraph breaks
   await sendActivity(ctx.context, {
-    text: commands.join("\n"),
+    text,
     suggestedActions: {
       actions: [
         { type: "imBack", title: "➕ New", value: "/new" },
