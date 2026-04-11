@@ -1,6 +1,6 @@
 {
   "name": "@hahnfeld/teams-adapter",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Teams adapter plugin for OpenACP — Adaptive Cards, commands, streaming",
   "type": "module",
   "main": "dist/index.js",

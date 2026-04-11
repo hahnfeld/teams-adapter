@@ -163,7 +163,14 @@ export class TeamsAdapter extends MessagingAdapter {
 
   // ─── start ────────────────────────────────────────────────────────────────
 
+  private _started = false;
+
   async start(): Promise<void> {
+    if (this._started) {
+      log.warn("[TeamsAdapter] Already started, skipping duplicate start()");
+      return;
+    }
+    this._started = true;
     log.info("[TeamsAdapter] Starting...");
 
     try {
@@ -233,6 +240,7 @@ export class TeamsAdapter extends MessagingAdapter {
     this.permissionHandler.dispose();
 
     await this.app.stop();
+    this._started = false;
     log.info("[TeamsAdapter] Stopped");
   }
 

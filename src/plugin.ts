@@ -736,6 +736,10 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         return;
       }
 
+      if (adapter) {
+        ctx.log.warn("Teams adapter setup() called again — skipping (already running)");
+        return;
+      }
       adapter = new TeamsAdapter(ctx.core as OpenACPCore, config as unknown as TeamsChannelConfig);
       await adapter.start();
       ctx.registerService("adapter:teams", adapter);
