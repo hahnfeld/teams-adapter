@@ -135,4 +135,12 @@ describe("parseTeamsLink", () => {
     expect(result.channelId).toBe("19:xyz@thread.tacv2");
     expect(result.tenantId).toBeUndefined();
   });
+
+  it("extracts IDs from new teams.cloud.microsoft domain", () => {
+    const link = "https://teams.cloud.microsoft/l/channel/19%3Aabc123%40thread.tacv2/General?groupId=team-guid-123&tenantId=tenant-guid-456";
+    const result = parseTeamsLink(link);
+    expect(result.teamId).toBe("team-guid-123");
+    expect(result.channelId).toBe("19:abc123@thread.tacv2");
+    expect(result.tenantId).toBe("tenant-guid-456");
+  });
 });

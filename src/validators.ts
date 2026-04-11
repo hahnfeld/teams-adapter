@@ -166,6 +166,7 @@ export async function discoverTeamsAndChannels(
  * Parse a Teams channel link to extract team and channel IDs.
  * Teams links look like:
  *   https://teams.microsoft.com/l/channel/19%3A...%40thread.tacv2/General?groupId=<teamId>&tenantId=<tenantId>
+ *   https://teams.cloud.microsoft/l/channel/19%3A...%40thread.tacv2/General?groupId=<teamId>&tenantId=<tenantId>
  */
 export function parseTeamsLink(url: string): { teamId?: string; channelId?: string; tenantId?: string } {
   try {

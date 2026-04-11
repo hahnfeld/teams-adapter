@@ -285,7 +285,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
             message: "Paste the Teams channel link:",
             validate: (v) => {
               if (!v.trim()) return "Link cannot be empty";
-              if (!v.includes("teams.microsoft.com")) return "This doesn't look like a Teams link";
+              if (!v.includes("teams.microsoft.com") && !v.includes("teams.cloud.microsoft")) return "This doesn't look like a Teams link";
               return undefined;
             },
           });
@@ -425,12 +425,27 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         `File sharing:     ${graphClientSecret ? "Enabled (Graph API)" : "Disabled"}`,
         "Configuration Summary",
       );
+      // ── Step 9: Generate Teams App Package ──
+
+      let appPackagePath: string | null = null;
+      try {
+        const { generateTeamsAppPackage } = await import("./app-package.js");
+        appPackagePath = await generateTeamsAppPackage(botAppId, ctx);
+        if (appPackagePath) {
+          terminal.log.success(`Teams app package created: ${appPackagePath}`);
+        }
+      } catch {
+        // Non-fatal — user can create manually
+      }
+
       terminal.log.info("");
       terminal.note(
         "Next steps:\n" +
-        "  1. Make sure the bot is added to your Teams team:\n" +
+        "  1. Upload the Teams app package to your team:\n" +
+        (appPackagePath
+          ? `     File: ${appPackagePath}\n`
+          : "     Generate it with: openacp plugin configure @openacp/teams-adapter\n") +
         "     Teams → Apps → Manage your apps → Upload a custom app\n" +
-        "     (or ask your Teams admin to install it)\n" +
         "  2. Set the bot's messaging endpoint to your OpenACP URL:\n" +
         "     Azure Portal → Bot resource → Configuration → Messaging endpoint\n" +
         "     Example: https://your-server.com/api/messages\n" +
