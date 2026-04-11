@@ -38,7 +38,6 @@ import { GraphFileClient } from "./graph.js";
 import { ConversationStore } from "./conversation-store.js";
 import { sendText, sendCard, sendActivity } from "./send-utils.js";
 import { renderUsageCard, renderToolCallCard, renderPlanCard, buildCitationEntities } from "./formatting.js";
-import { buildNewSessionDialog, buildSettingsDialog, buildDialogMessage } from "./task-modules.js";
 import type { ToolCallMeta } from "@openacp/plugin-sdk";
 import type { OutputMode } from "./activity.js";
 
@@ -183,7 +182,7 @@ export class TeamsAdapter extends MessagingAdapter {
 
       this.setupMessageHandler();
       this.setupCardActionHandler();
-      this.setupTaskModuleHandlers();
+
       this.setupReactionHandler();
 
       // Periodic cleanup of processed activity IDs (deduplication cache)
@@ -522,13 +521,6 @@ export class TeamsAdapter extends MessagingAdapter {
         return;
       }
 
-      // Legacy: Task Module dialog triggers (dialogId without verb)
-      const dialogId = data.dialogId as string | undefined;
-      if (dialogId && !data.verb) {
-        await this.handleInlineDialog(context, dialogId, data);
-        return;
-      }
-
       const verb = data.verb as string | undefined;
       if (!verb) return;
 
@@ -683,134 +675,6 @@ export class TeamsAdapter extends MessagingAdapter {
     });
   }
 
-  // ─── Task Module handlers (modal dialogs) ────────────────────────────────
-
-  /**
-   * Register task/fetch and task/submit invoke handlers for Teams modal dialogs.
-   * Task Modules are triggered by Action.Submit with msteams.type = "task/fetch".
-   */
-  private setupTaskModuleHandlers(): void {
-    // task/fetch — return the dialog card
-    this.app.on("task.fetch" as any, async (context: any) => {
-      try {
-        const data = context.activity.value?.data as Record<string, unknown> | undefined;
-        const dialogId = data?.dialogId as string | undefined;
-
-        if (dialogId === "new-session") {
-          const agents = this.core.agentManager.getAvailableAgents();
-          const workspace = this.core.configManager.resolveWorkspace?.() ?? process.cwd();
-          return buildNewSessionDialog(agents, workspace);
-        }
-
-        if (dialogId === "settings") {
-          const sessionId = data?.sessionId as string | undefined;
-          const session = sessionId ? this.core.sessionManager.getSession(sessionId) : undefined;
-          const config = this.core.configManager.get();
-          return buildSettingsDialog({
-            defaultAgent: config.defaultAgent,
-            workspace: this.core.configManager.resolveWorkspace?.(),
-            outputMode: "medium",
-            sessionId: sessionId ?? undefined,
-            sessionAgent: session?.agentName,
-            sessionModel: session?.getConfigByCategory?.("model")?.currentValue as string | undefined,
-            sessionBypass: !!session?.clientOverrides?.bypassPermissions,
-            sessionTts: session?.voiceMode,
-          });
-        }
-
-        return buildDialogMessage("Unknown dialog");
-      } catch (err) {
-        log.error({ err }, "[TeamsAdapter] task.fetch error");
-        return buildDialogMessage("Failed to load dialog");
-      }
-    });
-
-    // task/submit — process form data from the dialog
-    this.app.on("task.submit" as any, async (context: any) => {
-      try {
-        const data = context.activity.value?.data as Record<string, unknown> | undefined;
-        const action = data?.dialogAction as string | undefined;
-
-        if (action === "new-session") {
-          const agentName = data?.agent as string;
-          const workspace = data?.workspace as string;
-          if (!agentName || !workspace) {
-            return buildDialogMessage("Agent and workspace are required.");
-          }
-
-          // Validate agent name against registered agents
-          const availableAgents = this.core.agentManager.getAvailableAgents();
-          if (!availableAgents.some((a) => a.name === agentName)) {
-            return buildDialogMessage(`Unknown agent: ${agentName}`);
-          }
-
-          // Validate workspace — must match the configured workspace to prevent path traversal
-          const allowedWorkspace = this.core.configManager.resolveWorkspace?.() ?? process.cwd();
-          if (workspace !== allowedWorkspace) {
-            log.warn({ workspace, allowedWorkspace }, "[TeamsAdapter] task.submit: workspace mismatch");
-            return buildDialogMessage("Invalid workspace path.");
-          }
-
-          try {
-            const session = await this.core.sessionManager.createSession(
-              "teams",
-              agentName,
-              allowedWorkspace,
-              this.core.agentManager,
-            );
-            const threadId = await this.createSessionThread(session.id, session.name || agentName);
-            session.threadId = threadId;
-            session.threadIds.set("teams", threadId);
-
-            // Store context for the new session
-            const conversationId = context.activity.conversation?.id;
-            if (conversationId) {
-              this._sessionContexts.set(session.id, {
-                context,
-                isAssistant: false,
-              });
-            }
-
-            return buildDialogMessage(`Session created with ${agentName} in ${workspace}`);
-          } catch (err) {
-            log.error({ err, agentName, workspace }, "[TeamsAdapter] task.submit new-session error");
-            return buildDialogMessage(`Failed to create session: ${(err as Error).message}`);
-          }
-        }
-
-        if (action === "save-settings") {
-          const outputMode = data?.outputMode as string | undefined;
-          const bypass = data?.bypass as string | undefined;
-          const sessionId = data?.sessionId as string | undefined;
-
-          // Verify the submitting user's conversation owns the target session
-          const conversationId = context.activity.conversation?.id;
-          const session = sessionId ? this.core.sessionManager.getSession(sessionId) : undefined;
-          if (session && conversationId) {
-            const sessionThread = session.threadIds.get("teams");
-            if (sessionThread && sessionThread !== conversationId) {
-              log.warn({ sessionId, conversationId, sessionThread }, "[TeamsAdapter] save-settings: conversation mismatch");
-              return buildDialogMessage("You do not have access to this session.");
-            }
-          }
-
-          if (outputMode && sessionId) {
-            this.setSessionOutputMode(sessionId, outputMode as "low" | "medium" | "high");
-          }
-          if (bypass !== undefined && session) {
-            session.clientOverrides = { ...session.clientOverrides, bypassPermissions: bypass === "true" };
-          }
-
-          return buildDialogMessage("Settings saved");
-        }
-
-        return buildDialogMessage("Unknown action");
-      } catch (err) {
-        log.error({ err }, "[TeamsAdapter] task.submit error");
-        return buildDialogMessage("Failed to process");
-      }
-    });
-  }
 
   /**
    * Handle form submissions from inline wizard cards (dialogAction payloads).
@@ -877,46 +741,6 @@ export class TeamsAdapter extends MessagingAdapter {
     }
 
     await sendText(context, `Unknown action: ${action}`);
-  }
-
-  /**
-   * Legacy: Handle a dialog request that arrived via Action.Submit with dialogId (not invoke).
-   * Kept for backwards compatibility with older card payloads.
-   */
-  private async handleInlineDialog(context: any, dialogId: string, data: Record<string, unknown>): Promise<void> {
-    if (dialogId === "new-session") {
-      const agents = this.core.agentManager.getAvailableAgents();
-      const workspace = this.core.configManager.resolveWorkspace?.() ?? process.cwd();
-      const dialog = buildNewSessionDialog(agents, workspace);
-      const cardContent = (dialog.task as any)?.value?.card?.content;
-      if (cardContent) {
-        await sendCard(context, cardContent);
-      }
-      return;
-    }
-
-    if (dialogId === "settings") {
-      const sessionId = data.sessionId as string | undefined;
-      const session = sessionId ? this.core.sessionManager.getSession(sessionId) : undefined;
-      const config = this.core.configManager.get();
-      const dialog = buildSettingsDialog({
-        defaultAgent: config.defaultAgent,
-        workspace: this.core.configManager.resolveWorkspace?.(),
-        outputMode: "medium",
-        sessionId: sessionId ?? undefined,
-        sessionAgent: session?.agentName,
-        sessionModel: session?.getConfigByCategory?.("model")?.currentValue as string | undefined,
-        sessionBypass: !!session?.clientOverrides?.bypassPermissions,
-        sessionTts: session?.voiceMode,
-      });
-      const cardContent = (dialog.task as any)?.value?.card?.content;
-      if (cardContent) {
-        await sendCard(context, cardContent);
-      }
-      return;
-    }
-
-    await sendText(context, "Unknown dialog");
   }
 
   // ─── Card action handler (for Action.Execute / invoke activities) ─────
