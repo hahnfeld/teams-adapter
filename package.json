@@ -1,6 +1,6 @@
 {
-  "name": "@openacp/teams-adapter",
-  "version": "1.0.0",
+  "name": "@hahnfeld/teams-adapter",
+  "version": "1.0.1",
   "description": "Teams adapter plugin for OpenACP — Adaptive Cards, commands, streaming",
   "type": "module",
   "main": "dist/index.js",
@@ -24,10 +24,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Open-ACP/teams-adapter"
+    "url": "https://github.com/hahnfeld/teams-adapter"
   },
-  "homepage": "https://github.com/Open-ACP/teams-adapter",
-  "author": "OpenACP Contributors",
+  "homepage": "https://github.com/hahnfeld/teams-adapter",
+  "author": "Matt Hahnfeld",
+  "publishConfig": {
+    "@hahnfeld:registry": "https://npm.pkg.github.com"
+  },
   "peerDependencies": {
     "@openacp/cli": ">=2026.0.0",
     "@openacp/plugin-sdk": ">=2026.0.0"

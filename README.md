@@ -1,4 +1,4 @@
-# @openacp/teams-adapter
+# @hahnfeld/teams-adapter
 
 Microsoft Teams adapter plugin for [OpenACP](https://github.com/Open-ACP/OpenACP) — Adaptive Cards, slash commands, streaming.
 
@@ -26,7 +26,7 @@ Microsoft Teams adapter plugin for [OpenACP](https://github.com/Open-ACP/OpenACP
 ### Option A: OpenACP plugin install (recommended)
 
 ```bash
-openacp plugin install @openacp/teams-adapter
+openacp plugin install @hahnfeld/teams-adapter
 ```
 
 This launches an interactive wizard that walks you through Azure Bot setup, credential validation, team/channel selection, and generates a Teams app package for sideloading.
@@ -34,9 +34,9 @@ This launches an interactive wizard that walks you through Azure Bot setup, cred
 ### Option B: Manual npm install
 
 ```bash
-npm install @openacp/teams-adapter
+npm install @hahnfeld/teams-adapter
 # or
-pnpm add @openacp/teams-adapter
+pnpm add @hahnfeld/teams-adapter
 ```
 
 ## Azure Bot Setup
@@ -65,7 +65,7 @@ For full details see the [Azure Bot Service docs](https://learn.microsoft.com/en
 If you installed via `openacp plugin install`, the wizard runs automatically. To re-run it later:
 
 ```bash
-openacp plugin configure @openacp/teams-adapter
+openacp plugin configure @hahnfeld/teams-adapter
 ```
 
 The wizard guides you through:
@@ -160,10 +160,10 @@ After installation, set the bot's messaging endpoint in Azure:
 
 The adapter automatically requests a tunnel on the bot port at startup if an OpenACP tunnel provider is available. The tunnel URL is logged on boot.
 
-**Recommended: `@openacp/devtunnel-adapter`** — a tunnel provider plugin using [Microsoft Dev Tunnels](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/get-started), which aligns with the Microsoft/Azure ecosystem:
+**Recommended: `@hahnfeld/devtunnel-provider`** — a tunnel provider plugin using [Microsoft Dev Tunnels](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/get-started), which aligns with the Microsoft/Azure ecosystem:
 
 ```bash
-openacp plugin install @openacp/devtunnel-adapter
+openacp plugin install @hahnfeld/devtunnel-provider
 ```
 
 **Manual tunnel setup** (if not using an OpenACP tunnel provider):
@@ -216,7 +216,7 @@ Set the tunnel URL as the messaging endpoint in Azure: `https://<id>.devtunnels.
 ## Uninstalling
 
 ```bash
-openacp plugin uninstall @openacp/teams-adapter --purge
+openacp plugin uninstall @hahnfeld/teams-adapter --purge
 ```
 
 The `--purge` flag removes all saved settings. After uninstalling, you may also want to:

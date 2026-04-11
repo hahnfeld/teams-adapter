@@ -18,7 +18,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
   let adapter: TeamsAdapter | null = null;
 
   return {
-    name: "@openacp/teams-adapter",
+    name: "@hahnfeld/teams-adapter",
     version: "1.0.0",
     description: "Microsoft Teams adapter with Adaptive Cards, commands, and streaming",
     essential: false,
@@ -519,7 +519,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         "  1. Upload the Teams app package to your team:\n" +
         (appPackagePath
           ? `     File: ${appPackagePath}\n`
-          : "     Generate it with: openacp plugin configure @openacp/teams-adapter\n") +
+          : "     Generate it with: openacp plugin configure @hahnfeld/teams-adapter\n") +
         "     Teams → Apps → Manage your apps → Upload a custom app\n" +
         tunnelStep + "\n" +
         "  3. Set the bot's messaging endpoint in Azure:\n" +
