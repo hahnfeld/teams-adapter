@@ -17,7 +17,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
   let adapter: TeamsAdapter | null = null;
 
   return {
-    name: "@openacp/teams",
+    name: "@openacp/teams-adapter",
     version: "1.0.0",
     description: "Microsoft Teams adapter with Adaptive Cards, commands, and streaming",
     essential: false,
