@@ -13,7 +13,6 @@ import {
   formatToolCall,
   formatPlan,
   formatUsage,
-  renderUsageCard,
 } from "../formatting.js";
 
 describe("progressBar", () => {
@@ -202,23 +201,3 @@ describe("formatUsage", () => {
   });
 });
 
-describe("renderUsageCard", () => {
-  it("returns card body with header and facts for medium mode", () => {
-    const { body } = renderUsageCard({ tokensUsed: 1000 }, "medium");
-    expect(body.length).toBeGreaterThanOrEqual(2);
-    expect((body[0] as { type: string }).type).toBe("TextBlock");
-    expect((body[1] as { type: string }).type).toBe("FactSet");
-  });
-
-  it("returns single TextBlock for low mode", () => {
-    const { body } = renderUsageCard({ tokensUsed: 1000 }, "low");
-    expect(body).toHaveLength(1);
-    expect((body[0] as { type: string }).type).toBe("TextBlock");
-  });
-
-  it("returns unavailable message when no tokens", () => {
-    const { body } = renderUsageCard({}, "medium");
-    expect(body).toHaveLength(1);
-    expect((body[0] as { text: string }).text).toContain("unavailable");
-  });
-});

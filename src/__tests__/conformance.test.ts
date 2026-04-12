@@ -118,6 +118,16 @@ describe("TeamsAdapter exports", () => {
     expect(typeof mod.GraphFileClient).toBe("function");
   });
 
+  it("exports SessionMessageManager class", async () => {
+    const mod = await import("../index.js");
+    expect(typeof mod.SessionMessageManager).toBe("function");
+  });
+
+  it("exports ConversationRateLimiter class", async () => {
+    const mod = await import("../index.js");
+    expect(typeof mod.ConversationRateLimiter).toBe("function");
+  });
+
   it("exports DEFAULT_BOT_PORT constant", async () => {
     const mod = await import("../index.js");
     expect(mod.DEFAULT_BOT_PORT).toBe(3978);

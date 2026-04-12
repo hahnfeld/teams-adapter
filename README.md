@@ -1,12 +1,12 @@
 # @hahnfeld/teams-adapter
 
-Microsoft Teams adapter plugin for [OpenACP](https://github.com/Open-ACP/OpenACP) — Adaptive Cards, slash commands, streaming.
+Microsoft Teams adapter plugin for [OpenACP](https://github.com/Open-ACP/OpenACP) — real-time streaming, rich message composition, slash commands.
 
 ## Features
 
-- **Adaptive Cards** — Rich tool card rendering with progress indicators and action buttons
+- **Streaming Message Composer** — Single message per session with live-updating header (tool activity), body (streamed text), and footer (usage/completion)
+- **Per-conversation Rate Limiter** — Multi-window sliding rate limiter (6/1s, 7/2s, 55/30s, 1700/hr) with operation coalescing
 - **Slash Commands** — Full command suite: `/new`, `/cancel`, `/agents`, `/menu`, and more
-- **Streaming** — Real-time text updates via Teams message editing
 - **Threads** — Session threads within Teams channels
 - **Permissions** — Allow/Deny/Always Allow via Adaptive Card buttons
 - **Output Modes** — Low/Medium/High detail levels
@@ -261,35 +261,68 @@ pnpm test
 
 ## Architecture
 
+### Message Rendering Model
+
+All agent output is consolidated into a single Teams message per turn, edited in place:
+
+```
+┌─────────────────────────────────────────────┐
+│ **Session Name**                            │  ← TITLE (persistent, bold)
+│ *🔧 Reading file src/adapter.ts...*         │  ← HEADER (ephemeral, italic)
+│─────────────────────────────────────────────│
+│                                             │
+│ Here's what I found in the adapter...       │  ← BODY (streamed text + attachments)
+│ The function handles three cases:           │
+│                                             │
+│─────────────────────────────────────────────│
+│ *44k tokens · $0.14 · Task completed*       │  ← FOOTER (persistent, italic)
+└─────────────────────────────────────────────┘
+```
+
+| Message Type | Zone | Behavior |
+|---|---|---|
+| `text` | Body | Streamed, edited in place |
+| `thought` | Header | Ephemeral, 💭 prefix, replaced by next header |
+| `tool_call` | Header | Ephemeral, 🔧 prefix, replaced by next header |
+| `tool_update` | Header | Ephemeral, 🔧 prefix, replaced by next header |
+| `usage` | Footer | Persistent, dot-separated stats + "Task completed" |
+| `plan` | Separate | Single message, updated in place per session |
+| `error` | Separate | Standalone ❌ message |
+| `mode_change` | Separate | ⚙️ prefix |
+| `config_update` | Separate | ⚙️ prefix |
+| `model_update` | Separate | ⚙️ prefix |
+| `system_message` | Separate | ⚙️ prefix |
+
+### Source Layout
+
 ```
 src/
-├── index.ts             # Plugin entry point & public exports
-├── plugin.ts            # Plugin factory (install wizard, configure, setup/teardown)
-├── adapter.ts           # TeamsAdapter — extends MessagingAdapter
-├── app-package.ts       # Teams app manifest package generator
-├── renderer.ts          # TeamsRenderer (Adaptive Card rendering)
-├── activity.ts          # ActivityTracker (tool card state, streaming)
-├── formatting.ts        # Tool card formatting, usage cards, citations
-├── draft-manager.ts     # Message draft handling
-├── permissions.ts       # PermissionHandler (Adaptive Card buttons)
-├── graph.ts             # GraphFileClient (OneDrive file sharing)
-├── media.ts             # File download/upload utilities
+├── index.ts              # Plugin entry point & public exports
+├── plugin.ts             # Plugin factory (install wizard, configure, setup/teardown)
+├── adapter.ts            # TeamsAdapter — extends MessagingAdapter
+├── message-composer.ts   # SessionMessage (title/header/body/footer zones)
+├── rate-limiter.ts       # Per-conversation rate limiter with coalescing
+├── app-package.ts        # Teams app manifest package generator
+├── activity.ts           # Type re-exports from plugin-sdk
+├── formatting.ts         # Text formatting helpers (tool summaries, plans, usage)
+├── permissions.ts        # PermissionHandler (Adaptive Card buttons)
+├── graph.ts              # GraphFileClient (OneDrive file sharing)
+├── media.ts              # File download/upload utilities
 ├── conversation-store.ts # Conversation reference storage
-├── send-utils.ts        # Message sending helpers (Teams SDK compat)
-├── task-modules.ts      # Task module dialogs (new session, settings)
-├── assistant.ts         # Assistant session spawning
-├── validators.ts        # Credential & tenant validation, Teams link parsing
-├── types.ts             # TeamsChannelConfig, TeamsPlatformData
+├── send-utils.ts         # Message sending helpers (Teams SDK compat)
+├── assistant.ts          # Assistant session spawning
+├── validators.ts         # Credential & tenant validation, Teams link parsing
+├── types.ts              # TeamsChannelConfig, TeamsPlatformData
 └── commands/
-    ├── index.ts          # Command router + SLASH_COMMANDS registry
-    ├── new-session.ts    # /new, /newchat
-    ├── session.ts        # /cancel, /status, /sessions, /handoff
-    ├── admin.ts          # /bypass, /tts, /restart, /respawn, /update, /outputmode
-    ├── menu.ts           # /menu, /help, /clear
-    ├── agents.ts         # /agents, /install
-    ├── doctor.ts         # /doctor
-    ├── integrate.ts      # /integrate
-    └── settings.ts       # /settings
+    ├── index.ts           # Command router + SLASH_COMMANDS registry
+    ├── new-session.ts     # /new, /newchat
+    ├── session.ts         # /cancel, /status, /sessions, /handoff
+    ├── admin.ts           # /bypass, /tts, /restart, /respawn, /update, /outputmode
+    ├── menu.ts            # /menu, /help, /clear
+    ├── agents.ts          # /agents, /install
+    ├── doctor.ts          # /doctor
+    ├── integrate.ts       # /integrate
+    └── settings.ts        # /settings
 ```
 
 ## Tech Stack
