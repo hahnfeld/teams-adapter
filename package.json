@@ -29,7 +29,8 @@
   "homepage": "https://github.com/hahnfeld/teams-adapter",
   "author": "Matt Hahnfeld",
   "publishConfig": {
-    "@hahnfeld:registry": "https://npm.pkg.github.com"
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
   },
   "peerDependencies": {
     "@openacp/cli": ">=2026.0.0",
