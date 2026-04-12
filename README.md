@@ -187,7 +187,7 @@ Set the tunnel URL as the messaging endpoint in Azure: `https://<id>.devtunnels.
 
 ## Security
 
-The bot operates within your Azure AD tenant (single-tenant configuration), but **any user in your organization** who can sideload a Teams app could create their own app manifest pointing to the same bot and gain access to agent sessions. This means tenant-level auth alone is not sufficient to restrict access.
+The bot operates within your Azure AD tenant (single-tenant configuration), which prevents external access. However, in a large enterprise with thousands of employees, tenant-level auth alone may not be sufficient — **any user in your organization** who can sideload a Teams app could create their own app manifest pointing to the same bot App ID and gain access to agent sessions, your configured workspace, and any tools available to the agent.
 
 **Recommended:** Configure the built-in `@openacp/security` plugin to restrict which users can interact with the bot:
 
