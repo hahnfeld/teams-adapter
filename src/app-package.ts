@@ -152,6 +152,20 @@ export async function generateTeamsAppPackage(
     ],
     permissions: ["identity", "messageTeamMembers"],
     validDomains: [],
+    webApplicationInfo: {
+      id: botAppId,
+      resource: `api://botid-${botAppId}`,
+    },
+    authorization: {
+      permissions: {
+        resourceSpecific: [
+          {
+            name: "ChannelMessage.Read.Group",
+            type: "Application",
+          },
+        ],
+      },
+    },
   };
 
   const manifestJson = Buffer.from(JSON.stringify(manifest, null, 2), "utf-8");
