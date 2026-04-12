@@ -435,13 +435,7 @@ export function buildCitationEntities(sources: CitationSource[]): unknown[] {
 }
 
 /**
- * Build citation text references like "[1]" to insert into message text.
- * Returns a suffix string to append to the message.
  */
-export function buildCitationSuffix(sources: CitationSource[]): string {
-  if (sources.length === 0) return "";
-  return "\n\n" + sources.slice(0, 20).map((s, i) => `[${i + 1}] ${s.name}`).join("\n");
-}
 
 /** Guess the Teams citation icon type from a file extension */
 function guessIconType(name: string): string {

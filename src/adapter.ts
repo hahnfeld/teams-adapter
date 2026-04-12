@@ -37,7 +37,7 @@ import { downloadTeamsFile, isAttachmentTooLarge, buildFileAttachmentCard, uploa
 import { GraphFileClient } from "./graph.js";
 import { ConversationStore } from "./conversation-store.js";
 import { sendText, sendCard, sendActivity } from "./send-utils.js";
-import { renderUsageCard, renderToolCallCard, renderPlanCard, buildCitationEntities } from "./formatting.js";
+import { renderUsageCard, renderToolCallCard, renderPlanCard, buildCitationEntities, formatTokens } from "./formatting.js";
 import type { ToolCallMeta } from "@openacp/plugin-sdk";
 import type { OutputMode } from "./activity.js";
 
@@ -286,7 +286,7 @@ export class TeamsAdapter extends MessagingAdapter {
       const rawActivityText = context.activity.text ?? "";
       // Teams may prepend the bot @mention (e.g., "<at>BotName</at> /new") — strip it
       const text = rawActivityText.replace(/<at[^>]*>.*?<\/at>/gi, "").trim();
-      log.info({ rawText: rawActivityText.slice(0, 100), cleanText: text.slice(0, 100), activityType: context.activity.type }, "[TeamsAdapter] Incoming activity");
+      log.debug({ rawText: rawActivityText.slice(0, 100), cleanText: text.slice(0, 100), activityType: context.activity.type }, "[TeamsAdapter] Incoming activity");
 
       const userId = context.activity.from?.id ?? "unknown";
       // Use conversation.id as the thread discriminator — NOT activity.channelId
@@ -1219,10 +1219,8 @@ export class TeamsAdapter extends MessagingAdapter {
 
   // ─── Handler overrides ───────────────────────────────────────────────────
 
-  protected async handleThought(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    // Thoughts are not sent as messages in Teams — buffered and displayed via plan
-    void sessionId;
-    void content;
+  protected async handleThought(_sessionId: string, _content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
+    // Thoughts are not sent as messages in Teams
   }
 
   protected async handleText(sessionId: string, content: OutgoingMessage): Promise<void> {
@@ -1321,23 +1319,53 @@ export class TeamsAdapter extends MessagingAdapter {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const { context, isAssistant } = ctx;
-    await this.draftManager.finalize(sessionId, context, isAssistant);
+
+    // Append usage as a subtle footer on the draft before finalizing
     const meta = content.metadata as { tokensUsed?: number; contextSize?: number; cost?: number; duration?: number } | undefined;
-    const mode = this.resolveMode(sessionId);
-    const { body } = renderUsageCard(meta ?? {}, mode);
-    const card = { type: "AdaptiveCard" as const, version: "1.2" as const, body };
-    try {
-      // Feedback buttons on usage/completion messages — Teams shows thumbs up/down
-      await this.sendActivityWithRetry(context, {
-        attachments: [CardFactory.adaptiveCard(card as Record<string, unknown>)],
-        channelData: { feedbackLoop: { type: "default" } },
-      });
-    } catch (err) {
-      log.error({ err, sessionId }, "[TeamsAdapter] handleUsage: sendActivity failed");
+    if (meta?.tokensUsed != null) {
+      const draft = this.draftManager.getDraft(sessionId);
+      if (draft) {
+        const parts: string[] = [];
+        parts.push(`${formatTokens(meta.tokensUsed)} tokens`);
+        if (meta.duration != null) parts.push(`${(meta.duration / 1000).toFixed(1)}s`);
+        if (meta.cost != null) parts.push(`$${meta.cost.toFixed(4)}`);
+        draft.append(`\n\n---\n*${parts.join(" · ")}*`);
+      }
     }
 
-    // Notify completion in notification channel (matches Telegram's notification pattern)
-    if (this.notificationChannelId && sessionId !== this.assistantSession?.id) {
+    // Grab the draft ref before finalize (finalize deletes the draft from the map)
+    const draft = this.draftManager.getDraft(sessionId);
+
+    await this.draftManager.finalize(sessionId, context, isAssistant);
+
+    const finalRef = draft?.getFinalRef();
+
+    // In DMs, edit the last message to append "Task completed" to the usage footer.
+    // In channels, send a separate notification to the notification channel.
+    const convType = (context.activity?.conversation as Record<string, unknown> | undefined)?.conversationType;
+    if (convType === "personal" && finalRef) {
+      // Edit the last message's usage footer in-place
+      void (async () => {
+        try {
+          const botToken = await this.acquireBotToken();
+          if (!botToken) return;
+          const updatedText = finalRef.text.replace(
+            /(\n---\n\*.+)\*\s*$/,
+            `$1 · Task completed*`,
+          );
+          if (updatedText === finalRef.text) return;
+          const url = `${finalRef.serviceUrl}/v3/conversations/${encodeURIComponent(finalRef.conversationId)}/activities/${encodeURIComponent(finalRef.activityId)}`;
+          await fetch(url, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${botToken}` },
+            body: JSON.stringify({ type: "message", text: updatedText.replace(/(?<!\n)\n(?!\n)/g, "\n\n"), textFormat: "markdown" }),
+          });
+          // Best effort — result not checked
+        } catch {
+          // Best effort — user already sees the usage footer
+        }
+      })();
+    } else if (this.notificationChannelId && sessionId !== this.assistantSession?.id) {
       const sess = this.core.sessionManager.getSession(sessionId);
       const name = sess?.name || "Session";
       void this.sendNotification({
@@ -1408,13 +1436,6 @@ export class TeamsAdapter extends MessagingAdapter {
     const { context, isAssistant } = ctx;
     await this.draftManager.finalize(sessionId, context, isAssistant);
     this.cleanupSessionState(sessionId);
-    try {
-      await this.sendActivityWithRetry(context, {
-        text: "✅ **Done**",
-        channelData: { feedbackLoop: { type: "default" } },
-        ...this.getQuickActions(context),
-      });
-    } catch { /* best effort */ }
   }
 
   protected async handleError(sessionId: string, content: OutgoingMessage): Promise<void> {
@@ -1581,11 +1602,11 @@ export class TeamsAdapter extends MessagingAdapter {
       text += `\n${notification.deepLink}`;
     }
 
-    // Proactive messaging via stored conversation reference + bot token.
-    // We do NOT use a stored TurnContext here — TurnContexts are scoped to a
-    // single HTTP request/response cycle and go stale after the turn ends.
+    // Post to the notification channel via Bot Framework REST API.
+    // Use any stored ref for the serviceUrl and bot identity, but target
+    // the notification channel ID directly as the conversation.
     if (this.notificationChannelId) {
-      const ref = this.conversationStore.get(this.notificationChannelId) ?? this.conversationStore.getAny();
+      const ref = this.conversationStore.getAny();
       if (ref && TeamsAdapter.isValidServiceUrl(ref.serviceUrl)) {
         try {
           const botToken = await this.acquireBotToken();
@@ -1593,7 +1614,7 @@ export class TeamsAdapter extends MessagingAdapter {
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 10_000);
             try {
-              const response = await fetch(`${ref.serviceUrl}/v3/conversations/${ref.conversationId}/activities`, {
+              const response = await fetch(`${ref.serviceUrl}/v3/conversations/${encodeURIComponent(this.notificationChannelId)}/activities`, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
@@ -1607,7 +1628,7 @@ export class TeamsAdapter extends MessagingAdapter {
                 signal: controller.signal,
               });
               if (response.ok) return;
-              log.warn({ status: response.status }, "[TeamsAdapter] Proactive notification failed");
+              log.warn({ status: response.status }, "[TeamsAdapter] Proactive notification to channel failed");
             } finally {
               clearTimeout(timeout);
             }

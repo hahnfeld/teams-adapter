@@ -44,7 +44,3 @@ export async function handleIntegrate(ctx: CommandContext): Promise<void> {
     `Use \`openacp integrate <agent>\` from the terminal for detailed integration management.`,
   );
 }
-
-export async function handleIntegrateButton(ctx: CommandContext): Promise<void> {
-  await handleIntegrate(ctx);
-}

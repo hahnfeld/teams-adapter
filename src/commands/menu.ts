@@ -90,7 +90,3 @@ export async function handleClear(ctx: CommandContext): Promise<void> {
     await ctx.reply(`❌ Clear failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
-
-export async function handleMenuButton(ctx: CommandContext): Promise<void> {
-  await handleMenu(ctx);
-}

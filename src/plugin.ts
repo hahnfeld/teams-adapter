@@ -353,10 +353,22 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
         if (!notificationChannelId) {
           const nid = await terminal.text({
-            message: "Notification channel ID (or leave empty to skip):",
+            message: "Notification channel ID or Teams link (or leave empty to skip):",
             defaultValue: "",
           });
-          notificationChannelId = nid.trim() || null;
+          const raw = nid.trim();
+          if (raw) {
+            // Parse Teams links to extract channel ID
+            if (raw.includes("teams.microsoft.com") || raw.includes("teams.cloud.microsoft")) {
+              const parsed = parseTeamsLink(raw);
+              notificationChannelId = parsed.channelId ?? raw;
+              if (parsed.channelId) {
+                terminal.log.success(`Extracted notification channel ID: ${parsed.channelId}`);
+              }
+            } else {
+              notificationChannelId = raw;
+            }
+          }
         }
       }
 
@@ -538,7 +550,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       const { terminal, settings } = ctx;
       const current = await settings.getAll();
 
-      const { validateBotCredentials } = await import("./validators.js");
+      const { validateBotCredentials, parseTeamsLink } = await import("./validators.js");
 
       const choice = await terminal.select({
         message: "What to configure?",
@@ -633,11 +645,23 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
         case "notifications": {
           const nid = await terminal.text({
-            message: "Notification channel ID (empty to disable):",
+            message: "Notification channel ID or Teams link (empty to disable):",
             defaultValue: (current.notificationChannelId as string) ?? "",
           });
-          await settings.set("notificationChannelId", nid.trim() || null);
-          terminal.log.success(nid.trim() ? "Notification channel updated" : "Notifications disabled");
+          const raw = nid.trim();
+          if (raw) {
+            let channelId = raw;
+            if (raw.includes("teams.microsoft.com") || raw.includes("teams.cloud.microsoft")) {
+              const parsed = parseTeamsLink(raw);
+              channelId = parsed.channelId ?? raw;
+              if (parsed.channelId) terminal.log.success(`Extracted channel ID: ${parsed.channelId}`);
+            }
+            await settings.set("notificationChannelId", channelId);
+            terminal.log.success("Notification channel updated");
+          } else {
+            await settings.set("notificationChannelId", null);
+            terminal.log.success("Notifications disabled");
+          }
           break;
         }
 

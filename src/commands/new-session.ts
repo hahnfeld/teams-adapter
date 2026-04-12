@@ -114,11 +114,3 @@ export async function handleNewChat(ctx: CommandContext): Promise<void> {
     await ctx.reply(`❌ Failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
-
-export async function executeNewSession(
-  ctx: CommandContext,
-  agentName?: string,
-  workspace?: string,
-): Promise<void> {
-  await handleNew(ctx, [agentName ?? "", workspace ?? ""].filter(Boolean));
-}

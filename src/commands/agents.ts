@@ -95,10 +95,6 @@ export async function handleInstall(ctx: CommandContext, name?: string): Promise
   }
 }
 
-export async function handleAgentButton(ctx: CommandContext): Promise<void> {
-  await handleAgents(ctx);
-}
-
 function truncate(text: string, maxLen: number): string {
   return text.length <= maxLen ? text : text.slice(0, maxLen - 1) + "…";
 }

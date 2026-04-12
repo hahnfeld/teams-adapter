@@ -52,7 +52,3 @@ export async function handleDoctor(ctx: CommandContext): Promise<void> {
 
   await ctx.reply(`**🔍 System Diagnostics**\n\n${checks.join("\n\n")}`);
 }
-
-export async function handleDoctorButton(ctx: CommandContext): Promise<void> {
-  await handleDoctor(ctx);
-}

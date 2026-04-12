@@ -125,7 +125,3 @@ export async function handleHandoff(ctx: CommandContext): Promise<void> {
     `Run this command in a terminal to take over this session.`,
   );
 }
-
-export async function executeCancelSession(ctx: CommandContext): Promise<void> {
-  await handleCancel(ctx);
-}

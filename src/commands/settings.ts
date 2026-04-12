@@ -55,7 +55,3 @@ export async function handleSettings(ctx: CommandContext): Promise<void> {
     sessionInfo,
   );
 }
-
-export async function handleSettingsButton(ctx: CommandContext): Promise<void> {
-  await handleSettings(ctx);
-}

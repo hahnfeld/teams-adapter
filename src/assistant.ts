@@ -41,7 +41,3 @@ export async function spawnAssistant(
 
   return { session, ready };
 }
-
-export function buildWelcomeMessage(_core: OpenACPCore): string {
-  return "👋 Welcome to OpenACP on Microsoft Teams!";
-}

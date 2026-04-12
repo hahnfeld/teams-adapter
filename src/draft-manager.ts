@@ -8,6 +8,8 @@ const FIRST_FLUSH_INTERVAL = 500;
 /** Subsequent flushes are slower to avoid rate limits (Teams: 7 ops/sec/conversation) */
 const UPDATE_FLUSH_INTERVAL = 2000;
 const MAX_DISPLAY_LENGTH = 25000;
+/** If no new text arrives for this long, consider the stream stalled */
+const STALL_TIMEOUT = 30_000;
 
 export interface MessageRef {
   activityId?: string;
@@ -26,6 +28,10 @@ export class TeamsMessageDraft {
   private lastSentBuffer: string = "";
   private firstFlushPending = false;
   private finalizing = false;
+  private lastAppendTime = 0;
+  private stallTimer?: ReturnType<typeof setTimeout>;
+  /** After finalize, holds the last activity ref + text for post-finalize edits */
+  private _finalRef?: { activityId: string; conversationId: string; serviceUrl: string; text: string };
 
   constructor(
     private context: TurnContext,
@@ -42,11 +48,30 @@ export class TeamsMessageDraft {
   append(text: string): void {
     if (!text) return;
     this.buffer += text;
+    this.lastAppendTime = Date.now();
     this.scheduleFlush();
+    this.resetStallTimer();
+  }
+
+  private resetStallTimer(): void {
+    if (this.stallTimer) clearTimeout(this.stallTimer);
+    this.stallTimer = setTimeout(() => {
+      if (this.buffer && !this.finalizing) {
+        log.warn({ sessionId: this.sessionId, bufLen: this.buffer.length }, "[TeamsMessageDraft] Stream stalled — finalizing");
+        this.buffer += "\n\n---\n_Response was cut short — the model likely reached its output token limit. Send a follow-up message to continue._";
+        this.finalize().catch(() => {});
+      }
+    }, STALL_TIMEOUT);
+    if (this.stallTimer.unref) this.stallTimer.unref();
   }
 
   getBuffer(): string {
     return this.buffer;
+  }
+
+  /** Return the last finalized activity ref for post-finalize edits (e.g., appending "Task completed") */
+  getFinalRef(): { activityId: string; conversationId: string; serviceUrl: string; text: string } | undefined {
+    return this._finalRef;
   }
 
   private scheduleFlush(): void {
@@ -61,6 +86,7 @@ export class TeamsMessageDraft {
   async flush(): Promise<void> {
     if (!this.buffer) return;
     if (this.firstFlushPending) return;
+    log.debug({ sessionId: this.sessionId, bufLen: this.buffer.length, hasRef: !!this.ref?.activityId }, "[TeamsMessageDraft] flush");
 
     // If buffer exceeds limit, finalize the current message with its portion
     // and start a new streaming message for the overflow.
@@ -69,7 +95,10 @@ export class TeamsMessageDraft {
       const overflow = this.buffer.slice(MAX_DISPLAY_LENGTH);
 
       // Update current message with its final content
-      await this.updateActivityViaRest(finalChunk).catch(() => {});
+      log.info({ sessionId: this.sessionId, finalChunkLen: finalChunk.length, overflowLen: overflow.length }, "[TeamsMessageDraft] splitting to new message");
+      await this.updateActivityViaRest(finalChunk).catch((err) => {
+        log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] split: update failed");
+      });
 
       // Reset for a new message
       this.ref = undefined;
@@ -133,6 +162,8 @@ export class TeamsMessageDraft {
         const success = await this.updateActivityViaRest(snapshot);
         if (success) {
           this.lastSentBuffer = snapshot;
+        } else {
+          log.warn({ sessionId: this.sessionId, bufLen: snapshot.length }, "[TeamsMessageDraft] flush: REST update returned false");
         }
       } catch (err) {
         log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] flush: update failed");
@@ -174,6 +205,17 @@ export class TeamsMessageDraft {
     return true;
   }
 
+  private _saveFinalRef(text: string): void {
+    if (this.ref?.activityId && this.ref.conversationId && this.ref.serviceUrl) {
+      this._finalRef = {
+        activityId: this.ref.activityId,
+        conversationId: this.ref.conversationId,
+        serviceUrl: this.ref.serviceUrl,
+        text,
+      };
+    }
+  }
+
   async stripPattern(pattern: RegExp): Promise<void> {
     if (!this.buffer) return;
     try {
@@ -186,6 +228,7 @@ export class TeamsMessageDraft {
   async finalize(): Promise<void> {
     if (this.finalizing) return;
     this.finalizing = true;
+    if (this.stallTimer) { clearTimeout(this.stallTimer); this.stallTimer = undefined; }
     try {
       await this._finalizeInner();
     } finally {
@@ -209,11 +252,15 @@ export class TeamsMessageDraft {
       if (this.buffer !== this.lastSentBuffer) {
         try {
           const success = await this.updateActivityViaRest(this.buffer);
-          if (success) return;
+          if (success) {
+            this._saveFinalRef(this.buffer);
+            return;
+          }
         } catch {
           // Fall through to send as new message
         }
       } else {
+        this._saveFinalRef(this.buffer);
         return; // Already sent, nothing to update
       }
     }
@@ -223,29 +270,44 @@ export class TeamsMessageDraft {
     // then send the rest as new messages.
     const chunks = splitMessage(this.buffer, MAX_DISPLAY_LENGTH);
 
+    let lastChunkText = "";
     for (let i = 0; i < chunks.length; i++) {
       const content = chunks[i];
       try {
         if (i === 0 && this.ref?.activityId) {
-          // Update the existing streaming message with the first chunk
           const success = await this.updateActivityViaRest(content);
           if (!success) {
-            // Update failed — send as new message instead
-            await this.sendQueue.enqueue(
+            const result = await this.sendQueue.enqueue(
               () => sendText(this.context, content) as Promise<unknown>,
               { type: "other" },
             );
+            if (result) {
+              this.ref = {
+                activityId: (result as { id?: string }).id,
+                conversationId: this.context.activity.conversation?.id as string | undefined,
+                serviceUrl: this.context.activity.serviceUrl as string | undefined,
+              };
+            }
           }
         } else {
-          await this.sendQueue.enqueue(
+          const result = await this.sendQueue.enqueue(
             () => sendText(this.context, content) as Promise<unknown>,
             { type: "other" },
           );
+          if (result) {
+            this.ref = {
+              activityId: (result as { id?: string }).id,
+              conversationId: this.context.activity.conversation?.id as string | undefined,
+              serviceUrl: this.context.activity.serviceUrl as string | undefined,
+            };
+          }
         }
+        lastChunkText = content;
       } catch (err) {
         log.warn({ err, sessionId: this.sessionId, chunk: i }, "[TeamsMessageDraft] finalize: chunk send failed");
       }
     }
+    if (lastChunkText) this._saveFinalRef(lastChunkText);
   }
 }
 
