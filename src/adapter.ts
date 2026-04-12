@@ -434,9 +434,15 @@ export class TeamsAdapter extends MessagingAdapter {
         }
 
         if (sessionId !== "unknown") {
-          // Drain pending dispatches and reset draft state for new prompt
+          // Drain pending dispatches with a timeout — don't block forever if a
+          // previous prompt hung (e.g., output token exhaustion).
           const pendingDispatch = this._dispatchQueues.get(sessionId);
-          if (pendingDispatch) await pendingDispatch;
+          if (pendingDispatch) {
+            await Promise.race([
+              pendingDispatch,
+              new Promise<void>(resolve => setTimeout(resolve, 5000)),
+            ]);
+          }
           this.draftManager.cleanup(sessionId);
         }
 
@@ -447,7 +453,6 @@ export class TeamsAdapter extends MessagingAdapter {
         if (!existingSessionBeforeSend) {
           const defaultAgent = (this.core.configManager.get() as Record<string, unknown>)?.defaultAgent as string ?? "claude";
           log.info({ threadId, text: messageText.slice(0, 50), defaultAgent }, "[TeamsAdapter] No session — auto-creating via /new");
-          // Auto-create a session for first-time messages
           const registry = this.getCommandRegistry();
           if (registry) {
             try {
@@ -469,13 +474,14 @@ export class TeamsAdapter extends MessagingAdapter {
               const newSession = this.core.sessionManager.getSessionByThread("teams", threadId);
               if (newSession && messageText) {
                 this._sessionContexts.set(newSession.id, { context, isAssistant: false });
-                await this.core.handleMessage({
+                // Fire and forget — response comes back via sendMessage/SessionBridge
+                this.core.handleMessage({
                   channelId: "teams",
                   threadId,
                   userId,
                   text: messageText,
                   ...(attachments.length > 0 ? { attachments } : {}),
-                });
+                }).catch(err => log.error({ err }, "[TeamsAdapter] handleMessage failed"));
               }
             } catch (err) {
               log.error({ err }, "[TeamsAdapter] Auto-create session failed");
@@ -487,13 +493,16 @@ export class TeamsAdapter extends MessagingAdapter {
           return;
         }
 
-        await this.core.handleMessage({
+        // Fire and forget — response comes back via sendMessage/SessionBridge.
+        // Don't await: a hung prompt (token exhaustion, etc.) would block all
+        // subsequent messages in this conversation.
+        this.core.handleMessage({
           channelId: "teams",
           threadId,
           userId,
           text: messageText,
           ...(attachments.length > 0 ? { attachments } : {}),
-        });
+        }).catch(err => log.error({ err }, "[TeamsAdapter] handleMessage failed"));
       } catch (err) {
         log.error({ err, threadId, userId }, "[TeamsAdapter] message handler error");
         try {
