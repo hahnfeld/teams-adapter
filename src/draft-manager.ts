@@ -1,7 +1,7 @@
 import type { TurnContext } from "@microsoft/agents-hosting";
 import { log } from "@openacp/plugin-sdk";
 import { splitMessage } from "./formatting.js";
-import { sendText, updateActivity as updateTeamsActivity } from "./send-utils.js";
+import { sendText } from "./send-utils.js";
 
 /** First flush fires quickly so the user sees content fast */
 const FIRST_FLUSH_INTERVAL = 500;
@@ -56,100 +56,18 @@ export class TeamsMessageDraft {
   }
 
   async flush(): Promise<void> {
-    if (!this.buffer) return;
-    if (this.firstFlushPending) return;
-
-    const snapshot = this.buffer;
-
-    let content = snapshot;
-    let truncated = false;
-    if (content.length > MAX_DISPLAY_LENGTH) {
-      content = snapshot.slice(0, MAX_DISPLAY_LENGTH) + "…";
-      truncated = true;
-    }
-
-    if (!content) return;
-
-    if (!this.ref?.activityId) {
-      this.firstFlushPending = true;
-      try {
-        const result = await this.sendQueue.enqueue(
-          () => sendText(this.context, content) as Promise<unknown>,
-          { type: "other" },
-        );
-        if (result) {
-          const activityId = (result as { id?: string }).id;
-          this.ref = {
-            activityId,
-            conversationId: this.context.activity.conversation?.id as string | undefined,
-          };
-          if (!truncated) {
-            this.lastSentBuffer = snapshot;
-            this.displayTruncated = false;
-          } else {
-            this.displayTruncated = true;
-          }
-        }
-      } catch (err) {
-        log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] flush: sendActivity failed");
-      } finally {
-        this.firstFlushPending = false;
-      }
-    } else {
-      if (!truncated && snapshot === this.lastSentBuffer) return;
-
-      try {
-        const result = await this.sendQueue.enqueue(
-          () => updateTeamsActivity(this.context, {
-            id: this.ref!.activityId,
-            conversation: { id: this.ref!.conversationId },
-            text: content,
-          }) as Promise<unknown>,
-          { type: "text" },
-        );
-        if (result !== undefined) {
-          if (!truncated) {
-            this.lastSentBuffer = snapshot;
-            this.displayTruncated = false;
-          } else {
-            this.displayTruncated = true;
-          }
-        }
-      } catch (err) {
-        log.warn({ err, sessionId: this.sessionId, activityId: this.ref?.activityId }, "[TeamsMessageDraft] flush: updateActivity failed");
-      }
-    }
+    // Streaming updates via updateActivity don't work with the teams.apps SDK
+    // context (it only has send(), not updateActivity()). Instead of trying to
+    // update in-place, we skip periodic flushes and let finalize() send the
+    // complete message. The typing indicator keeps the user informed.
   }
 
   async stripPattern(pattern: RegExp): Promise<void> {
-    if (!this.ref?.activityId || !this.buffer) return;
-
-    let stripped: string;
+    if (!this.buffer) return;
     try {
-      stripped = this.buffer.replace(pattern, "").trim();
-    } catch (err) {
-      log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] stripPattern: replace failed");
-      return;
-    }
-
-    if (stripped === this.buffer.trim()) return;
-
-    if (!stripped) return;
-
-    try {
-      await this.sendQueue.enqueue(
-        () => updateTeamsActivity(this.context, {
-          id: this.ref!.activityId,
-          conversation: { id: this.ref!.conversationId },
-          text: stripped,
-        }) as Promise<unknown>,
-        { type: "other" },
-      );
-      // Only update state after successful send
-      this.buffer = stripped;
-      this.lastSentBuffer = stripped;
-    } catch (err) {
-      log.warn({ err, sessionId: this.sessionId, activityId: this.ref?.activityId }, "[TeamsMessageDraft] stripPattern: updateActivity failed");
+      this.buffer = this.buffer.replace(pattern, "").trim();
+    } catch {
+      // Regex failed — leave buffer unchanged
     }
   }
 
@@ -169,65 +87,20 @@ export class TeamsMessageDraft {
       this.flushTimer = undefined;
     }
 
-    await this.flushPromise;
-
     if (!this.buffer) return;
 
-    if (this.ref?.activityId && this.buffer === this.lastSentBuffer && !this.displayTruncated) {
-      return;
-    }
-
-    if (this.buffer.length <= MAX_DISPLAY_LENGTH) {
-      const content = this.buffer;
-      try {
-        if (this.ref?.activityId) {
-          await this.sendQueue.enqueue(
-            () => updateTeamsActivity(this.context, {
-              id: this.ref!.activityId,
-              conversation: { id: this.ref!.conversationId },
-              text: content,
-            }) as Promise<unknown>,
-            { type: "other" },
-          );
-        } else {
-          await this.sendQueue.enqueue(
-            () => sendText(this.context, content) as Promise<unknown>,
-            { type: "other" },
-          );
-        }
-        return;
-      } catch {
-        // Fall through to split approach
-      }
-    }
-
+    // Send the complete text as new message(s), split if needed.
+    // We don't use updateActivity because the teams.apps SDK context
+    // doesn't support it — only send() is available.
     const chunks = splitMessage(this.buffer, MAX_DISPLAY_LENGTH);
 
     for (let i = 0; i < chunks.length; i++) {
       const content = chunks[i];
       try {
-        if (i === 0 && this.ref?.activityId) {
-          await this.sendQueue.enqueue(
-            () => updateTeamsActivity(this.context, {
-              id: this.ref!.activityId,
-              conversation: { id: this.ref!.conversationId },
-              text: content,
-            }) as Promise<unknown>,
-            { type: "other" },
-          );
-        } else {
-          const result = await this.sendQueue.enqueue(
-            () => sendText(this.context, content) as Promise<unknown>,
-            { type: "other" },
-          );
-          if (result && i === 0) {
-            const activityId = (result as { id?: string }).id;
-            this.ref = {
-              activityId,
-              conversationId: this.context.activity.conversation?.id as string | undefined,
-            };
-          }
-        }
+        await this.sendQueue.enqueue(
+          () => sendText(this.context, content) as Promise<unknown>,
+          { type: "other" },
+        );
       } catch (err) {
         log.warn({ err, sessionId: this.sessionId, chunk: i }, "[TeamsMessageDraft] finalize: chunk send failed");
       }
