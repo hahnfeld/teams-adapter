@@ -105,14 +105,14 @@ export class TeamsAdapter extends MessagingAdapter {
     super(
       { configManager: core.configManager },
       // Teams measures message size in bytes (100KB limit, 80KB safe threshold).
-      // Use 12000 chars as the split limit — safe for multi-byte content (CJK, emoji)
+      // Teams supports ~28k chars per message. Use 25000 to leave room for markdown overhead.
       // where each char can be 3-4 bytes, plus activity envelope overhead.
-      { ...config as unknown as Record<string, unknown>, maxMessageLength: 12000, enabled: config.enabled ?? true } as MessagingAdapterConfig,
+      { ...config as unknown as Record<string, unknown>, maxMessageLength: 25000, enabled: config.enabled ?? true } as MessagingAdapterConfig,
     );
     this.core = core;
     this.teamsConfig = config;
     this.sendQueue = new SendQueue({ minInterval: 1000 });
-    this.draftManager = new TeamsDraftManager(this.sendQueue);
+    this.draftManager = new TeamsDraftManager(this.sendQueue, () => this.acquireBotToken());
     this.fileService = core.fileService;
 
     // Persistent conversation reference store for proactive messaging

@@ -6,13 +6,17 @@ import { sendText } from "./send-utils.js";
 /** First flush fires quickly so the user sees content fast */
 const FIRST_FLUSH_INTERVAL = 500;
 /** Subsequent flushes are slower to avoid rate limits (Teams: 7 ops/sec/conversation) */
-const UPDATE_FLUSH_INTERVAL = 3000;
-const MAX_DISPLAY_LENGTH = 1900;
+const UPDATE_FLUSH_INTERVAL = 2000;
+const MAX_DISPLAY_LENGTH = 25000;
 
 export interface MessageRef {
   activityId?: string;
   conversationId?: string;
+  serviceUrl?: string;
 }
+
+/** Function signature for acquiring a bot token — injected from the adapter */
+export type AcquireBotToken = () => Promise<string | null>;
 
 export class TeamsMessageDraft {
   private buffer: string = "";
@@ -20,7 +24,6 @@ export class TeamsMessageDraft {
   private flushTimer?: ReturnType<typeof setTimeout>;
   private flushPromise: Promise<void> = Promise.resolve();
   private lastSentBuffer: string = "";
-  private displayTruncated = false;
   private firstFlushPending = false;
   private finalizing = false;
 
@@ -28,6 +31,7 @@ export class TeamsMessageDraft {
     private context: TurnContext,
     private sendQueue: { enqueue<T>(fn: () => Promise<T>, opts?: { type?: string }): Promise<T | undefined> },
     private sessionId: string,
+    private acquireBotToken?: AcquireBotToken,
   ) {}
 
   /** Update the TurnContext to the latest inbound turn (prevents stale context refs) */
@@ -47,7 +51,6 @@ export class TeamsMessageDraft {
 
   private scheduleFlush(): void {
     if (this.flushTimer) return;
-    // Fast first flush (500ms) for perceived responsiveness, then slower updates (3s)
     const interval = this.ref?.activityId ? UPDATE_FLUSH_INTERVAL : FIRST_FLUSH_INTERVAL;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
@@ -56,10 +59,119 @@ export class TeamsMessageDraft {
   }
 
   async flush(): Promise<void> {
-    // Streaming updates via updateActivity don't work with the teams.apps SDK
-    // context (it only has send(), not updateActivity()). Instead of trying to
-    // update in-place, we skip periodic flushes and let finalize() send the
-    // complete message. The typing indicator keeps the user informed.
+    if (!this.buffer) return;
+    if (this.firstFlushPending) return;
+
+    // If buffer exceeds limit, finalize the current message with its portion
+    // and start a new streaming message for the overflow.
+    if (this.buffer.length > MAX_DISPLAY_LENGTH && this.ref?.activityId) {
+      const finalChunk = this.buffer.slice(0, MAX_DISPLAY_LENGTH);
+      const overflow = this.buffer.slice(MAX_DISPLAY_LENGTH);
+
+      // Update current message with its final content
+      await this.updateActivityViaRest(finalChunk).catch(() => {});
+
+      // Reset for a new message
+      this.ref = undefined;
+      this.lastSentBuffer = "";
+      this.firstFlushPending = false;
+      this.buffer = overflow;
+
+      // Immediately send the overflow as a new message to resume streaming
+      if (overflow) {
+        this.firstFlushPending = true;
+        try {
+          const result = await this.sendQueue.enqueue(
+            () => sendText(this.context, overflow) as Promise<unknown>,
+            { type: "other" },
+          );
+          if (result) {
+            this.ref = {
+              activityId: (result as { id?: string }).id,
+              conversationId: this.context.activity.conversation?.id as string | undefined,
+              serviceUrl: this.context.activity.serviceUrl as string | undefined,
+            };
+            this.lastSentBuffer = overflow;
+          }
+        } catch (err) {
+          log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] flush: overflow send failed");
+        } finally {
+          this.firstFlushPending = false;
+        }
+      }
+      return;
+    }
+
+    const snapshot = this.buffer;
+
+    if (!this.ref?.activityId) {
+      // First message — send via context.send() to get the activityId
+      this.firstFlushPending = true;
+      try {
+        const result = await this.sendQueue.enqueue(
+          () => sendText(this.context, snapshot) as Promise<unknown>,
+          { type: "other" },
+        );
+        if (result) {
+          this.ref = {
+            activityId: (result as { id?: string }).id,
+            conversationId: this.context.activity.conversation?.id as string | undefined,
+            serviceUrl: this.context.activity.serviceUrl as string | undefined,
+          };
+          this.lastSentBuffer = snapshot;
+        }
+      } catch (err) {
+        log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] flush: initial send failed");
+      } finally {
+        this.firstFlushPending = false;
+      }
+    } else {
+      // Subsequent updates — use Bot Framework REST API to edit the message
+      if (snapshot === this.lastSentBuffer) return;
+
+      try {
+        const success = await this.updateActivityViaRest(snapshot);
+        if (success) {
+          this.lastSentBuffer = snapshot;
+        }
+      } catch (err) {
+        log.warn({ err, sessionId: this.sessionId }, "[TeamsMessageDraft] flush: update failed");
+      }
+    }
+  }
+
+  /**
+   * Update an existing message via the Bot Framework REST API.
+   * Bypasses the teams.apps SDK context which doesn't support updateActivity.
+   */
+  private async updateActivityViaRest(text: string): Promise<boolean> {
+    if (!this.ref?.activityId || !this.ref.serviceUrl || !this.ref.conversationId) return false;
+    if (!this.acquireBotToken) return false;
+
+    const token = await this.acquireBotToken();
+    if (!token) return false;
+
+    const url = `${this.ref.serviceUrl}/v3/conversations/${encodeURIComponent(this.ref.conversationId)}/activities/${encodeURIComponent(this.ref.activityId)}`;
+
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        type: "message",
+        text: text.replace(/(?<!\n)\n(?!\n)/g, "\n\n"), // Teams newline normalization
+        textFormat: "markdown",
+      }),
+    });
+
+    if (!response.ok) {
+      log.warn({ status: response.status, sessionId: this.sessionId }, "[TeamsMessageDraft] REST updateActivity failed");
+      return false;
+    }
+
+    return true;
   }
 
   async stripPattern(pattern: RegExp): Promise<void> {
@@ -87,20 +199,49 @@ export class TeamsMessageDraft {
       this.flushTimer = undefined;
     }
 
+    // Wait for any in-flight flush to complete
+    await this.flushPromise;
+
     if (!this.buffer) return;
 
-    // Send the complete text as new message(s), split if needed.
-    // We don't use updateActivity because the teams.apps SDK context
-    // doesn't support it — only send() is available.
+    // If we have an activityId and the buffer fits in one message, do a final update
+    if (this.ref?.activityId && this.buffer.length <= MAX_DISPLAY_LENGTH) {
+      if (this.buffer !== this.lastSentBuffer) {
+        try {
+          const success = await this.updateActivityViaRest(this.buffer);
+          if (success) return;
+        } catch {
+          // Fall through to send as new message
+        }
+      } else {
+        return; // Already sent, nothing to update
+      }
+    }
+
+    // Buffer exceeds single message limit or update failed — send as new message(s).
+    // If we have an existing streaming message, update it with the first chunk,
+    // then send the rest as new messages.
     const chunks = splitMessage(this.buffer, MAX_DISPLAY_LENGTH);
 
     for (let i = 0; i < chunks.length; i++) {
       const content = chunks[i];
       try {
-        await this.sendQueue.enqueue(
-          () => sendText(this.context, content) as Promise<unknown>,
-          { type: "other" },
-        );
+        if (i === 0 && this.ref?.activityId) {
+          // Update the existing streaming message with the first chunk
+          const success = await this.updateActivityViaRest(content);
+          if (!success) {
+            // Update failed — send as new message instead
+            await this.sendQueue.enqueue(
+              () => sendText(this.context, content) as Promise<unknown>,
+              { type: "other" },
+            );
+          }
+        } else {
+          await this.sendQueue.enqueue(
+            () => sendText(this.context, content) as Promise<unknown>,
+            { type: "other" },
+          );
+        }
       } catch (err) {
         log.warn({ err, sessionId: this.sessionId, chunk: i }, "[TeamsMessageDraft] finalize: chunk send failed");
       }
@@ -111,12 +252,15 @@ export class TeamsMessageDraft {
 export class TeamsDraftManager {
   private drafts = new Map<string, TeamsMessageDraft>();
 
-  constructor(private sendQueue: { enqueue<T>(fn: () => Promise<T>, opts?: { type?: string }): Promise<T | undefined> }) {}
+  constructor(
+    private sendQueue: { enqueue<T>(fn: () => Promise<T>, opts?: { type?: string }): Promise<T | undefined> },
+    private acquireBotToken?: AcquireBotToken,
+  ) {}
 
   getOrCreate(sessionId: string, context: TurnContext): TeamsMessageDraft {
     let draft = this.drafts.get(sessionId);
     if (!draft) {
-      draft = new TeamsMessageDraft(context, this.sendQueue, sessionId);
+      draft = new TeamsMessageDraft(context, this.sendQueue, sessionId, this.acquireBotToken);
       this.drafts.set(sessionId, draft);
     } else {
       // Re-bind to the latest TurnContext to prevent stale context references
