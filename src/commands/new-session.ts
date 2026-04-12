@@ -15,7 +15,7 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
     // Task modules (task/fetch popups) don't work reliably for sideloaded apps,
     // so we render the wizard directly in the chat.
     const agents = ctx.adapter.core.agentManager.getAvailableAgents();
-    const workspace = ctx.adapter.core.configManager.resolveWorkspace?.() ?? process.cwd();
+    const defaultWorkspace = ctx.adapter.core.configManager.resolveWorkspace?.() ?? process.cwd();
     const agentChoices = agents.map((a: { name: string }) => ({ title: a.name, value: a.name }));
     if (agentChoices.length === 0) {
       agentChoices.push({ title: "openacp", value: "openacp" });
@@ -29,7 +29,7 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
         { type: "TextBlock", text: "Agent", weight: "Bolder", spacing: "Large" },
         { type: "Input.ChoiceSet", id: "agent", style: "compact", value: agentChoices[0].value, choices: agentChoices },
         { type: "TextBlock", text: "Workspace (project directory)", weight: "Bolder", spacing: "Large" },
-        { type: "Input.Text", id: "workspace", placeholder: "/path/to/project", value: workspace },
+        { type: "Input.Text", id: "workspace", placeholder: "/path/to/project", value: defaultWorkspace },
       ],
       actions: [
         { type: "Action.Execute", title: "Create Session", verb: "dialog:new-session" },
@@ -44,16 +44,18 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
   try {
     await ctx.reply(`🔄 Creating session with **${agentName}**...`);
 
-    const session = await ctx.adapter.core.sessionManager.createSession(
-      "teams",
+    const conversationId = ctx.context.activity?.conversation?.id as string | undefined;
+    const session = await (ctx.adapter.core as any).createSession({
+      channelId: "teams",
       agentName,
-      workDir,
-      ctx.adapter.core.agentManager,
-    );
-
-    const threadId = await ctx.adapter.createSessionThread(session.id, session.name || agentName);
-    session.threadId = threadId;
-    session.threadIds.set("teams", threadId);
+      workingDirectory: workDir,
+      threadId: conversationId,
+      createThread: !conversationId,
+    });
+    if (conversationId) {
+      session.threadIds.set("teams", conversationId);
+    }
+    ctx.adapter["_sessionContexts"].set(session.id, { context: ctx.context, isAssistant: false, threadId: conversationId });
 
     await ctx.reply(
       `✅ Session created\n\n` +
@@ -89,16 +91,18 @@ export async function handleNewChat(ctx: CommandContext): Promise<void> {
   try {
     await ctx.reply(`🔄 Starting new chat with **${agentName}**...`);
 
-    const newSession = await ctx.adapter.core.sessionManager.createSession(
-      "teams",
+    const conversationId = ctx.context.activity?.conversation?.id as string | undefined;
+    const newSession = await (ctx.adapter.core as any).createSession({
+      channelId: "teams",
       agentName,
-      workspace,
-      ctx.adapter.core.agentManager,
-    );
-
-    const threadId = await ctx.adapter.createSessionThread(newSession.id, newSession.name || agentName);
-    newSession.threadId = threadId;
-    newSession.threadIds.set("teams", threadId);
+      workingDirectory: workspace,
+      threadId: conversationId,
+      createThread: !conversationId,
+    });
+    if (conversationId) {
+      newSession.threadIds.set("teams", conversationId);
+    }
+    ctx.adapter["_sessionContexts"].set(newSession.id, { context: ctx.context, isAssistant: false, threadId: conversationId });
 
     await ctx.reply(
       `✅ New chat started\n\n` +

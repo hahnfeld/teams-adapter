@@ -677,8 +677,50 @@ export class TeamsAdapter extends MessagingAdapter {
 
 
   /**
+   * Create a session in the background — sends status updates to the conversation.
+   * Runs async without blocking the invoke response.
+   */
+  private createSessionInBackground(context: any, agentName: string, workspace: string): void {
+    const conversationId = context.activity.conversation?.id as string | undefined;
+    (async () => {
+      try {
+        // Use core.createSession (not sessionManager.createSession) so the
+        // SessionBridge is connected — without it, agent responses never
+        // reach the adapter's sendMessage.
+        const session = await (this.core as any).createSession({
+          channelId: "teams",
+          agentName,
+          workingDirectory: workspace,
+          threadId: conversationId,
+          createThread: !conversationId,
+        });
+
+        // Ensure the thread is linked for DM conversations
+        if (conversationId) {
+          session.threadIds.set("teams", conversationId);
+        }
+
+        // Store context so the adapter can send responses to this conversation
+        this._sessionContexts.set(session.id, { context, isAssistant: false, threadId: conversationId });
+
+        await sendText(context,
+          `✅ Session created\n\n` +
+          `**Agent:** ${agentName}\n\n` +
+          `**Workspace:** \`${workspace}\`\n\n` +
+          `**Session:** ${session.id.slice(0, 8)}`,
+        );
+      } catch (err) {
+        log.error({ err, agentName, workspace }, "[TeamsAdapter] createSessionInBackground error");
+        try {
+          await sendText(context, `❌ Failed to create session: ${(err as Error).message}`);
+        } catch { /* best effort */ }
+      }
+    })();
+  }
+
+  /**
    * Handle form submissions from inline wizard cards (dialogAction payloads).
-   * These come from Action.Submit buttons on cards rendered directly in chat.
+   * These come from Action.Execute buttons on cards rendered directly in chat.
    */
   private async handleDialogAction(context: any, action: string, data: Record<string, unknown>): Promise<void> {
     if (action === "new-session") {
@@ -695,28 +737,10 @@ export class TeamsAdapter extends MessagingAdapter {
         return;
       }
 
-      try {
-        await sendText(context, `🔄 Creating session with **${agentName}**...`);
-        const session = await this.core.sessionManager.createSession(
-          "teams",
-          agentName,
-          workspace,
-          this.core.agentManager,
-        );
-        const threadId = await this.createSessionThread(session.id, session.name || agentName);
-        session.threadId = threadId;
-        session.threadIds.set("teams", threadId);
-
-        await sendText(context,
-          `✅ Session created\n\n` +
-          `**Agent:** ${agentName}\n\n` +
-          `**Workspace:** \`${workspace}\`\n\n` +
-          `**Session:** ${session.id.slice(0, 8)}`,
-        );
-      } catch (err) {
-        log.error({ err, agentName, workspace }, "[TeamsAdapter] handleDialogAction new-session error");
-        await sendText(context, `❌ Failed to create session: ${(err as Error).message}`);
-      }
+      // Send acknowledgment immediately, then create session in the background.
+      // Session creation spawns an agent process (~30s) which would timeout the invoke.
+      await sendText(context, `🔄 Creating session with **${agentName}**...`);
+      this.createSessionInBackground(context, agentName, workspace);
       return;
     }
 
