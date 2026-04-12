@@ -185,6 +185,26 @@ Set the tunnel URL as the messaging endpoint in Azure: `https://<id>.devtunnels.
 
 > **Important:** Always use `--allow-anonymous` — Azure Bot Service cannot authenticate with Dev Tunnel auth.
 
+## Security
+
+The bot operates within your Azure AD tenant (single-tenant configuration), but **any user in your organization** who can sideload a Teams app could create their own app manifest pointing to the same bot and gain access to agent sessions. This means tenant-level auth alone is not sufficient to restrict access.
+
+**Recommended:** Configure the built-in `@openacp/security` plugin to restrict which users can interact with the bot:
+
+```bash
+openacp plugin configure @openacp/security
+```
+
+Add your Teams user ID to the `allowedUserIds` list. The security plugin registers middleware on all incoming messages at the OpenACP core level, blocking unauthorized users before any adapter code runs. You can find your Teams user ID in the OpenACP logs when you send a message (the `userId` field).
+
+**Additional controls:**
+
+- **Teams Admin Center** — Use app permission policies to restrict who can install the sideloaded app
+- **Azure Bot Configuration** — Single-tenant bots already reject users outside your Azure AD tenant
+- **Network** — The bot is only reachable via your tunnel URL; restrict tunnel access if your provider supports it
+
+> **Important:** Without an `allowedUserIds` configuration, any authenticated user in your tenant can execute agent commands, create sessions, and access your configured workspace through the bot.
+
 ## Slash Commands
 
 | Command | Description |
