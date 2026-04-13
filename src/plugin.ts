@@ -96,11 +96,11 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       let botAppPassword = await terminal.password({
         message: hasExisting ? "Bot App Password (client secret) — press Enter to keep current:" : "Bot App Password (client secret):",
         validate: (val) => {
-          if (!val.trim() && !hasExisting) return "Password cannot be empty";
+          if (!(val ?? "").trim() && !hasExisting) return "Password cannot be empty";
           return undefined;
         },
       });
-      if (!botAppPassword.trim() && hasExisting) {
+      if (!(botAppPassword ?? "").trim() && hasExisting) {
         botAppPassword = current.botAppPassword as string;
       }
       botAppPassword = botAppPassword.trim();
