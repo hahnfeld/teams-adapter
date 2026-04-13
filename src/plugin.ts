@@ -31,6 +31,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
     async install(ctx: InstallContext) {
       const { terminal, settings } = ctx;
+      const current = await settings.getAll() as Record<string, unknown>;
 
       const { validateBotCredentials, validateTenant, discoverTeamsAndChannels, parseTeamsLink } =
         await import("./validators.js");
@@ -59,21 +60,24 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         "Azure Bot Setup",
       );
 
-      const ready = await terminal.confirm({
-        message: "Do you have your Bot App ID and Password ready?",
-        initialValue: true,
-      });
-      if (!ready) {
-        terminal.log.info("No worries! Set up your Azure Bot first, then run this again.");
-        terminal.cancel("Setup cancelled — re-run when ready.");
-        return;
+      const hasExisting = !!(current.botAppId && current.botAppPassword);
+      if (!hasExisting) {
+        const ready = await terminal.confirm({
+          message: "Do you have your Bot App ID and Password ready?",
+          initialValue: true,
+        });
+        if (!ready) {
+          terminal.log.info("No worries! Set up your Azure Bot first, then run this again.");
+          terminal.cancel("Setup cancelled — re-run when ready.");
+          return;
+        }
       }
 
       // ── Step 2: Bot App ID ──
 
       let botAppId = await terminal.text({
         message: "Bot App ID (Microsoft App ID from Azure Portal):",
-        placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+        ...((current.botAppId as string) ? { defaultValue: current.botAppId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
         validate: (val) => {
           const trimmed = val.trim();
           if (!trimmed) return "App ID cannot be empty";
@@ -90,12 +94,15 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       terminal.log.info("Find this in Azure Portal → Bot resource → Manage Password → Client secrets");
 
       let botAppPassword = await terminal.password({
-        message: "Bot App Password (client secret):",
+        message: hasExisting ? "Bot App Password (client secret) — press Enter to keep current:" : "Bot App Password (client secret):",
         validate: (val) => {
-          if (!val.trim()) return "Password cannot be empty";
+          if (!val.trim() && !hasExisting) return "Password cannot be empty";
           return undefined;
         },
       });
+      if (!botAppPassword.trim() && hasExisting) {
+        botAppPassword = current.botAppPassword as string;
+      }
       botAppPassword = botAppPassword.trim();
 
       // ── Step 4: Tenant Configuration ──
@@ -114,12 +121,20 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         "Tenant Type",
       );
 
+      const existingTenantId = current.tenantId as string | undefined;
+      const isSingleTenant = existingTenantId && existingTenantId !== "botframework.com";
+      const tenantOptions = isSingleTenant
+        ? [
+            { value: "single" as const, label: "Single-tenant (enterprise)", hint: `Current: ${existingTenantId}` },
+            { value: "multi" as const, label: "Multi-tenant (public)" },
+          ]
+        : [
+            { value: "single" as const, label: "Single-tenant (enterprise)", hint: "Most common for internal bots" },
+            { value: "multi" as const, label: "Multi-tenant (public)" },
+          ];
       const tenantType = await terminal.select({
         message: "What type of bot registration?",
-        options: [
-          { value: "single", label: "Single-tenant (enterprise)", hint: "Most common for internal bots" },
-          { value: "multi", label: "Multi-tenant (public)" },
-        ],
+        options: tenantOptions,
       });
 
       let tenantId = "botframework.com";
@@ -127,7 +142,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         while (true) {
           const tenantInput = await terminal.text({
             message: "Tenant ID (GUID from Azure Portal → Entra ID → Overview):",
-            placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            ...(isSingleTenant && existingTenantId ? { defaultValue: existingTenantId } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
             validate: (val) => {
               const trimmed = val.trim();
               if (!trimmed) return "Tenant ID cannot be empty";
@@ -308,7 +323,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         if (!teamId) {
           teamId = await terminal.text({
             message: "Team ID (groupId GUID):",
-            placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            ...((current.teamId as string) ? { defaultValue: current.teamId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           teamId = teamId.trim();
@@ -317,6 +332,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         if (!channelId) {
           channelId = await terminal.text({
             message: "Channel ID (e.g. 19:abc123@thread.tacv2):",
+            defaultValue: (current.channelId as string) || undefined,
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           channelId = channelId.trim();
@@ -328,7 +344,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       terminal.log.info("");
       const wantNotifications = await terminal.confirm({
         message: "Set up a dedicated notification channel? (Session completions, errors, permission alerts)",
-        initialValue: false,
+        initialValue: !!(current.notificationChannelId),
       });
 
       let notificationChannelId: string | null = null;
@@ -354,7 +370,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         if (!notificationChannelId) {
           const nid = await terminal.text({
             message: "Notification channel ID or Teams link (or leave empty to skip):",
-            defaultValue: "",
+            defaultValue: (current.notificationChannelId as string) || "",
           });
           const raw = nid.trim();
           if (raw) {
@@ -377,7 +393,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       terminal.log.info("");
       const wantGraph = await terminal.confirm({
         message: "Enable file sharing via OneDrive? (Allows sharing agent-generated files in Teams)",
-        initialValue: false,
+        initialValue: !!(current.graphClientSecret),
       });
 
       let graphClientSecret: string | undefined;
@@ -427,16 +443,17 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         "Bot Port",
       );
 
+      const existingPort = current.botPort as number | undefined;
       const useDefaultPort = await terminal.confirm({
         message: `Use the default bot port (${DEFAULT_BOT_PORT})?`,
-        initialValue: true,
+        initialValue: existingPort ? existingPort === DEFAULT_BOT_PORT : true,
       });
 
       let botPort = DEFAULT_BOT_PORT;
       if (!useDefaultPort) {
         const portInput = await terminal.text({
           message: "Bot port:",
-          defaultValue: String(DEFAULT_BOT_PORT),
+          defaultValue: String(existingPort ?? DEFAULT_BOT_PORT),
           validate: (v) => {
             const n = Number(v.trim());
             if (isNaN(n) || !Number.isInteger(n) || n < 1 || n > 65535) return "Port must be 1–65535";
@@ -457,13 +474,24 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         "Tunnel Setup",
       );
 
+      const tunnelOptions = [
+        { value: "devtunnel", label: "@hahnfeld/devtunnel-provider (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
+        { value: "builtin", label: "Built-in tunnel service", hint: "Uses the system tunnel service if available" },
+        { value: "manual", label: "Manual", hint: "I'll set up my own tunnel (ngrok, cloudflared, etc.)" },
+      ];
+      const existingTunnel = current.tunnelMethod as string | undefined;
+      if (existingTunnel && existingTunnel !== "devtunnel") {
+        // Move current method to top of list
+        const idx = tunnelOptions.findIndex((o) => o.value === existingTunnel);
+        if (idx > 0) {
+          const [item] = tunnelOptions.splice(idx, 1);
+          item.hint = `Current — ${item.hint}`;
+          tunnelOptions.unshift(item);
+        }
+      }
       const tunnelMethod = await terminal.select({
         message: "How should the bot port be tunneled?",
-        options: [
-          { value: "devtunnel", label: "@hahnfeld/devtunnel-provider (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
-          { value: "builtin", label: "Built-in tunnel service", hint: "Uses the system tunnel service if available" },
-          { value: "manual", label: "Manual", hint: "I'll set up my own tunnel (ngrok, cloudflared, etc.)" },
-        ],
+        options: tunnelOptions,
       });
 
       // ── Step 8d: Save Settings ──
