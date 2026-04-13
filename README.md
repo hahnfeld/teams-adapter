@@ -325,6 +325,14 @@ src/
     └── settings.ts        # /settings
 ```
 
+## Known Issues
+
+- **`openacp plugin configure` does not work for npm-installed plugins.** This is a bug in the OpenACP CLI where the `configure` command only resolves built-in plugins. To reconfigure the adapter after initial setup, re-run the install wizard:
+
+  ```bash
+  openacp plugin install @hahnfeld/teams-adapter
+  ```
+
 ## Tech Stack
 
 - [`@microsoft/teams.apps`](https://www.npmjs.com/package/@microsoft/teams.apps) — App class, server hosting, activity routing
