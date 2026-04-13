@@ -77,7 +77,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
       let botAppId = await terminal.text({
         message: "Bot App ID (Microsoft App ID from Azure Portal):",
-        ...((current.botAppId as string) ? { defaultValue: current.botAppId as string, placeholder: current.botAppId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
+        ...((current.botAppId as string) ? { initialValue: current.botAppId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }) as any,
         validate: (val) => {
           const trimmed = val.trim();
           if (!trimmed) return "App ID cannot be empty";
@@ -142,7 +142,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         while (true) {
           const tenantInput = await terminal.text({
             message: "Tenant ID (GUID from Azure Portal → Entra ID → Overview):",
-            ...(isSingleTenant && existingTenantId ? { defaultValue: existingTenantId, placeholder: existingTenantId } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
+            ...(isSingleTenant && existingTenantId ? { initialValue: existingTenantId } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }) as any,
             validate: (val) => {
               const trimmed = val.trim();
               if (!trimmed) return "Tenant ID cannot be empty";
@@ -323,7 +323,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         if (!teamId) {
           teamId = await terminal.text({
             message: "Team ID (groupId GUID):",
-            ...((current.teamId as string) ? { defaultValue: current.teamId as string, placeholder: current.teamId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
+            ...((current.teamId as string) ? { initialValue: current.teamId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }) as any,
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           teamId = teamId.trim();
@@ -332,8 +332,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         if (!channelId) {
           channelId = await terminal.text({
             message: "Channel ID (e.g. 19:abc123@thread.tacv2):",
-            defaultValue: (current.channelId as string) || undefined,
-            placeholder: (current.channelId as string) || undefined,
+            ...((current.channelId as string) ? { initialValue: current.channelId as string } : {}) as any,
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           channelId = channelId.trim();
@@ -371,7 +370,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         if (!notificationChannelId) {
           const nid = await terminal.text({
             message: "Notification channel ID or Teams link (or leave empty to skip):",
-            defaultValue: (current.notificationChannelId as string) || "",
+            ...((current.notificationChannelId as string) ? { initialValue: current.notificationChannelId as string } : {}) as any,
           });
           const raw = nid.trim();
           if (raw) {
@@ -452,10 +451,10 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
       let botPort = DEFAULT_BOT_PORT;
       if (!useDefaultPort) {
-        const portInput = await terminal.text({
+        const portInput = await (terminal as any).text({
           message: "Bot port:",
-          defaultValue: String(existingPort ?? DEFAULT_BOT_PORT),
-          validate: (v) => {
+          initialValue: String(existingPort ?? DEFAULT_BOT_PORT),
+          validate: (v: string) => {
             const n = Number(v.trim());
             if (isNaN(n) || !Number.isInteger(n) || n < 1 || n > 65535) return "Port must be 1–65535";
             return undefined;
