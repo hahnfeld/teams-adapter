@@ -77,7 +77,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
       let botAppId = await terminal.text({
         message: "Bot App ID (Microsoft App ID from Azure Portal):",
-        ...((current.botAppId as string) ? { defaultValue: current.botAppId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
+        ...((current.botAppId as string) ? { defaultValue: current.botAppId as string, placeholder: current.botAppId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
         validate: (val) => {
           const trimmed = val.trim();
           if (!trimmed) return "App ID cannot be empty";
@@ -142,7 +142,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         while (true) {
           const tenantInput = await terminal.text({
             message: "Tenant ID (GUID from Azure Portal → Entra ID → Overview):",
-            ...(isSingleTenant && existingTenantId ? { defaultValue: existingTenantId } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
+            ...(isSingleTenant && existingTenantId ? { defaultValue: existingTenantId, placeholder: existingTenantId } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
             validate: (val) => {
               const trimmed = val.trim();
               if (!trimmed) return "Tenant ID cannot be empty";
@@ -323,7 +323,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         if (!teamId) {
           teamId = await terminal.text({
             message: "Team ID (groupId GUID):",
-            ...((current.teamId as string) ? { defaultValue: current.teamId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
+            ...((current.teamId as string) ? { defaultValue: current.teamId as string, placeholder: current.teamId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }),
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           teamId = teamId.trim();
@@ -333,6 +333,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           channelId = await terminal.text({
             message: "Channel ID (e.g. 19:abc123@thread.tacv2):",
             defaultValue: (current.channelId as string) || undefined,
+            placeholder: (current.channelId as string) || undefined,
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           channelId = channelId.trim();
