@@ -17,7 +17,8 @@ import { sendText } from "./send-utils.js";
 import type { ConversationRateLimiter } from "./rate-limiter.js";
 
 const MAX_BODY_LENGTH = 25_000;
-const STALL_TIMEOUT = 30_000;
+/** How long to wait with no activity (body text or header changes) before warning about truncation. */
+const STALL_TIMEOUT = 120_000;
 
 export interface MessageRef {
   activityId: string;
@@ -82,16 +83,17 @@ export class SessionMessage {
     this.requestFlush();
   }
 
-  /** Max header length — keeps the message compact; tool diffs can be huge. */
-  private static readonly MAX_HEADER_LENGTH = 120;
+  /** Max header length — tool notifications can include file paths and summaries. */
+  private static readonly MAX_HEADER_LENGTH = 300;
 
-  /** Replace the ephemeral header (tool_call, thought, etc.). */
+  /** Replace the ephemeral header (tool_call, thought, etc.). Reset stall timer since tool activity counts as activity. */
   setHeader(text: string): void {
     // Truncate to first line, then cap length — headers are status indicators, not content
     const firstLine = text.split("\n")[0];
     this.header = firstLine.length > SessionMessage.MAX_HEADER_LENGTH
       ? firstLine.slice(0, SessionMessage.MAX_HEADER_LENGTH) + "..."
       : firstLine;
+    this.resetStallTimer();
     this.requestFlush();
   }
 
