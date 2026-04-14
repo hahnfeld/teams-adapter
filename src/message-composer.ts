@@ -32,6 +32,28 @@ const MAX_ROOT_TEXT_LENGTH = 25_000;
 /** How long to wait with no activity before warning about truncation. */
 const STALL_TIMEOUT = 120_000;
 
+// ─── Brand Colors (Alaska + Hawaiian Airlines dual-brand) ─────────────────────
+// Alaska: Primary #01426a, Bold #00274a, Secondary cyan #5de3f7, Tertiary green #a3cd6a
+// Hawaiian: Primary purple #463c8f, Secondary magenta #ce0c88, Tertiary red #ee453d
+
+const BRAND = {
+  // Alaska primary blue — active/running tools
+  alaskaBlue: "#01426a",
+  alaskaDark: "#00274a",
+  // Hawaiian purple — completed results, primary brand
+  hawaiianPurple: "#463c8f",
+  // Accent colors
+  alaskaCyan: "#5de3f7",
+  hawaiianMagenta: "#ce0c88",
+  alaskaGreen: "#a3cd6a",
+  // Neutrals
+  textDefault: "#2a2a2a",
+  textMuted: "#676767",
+  // Surfaces
+  white: "#ffffff",
+  surfaceMuted: "#f7f7f7",
+} as const;
+
 // ─── Entry Types ───────────────────────────────────────────────────────────────
 
 type BodyEntry =
@@ -67,7 +89,9 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           text: `**${escapeMd(entry.text)}**`,
           weight: "Bolder",
           size: "Medium",
+          fontType: "Monospace",
           spacing: "None",
+          color: undefined,
         });
         break;
 
@@ -79,16 +103,19 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
             {
               type: "TextBlock",
               text: `🔄 ${escapeMd(entry.toolName)}…  (${elapsed})`,
-              color: "Warning",
+              color: undefined,
+              hexColor: BRAND.alaskaBlue,
               weight: "Bolder",
               size: "Small",
+              fontType: "Monospace",
               spacing: "None",
             },
             ...entry.children.map((c) => ({
               type: "TextBlock",
               text: `    ${c.text}`,
               size: "Small",
-              color: "Accent",
+              hexColor: BRAND.alaskaCyan,
+              fontType: "Monospace",
               spacing: "None",
             })),
           ],
@@ -106,16 +133,18 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
             {
               type: "TextBlock",
               text: `📄 ${escapeMd(entry.result)}  (${elapsed})`,
-              color: "Good",
+              hexColor: BRAND.hawaiianPurple,
               weight: "Bolder",
               size: "Small",
+              fontType: "Monospace",
               spacing: "None",
             },
             ...entry.children.map((c) => ({
               type: "TextBlock",
               text: `    ${c.text}`,
               size: "Small",
-              color: "Default",
+              hexColor: BRAND.textDefault,
+              fontType: "Monospace",
               wrap: true,
               spacing: "None",
             })),
@@ -131,7 +160,8 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           type: "TextBlock",
           text: entry.text,
           size: "Small",
-          color: "Default",
+          hexColor: BRAND.textDefault,
+          fontType: "Monospace",
           wrap: true,
           spacing: "None",
         });
@@ -143,7 +173,8 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           text: `💭 ${entry.text}`,
           italic: true,
           size: "Small",
-          color: "Light",
+          hexColor: BRAND.textMuted,
+          fontType: "Monospace",
           spacing: "None",
         });
         break;
@@ -154,7 +185,8 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           text: `*${escapeMd(entry.text)}*`,
           italic: true,
           size: "Small",
-          color: "Accent",
+          hexColor: BRAND.alaskaBlue,
+          fontType: "Monospace",
           spacing: "None",
         });
         break;
@@ -164,7 +196,8 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           type: "TextBlock",
           text: "─".repeat(30),
           size: "Small",
-          color: "Light",
+          hexColor: BRAND.textMuted,
+          fontType: "Monospace",
           spacing: "None",
         });
         break;
