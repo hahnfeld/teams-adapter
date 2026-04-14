@@ -32,24 +32,20 @@ const MAX_ROOT_TEXT_LENGTH = 25_000;
 /** How long to wait with no activity before warning about truncation. */
 const STALL_TIMEOUT = 120_000;
 
-// ─── Brand Colors (Alaska + Hawaiian Airlines dual-brand) ─────────────────────
-// Alaska: Primary #01426a, Bold #00274a, Secondary cyan #5de3f7, Tertiary green #a3cd6a
-// Hawaiian: Primary purple #463c8f, Secondary magenta #ce0c88, Tertiary red #ee453d
+// ─── Brand Colors ────────────────────────────────────────────────────────────
+// Primary blue #01426a | Dark blue #00274a | Purple #463c8f
+// Cyan #5de3f7 | Green #a3cd6a | Magenta #ce0c88
+// Text default #2a2a2a | Muted #676767 | White #ffffff
 
 const BRAND = {
-  // Alaska primary blue — active/running tools
-  alaskaBlue: "#01426a",
-  alaskaDark: "#00274a",
-  // Hawaiian purple — completed results, primary brand
-  hawaiianPurple: "#463c8f",
-  // Accent colors
-  alaskaCyan: "#5de3f7",
-  hawaiianMagenta: "#ce0c88",
-  alaskaGreen: "#a3cd6a",
-  // Neutrals
+  blue: "#01426a",
+  blueDark: "#00274a",
+  purple: "#463c8f",
+  cyan: "#5de3f7",
+  green: "#a3cd6a",
+  magenta: "#ce0c88",
   textDefault: "#2a2a2a",
   textMuted: "#676767",
-  // Surfaces
   white: "#ffffff",
   surfaceMuted: "#f7f7f7",
 } as const;
@@ -104,7 +100,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
               type: "TextBlock",
               text: `🔄 ${escapeMd(entry.toolName)}…  (${elapsed})`,
               color: undefined,
-              hexColor: BRAND.alaskaBlue,
+              hexColor: BRAND.blue,
               weight: "Bolder",
               size: "Small",
               fontType: "Monospace",
@@ -114,7 +110,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
               type: "TextBlock",
               text: `    ${c.text}`,
               size: "Small",
-              hexColor: BRAND.alaskaCyan,
+              hexColor: BRAND.cyan,
               fontType: "Monospace",
               spacing: "None",
             })),
@@ -133,7 +129,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
             {
               type: "TextBlock",
               text: `📄 ${escapeMd(entry.result)}  (${elapsed})`,
-              hexColor: BRAND.hawaiianPurple,
+              hexColor: BRAND.purple,
               weight: "Bolder",
               size: "Small",
               fontType: "Monospace",
@@ -185,7 +181,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           text: `*${escapeMd(entry.text)}*`,
           italic: true,
           size: "Small",
-          hexColor: BRAND.alaskaBlue,
+          hexColor: BRAND.blue,
           fontType: "Monospace",
           spacing: "None",
         });
