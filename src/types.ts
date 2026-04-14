@@ -8,6 +8,8 @@ export interface TeamsChannelConfig {
   tenantId: string;
   teamId: string;
   channelId: string;
+  /** Channel IDs the bot will respond in (computed from channelId + notificationChannelId on setup). */
+  allowedChannelIds: string[];
   notificationChannelId: string | null;
   assistantThreadId: string | null;
   /** Port for the Bot Framework HTTP server (default: 3978). Separate from the OpenACP API port. */

@@ -280,6 +280,28 @@ export class TeamsAdapter extends MessagingAdapter {
       // the 1:1, group chat, or channel thread the message came from.
       const conversationId = String(context.activity.conversation?.id ?? "unknown");
       const threadId = conversationId;
+
+      // Security: only respond in configured channels
+      const allowedChannelIds = this.teamsConfig.allowedChannelIds ?? [this.teamsConfig.channelId];
+      if (!allowedChannelIds.includes(conversationId)) {
+        log.debug({ conversationId, allowedChannelIds }, "[TeamsAdapter] Channel not in allowlist, ignoring");
+        return;
+      }
+
+      // Security: enforce tenant isolation for single-tenant bots
+      const isSingleTenant = this.teamsConfig.tenantId && this.teamsConfig.tenantId !== "botframework.com";
+      if (isSingleTenant) {
+        const incomingTenant = context.activity.conversation?.tenantId;
+        if (!incomingTenant) {
+          log.warn({ conversationId }, "[TeamsAdapter] Missing tenantId in activity — rejected (single-tenant mode)");
+          return;
+        }
+        if (incomingTenant !== this.teamsConfig.tenantId) {
+          log.warn({ incomingTenant, configuredTenant: this.teamsConfig.tenantId }, "[TeamsAdapter] Rejected message from unexpected tenant");
+          return;
+        }
+      }
+
       const activityId = context.activity.id as string | undefined;
 
       try {

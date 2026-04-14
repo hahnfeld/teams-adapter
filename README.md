@@ -101,10 +101,12 @@ channels:
     tenantId: "${TEAMS_TENANT_ID}"
     teamId: "${TEAMS_TEAM_ID}"
     channelId: "${TEAMS_CHANNEL_ID}"
-    botPort: 3978                                                # Bot Framework port (default)
+    allowedChannelIds:                                   # optional — defaults to [channelId]
+      - "${TEAMS_CHANNEL_ID}"                            # additional channels can be added here
+    botPort: 3978                                        # Bot Framework port (default)
     notificationChannelId: "${TEAMS_NOTIFICATION_CHANNEL_ID}"  # optional
     assistantThreadId: null  # auto-set after first run
-    graphClientSecret: "${TEAMS_GRAPH_CLIENT_SECRET}"           # optional, for file sharing
+    graphClientSecret: "${TEAMS_GRAPH_CLIENT_SECRET}"   # optional, for file sharing
 ```
 
 ### Configuration reference
@@ -113,10 +115,11 @@ channels:
 |-------|------|----------|-------------|
 | `enabled` | `boolean` | Yes | Enable the Teams adapter |
 | `botAppId` | `string` | Yes | Azure AD App ID for the bot |
-| `botAppPassword` | `string` | Yes | Bot client secret |
+| `botAppPassword` | `string` | Yes | Bot client secret (proves bot identity to Azure Bot Service) |
 | `tenantId` | `string` | Yes | Microsoft tenant ID (GUID), or `botframework.com` for multi-tenant |
 | `teamId` | `string` | Yes | Default team ID (groupId GUID) |
 | `channelId` | `string` | Yes | Primary channel for sessions (e.g. `19:abc@thread.tacv2`) |
+| `allowedChannelIds` | `string[]` | No | Channels the bot will respond in. Defaults to `[channelId]`. Add extra channels here to expand access. |
 | `botPort` | `number` | No | Bot Framework HTTP server port (default: `3978`) |
 | `notificationChannelId` | `string \| null` | No | Separate channel for notifications |
 | `assistantThreadId` | `string \| null` | No | Thread for the assistant (auto-populated) |
@@ -187,7 +190,11 @@ Set the tunnel URL as the messaging endpoint in Azure: `https://<id>.devtunnels.
 
 ## Security
 
-The bot operates within your Azure AD tenant (single-tenant configuration), which prevents external access. However, in a large enterprise with thousands of employees, tenant-level auth alone may not be sufficient — **any user in your organization** who can sideload a Teams app could create their own app manifest pointing to the same bot App ID and gain access to agent sessions, your configured workspace, and any tools available to the agent.
+The bot uses a **channel allowlist** — it only responds in the configured `channelId` (and any additional channels listed in `allowedChannelIds`). Messages from other channels are silently ignored. This prevents the bot from responding in channels where it wasn't intentionally installed.
+
+The bot also operates within your Azure AD tenant (single-tenant configuration), which prevents external access.
+
+**For enterprise deployments with many users**, tenant-level auth alone is not sufficient — any user in your organization who can sideload a Teams app could create their own app manifest pointing to the same bot App ID and gain access to agent sessions, your configured workspace, and any tools available to the agent.
 
 **Recommended:** Configure the built-in `@openacp/security` plugin to restrict which users can interact with the bot:
 
@@ -197,13 +204,39 @@ openacp plugin configure @openacp/security
 
 Add your Teams user ID to the `allowedUserIds` list. The security plugin registers middleware on all incoming messages at the OpenACP core level, blocking unauthorized users before any adapter code runs. You can find your Teams user ID in the OpenACP logs when you send a message (the `userId` field).
 
-**Additional controls:**
+**Summary of layers:**
 
-- **Teams Admin Center** — Use app permission policies to restrict who can install the sideloaded app
-- **Azure Bot Configuration** — Single-tenant bots already reject users outside your Azure AD tenant
-- **Network** — The bot is only reachable via your tunnel URL; restrict tunnel access if your provider supports it
+| Layer | Protects against |
+|---|---|
+| `allowedChannelIds` | Bot responding in wrong Teams channel |
+| Single-tenant Azure AD | Users from other organizations |
+| `@openacp/security` plugin (`allowedUserIds`) | Untrusted users in your tenant |
+| Teams Admin Center (app permission policies) | Users installing the sideloaded app |
+| Tunnel access controls | Unauthorized network access |
 
-> **Important:** Without an `allowedUserIds` configuration, any authenticated user in your tenant can execute agent commands, create sessions, and access your configured workspace through the bot.
+> **Important:** Without `allowedUserIds` configured, any authenticated user in your tenant can execute agent commands, create sessions, and access your configured workspace through the bot.
+
+### Personal chat (1:1 DMs)
+
+By default the bot ignores personal DMs — only the configured channel(s) in `allowedChannelIds` are accepted. This is secure by default.
+
+If you want to allow personal DMs, you need to add the DM conversation IDs to `allowedChannelIds`. Here's how to find a conversation ID:
+
+1. Enable debug logging in OpenACP (`logLevel: debug`)
+2. Send a message to the bot via personal DM in Teams
+3. Look in the OpenACP logs for the `conversationId` of the incoming message — it will look like `19:xxx@thread.tacv2` or a similar Teams thread ID format
+4. Add that ID to `allowedChannelIds` in your config:
+
+```yaml
+channels:
+  teams:
+    channelId: "19:primary-channel@thread.tacv2"
+    allowedChannelIds:
+      - "19:primary-channel@thread.tacv2"
+      - "19:your-personal-dm-id@thread.tacv2"   # add DM conversation IDs here
+```
+
+> **Note:** Each personal DM between a user and the bot has its own unique conversation ID. You would need to add each user's DM thread ID individually.
 
 ## Slash Commands
 

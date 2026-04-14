@@ -342,13 +342,37 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       // ── Step 6: Notification Channel (Optional) ──
 
       terminal.log.info("");
-      const wantNotifications = await terminal.confirm({
-        message: "Set up a dedicated notification channel? (Session completions, errors, permission alerts)",
-        initialValue: !!(current.notificationChannelId),
+
+      // Build options for notification channel selection
+      const existingNotifChannel = (current.notificationChannelId as string | null) ?? null;
+      const notifMethodOptions = [
+        { value: "link", label: "Paste a channel link (easiest)", hint: "Right-click channel → Get link" },
+        { value: "manual", label: "Enter channel ID manually", hint: existingNotifChannel ? `Current: ${existingNotifChannel.slice(0, 20)}...` : "" },
+        { value: "none", label: "No notification channel", hint: "Don't set up a notification channel" },
+      ];
+      const notifMethod = await terminal.select({
+        message: "Set up a notification channel? (Session completions, errors, permission alerts)",
+        options: notifMethodOptions,
       });
 
       let notificationChannelId: string | null = null;
-      if (wantNotifications) {
+      if (notifMethod === "link") {
+        const link = await terminal.text({
+          message: "Paste the Teams notification channel link:",
+          validate: (v) => {
+            if (!v.trim()) return "Link cannot be empty";
+            if (!v.includes("teams.microsoft.com") && !v.includes("teams.cloud.microsoft")) return "This doesn't look like a Teams link";
+            return undefined;
+          },
+        });
+        const parsed = parseTeamsLink(link.trim());
+        if (parsed.channelId) {
+          notificationChannelId = parsed.channelId;
+          terminal.log.success(`Extracted notification channel ID: ${notificationChannelId}`);
+        } else {
+          terminal.log.warning("Could not extract channel ID from link.");
+        }
+      } else if (notifMethod === "manual") {
         if (discovery.ok) {
           const team = discovery.teams.find((t) => t.id === teamId);
           if (team && team.channels.length > 1) {
@@ -369,24 +393,14 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
         if (!notificationChannelId) {
           const nid = await terminal.text({
-            message: "Notification channel ID or Teams link (or leave empty to skip):",
-            ...((current.notificationChannelId as string) ? { initialValue: current.notificationChannelId as string } : {}) as any,
+            message: "Notification channel ID (e.g. 19:abc123@thread.tacv2):",
+            ...(existingNotifChannel ? { initialValue: existingNotifChannel } : {}) as any,
+            validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
-          const raw = nid.trim();
-          if (raw) {
-            // Parse Teams links to extract channel ID
-            if (raw.includes("teams.microsoft.com") || raw.includes("teams.cloud.microsoft")) {
-              const parsed = parseTeamsLink(raw);
-              notificationChannelId = parsed.channelId ?? raw;
-              if (parsed.channelId) {
-                terminal.log.success(`Extracted notification channel ID: ${parsed.channelId}`);
-              }
-            } else {
-              notificationChannelId = raw;
-            }
-          }
+          notificationChannelId = nid.trim();
         }
       }
+      // notifMethod === "none" → notificationChannelId stays null
 
       // ── Step 7: Graph API for File Sharing (Optional) ──
 
@@ -496,6 +510,11 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
       // ── Step 8d: Save Settings ──
 
+      // allowedChannelIds restricts which channels the bot will respond to.
+      // Only the main channel is included here. Additional channels can be
+      // added manually in the config file.
+      const allowedChannelIds: string[] = [channelId];
+
       await settings.setAll({
         enabled: true,
         botAppId,
@@ -503,6 +522,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         tenantId,
         teamId,
         channelId,
+        allowedChannelIds,
         notificationChannelId,
         assistantThreadId: null,
         botPort,
@@ -649,8 +669,16 @@ export default function createTeamsPlugin(): OpenACPPlugin {
             defaultValue: (current.channelId as string) ?? "",
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
+          const newChannelId = cid.trim();
           await settings.set("teamId", tid.trim());
-          await settings.set("channelId", cid.trim());
+          await settings.set("channelId", newChannelId);
+          // Rebuild allowedChannelIds: main channel (replacing old one), plus notification channel if set
+          const notificationChannelId = current.notificationChannelId as string | null;
+          const allowedChannelIds: string[] = [newChannelId];
+          if (notificationChannelId && !allowedChannelIds.includes(notificationChannelId)) {
+            allowedChannelIds.push(notificationChannelId);
+          }
+          await settings.set("allowedChannelIds", allowedChannelIds);
           terminal.log.success("Team and channel updated");
           break;
         }
@@ -672,19 +700,40 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         }
 
         case "notifications": {
-          const nid = await terminal.text({
-            message: "Notification channel ID or Teams link (empty to disable):",
-            defaultValue: (current.notificationChannelId as string) ?? "",
+          const existingNotif = (current.notificationChannelId as string | null) ?? null;
+          const notifOptions = [
+            { value: "link", label: "Paste a channel link (easiest)", hint: "Right-click channel → Get link" },
+            { value: "manual", label: "Enter channel ID manually", hint: existingNotif ? `Current: ${existingNotif.slice(0, 20)}...` : "" },
+            { value: "none", label: "No notification channel", hint: "Don't use a notification channel" },
+          ];
+          const method = await terminal.select({
+            message: "Notification channel:",
+            options: notifOptions,
           });
-          const raw = nid.trim();
-          if (raw) {
-            let channelId = raw;
-            if (raw.includes("teams.microsoft.com") || raw.includes("teams.cloud.microsoft")) {
-              const parsed = parseTeamsLink(raw);
-              channelId = parsed.channelId ?? raw;
-              if (parsed.channelId) terminal.log.success(`Extracted channel ID: ${parsed.channelId}`);
+
+          if (method === "link") {
+            const link = await terminal.text({
+              message: "Paste the Teams notification channel link:",
+              validate: (v) => {
+                if (!v.trim()) return "Link cannot be empty";
+                if (!v.includes("teams.microsoft.com") && !v.includes("teams.cloud.microsoft")) return "This doesn't look like a Teams link";
+                return undefined;
+              },
+            });
+            const parsed = parseTeamsLink(link.trim());
+            if (parsed.channelId) {
+              await settings.set("notificationChannelId", parsed.channelId);
+              terminal.log.success(`Notification channel updated: ${parsed.channelId}`);
+            } else {
+              terminal.log.warning("Could not extract channel ID from link.");
             }
-            await settings.set("notificationChannelId", channelId);
+          } else if (method === "manual") {
+            const nid = await terminal.text({
+              message: "Notification channel ID (e.g. 19:abc123@thread.tacv2):",
+              ...(existingNotif ? { initialValue: existingNotif } : {}) as any,
+              validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
+            });
+            await settings.set("notificationChannelId", nid.trim());
             terminal.log.success("Notification channel updated");
           } else {
             await settings.set("notificationChannelId", null);
