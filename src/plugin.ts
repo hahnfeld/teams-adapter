@@ -672,13 +672,8 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           const newChannelId = cid.trim();
           await settings.set("teamId", tid.trim());
           await settings.set("channelId", newChannelId);
-          // Rebuild allowedChannelIds: main channel (replacing old one), plus notification channel if set
-          const notificationChannelId = current.notificationChannelId as string | null;
-          const allowedChannelIds: string[] = [newChannelId];
-          if (notificationChannelId && !allowedChannelIds.includes(notificationChannelId)) {
-            allowedChannelIds.push(notificationChannelId);
-          }
-          await settings.set("allowedChannelIds", allowedChannelIds);
+          // Rebuild allowedChannelIds: main channel only (notification channel is outbound-only)
+          await settings.set("allowedChannelIds", [newChannelId]);
           terminal.log.success("Team and channel updated");
           break;
         }
