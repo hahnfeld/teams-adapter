@@ -1242,7 +1242,7 @@ export class TeamsAdapter extends MessagingAdapter {
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     this.ensureSessionTitle(sessionId, msg);
     const summary = content.text?.split("\n")[0]?.slice(0, 300) || "Thinking...";
-    msg.addOrReplaceThought(summary);
+    msg.addThought(summary);
   }
 
   protected async handleText(sessionId: string, content: OutgoingMessage): Promise<void> {
@@ -1286,15 +1286,14 @@ export class TeamsAdapter extends MessagingAdapter {
       meta.rawInput,
       meta.displaySummary as string | undefined,
     );
-    // Look up and use the stored entry id to replace tool-start with tool-result
+    // Look up and use the stored entry id to create tool-result entry (progress stays)
     const entryId = this._toolEntryIds.get(sessionId);
     if (entryId) {
-      msg.updateToolResult(entryId, summary);
+      msg.addToolResult(entryId, summary);
       this._toolEntryIds.delete(sessionId);
     } else {
-      // Fallback: add as a tool result directly
-      const newId = msg.addToolStart(toolName || "Tool", summary);
-      msg.updateToolResult(newId, summary);
+      // Fallback: create a standalone tool result
+      msg.addToolResult("", summary);
     }
   }
 

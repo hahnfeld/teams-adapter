@@ -1,16 +1,17 @@
 /**
  * Message composer — manages a single "main message" per session in Teams.
  *
- * Uses an Adaptive Card with a hierarchical entry model:
- *   - title: bold, persistent — session name, survives finalize
- *   - tool-start/tool-result: shows tool name + status, with child text entries
- *   - text: streaming text at root level
- *   - thought: italic, can be replaced/removed
- *   - usage: appended at end
+ * Emulates Claude Code's terminal UX using Adaptive Cards:
+ *   - Title: bold, persistent — session name
+ *   - Thinking blocks: italic, 💭 prefix, ALWAYS append (never replaced)
+ *   - Tool progress: 🔄 Running... with elapsed time, persistent as historical record
+ *   - Tool result: 📄 Result... appears AFTER progress (both coexist)
+ *   - Streaming text: root-level, appended
+ *   - Usage: italic footer, persistent
  *
- * Text output during a tool call is indented as a child of that tool entry.
- * This matches Claude Code's visual model where tool results "fill in" under
- * the tool block before being replaced by the final result.
+ * Tool output during execution is indented as children under the tool block.
+ * When a tool completes, a NEW tool-result entry is appended — the progress
+ * entry stays as a historical record (matching Claude Code's behavior).
  */
 import type { TurnContext } from "@microsoft/agents-hosting";
 import { log } from "@openacp/plugin-sdk";
@@ -28,15 +29,15 @@ export interface MessageRef {
 export type AcquireBotToken = () => Promise<string | null>;
 
 const MAX_ROOT_TEXT_LENGTH = 25_000;
-/** How long to wait with no activity (text chunks or tool changes) before warning about truncation. */
+/** How long to wait with no activity before warning about truncation. */
 const STALL_TIMEOUT = 120_000;
 
 // ─── Entry Types ───────────────────────────────────────────────────────────────
 
 type BodyEntry =
   | { id: string; kind: "title"; text: string }
-  | { id: string; kind: "tool-start"; toolName: string; params?: string; status: "running"; children: TextChild[] }
-  | { id: string; kind: "tool-result"; toolName: string; result: string; children: TextChild[] }
+  | { id: string; kind: "tool-start"; toolName: string; params?: string; startedAt: number; children: TextChild[] }
+  | { id: string; kind: "tool-result"; toolName: string; result: string; startedAt: number; endedAt: number; children: TextChild[] }
   | { id: string; kind: "text"; text: string }
   | { id: string; kind: "thought"; text: string }
   | { id: string; kind: "usage"; text: string }
@@ -56,6 +57,7 @@ function nextId(): string {
 
 function buildCardBody(entries: BodyEntry[]): unknown[] {
   const blocks: unknown[] = [];
+  const now = Date.now();
 
   for (const entry of entries) {
     switch (entry.kind) {
@@ -69,14 +71,15 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
         });
         break;
 
-      case "tool-start":
+      case "tool-start": {
+        const elapsed = formatElapsed(now - entry.startedAt);
         blocks.push({
           type: "Container",
           items: [
             {
               type: "TextBlock",
-              text: `🔄 ${escapeMd(entry.toolName)}`,
-              isSubtle: false,
+              text: `🔄 ${escapeMd(entry.toolName)}…  (${elapsed})`,
+              color: "Warning",
               weight: "Bolder",
               size: "Small",
               spacing: "None",
@@ -85,7 +88,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
               type: "TextBlock",
               text: `    ${c.text}`,
               size: "Small",
-              isSubtle: true,
+              color: "Accent",
               spacing: "None",
             })),
           ],
@@ -93,14 +96,17 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           padding: "Small",
         });
         break;
+      }
 
-      case "tool-result":
+      case "tool-result": {
+        const elapsed = formatElapsed(entry.endedAt - entry.startedAt);
         blocks.push({
           type: "Container",
           items: [
             {
               type: "TextBlock",
-              text: `📄 ${escapeMd(entry.result)}`,
+              text: `📄 ${escapeMd(entry.result)}  (${elapsed})`,
+              color: "Good",
               weight: "Bolder",
               size: "Small",
               spacing: "None",
@@ -109,7 +115,8 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
               type: "TextBlock",
               text: `    ${c.text}`,
               size: "Small",
-              isSubtle: false,
+              color: "Default",
+              wrap: true,
               spacing: "None",
             })),
           ],
@@ -117,12 +124,14 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           padding: "Small",
         });
         break;
+      }
 
       case "text":
         blocks.push({
           type: "TextBlock",
           text: entry.text,
           size: "Small",
+          color: "Default",
           wrap: true,
           spacing: "None",
         });
@@ -134,7 +143,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           text: `💭 ${entry.text}`,
           italic: true,
           size: "Small",
-          isSubtle: true,
+          color: "Light",
           spacing: "None",
         });
         break;
@@ -145,7 +154,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           text: `*${escapeMd(entry.text)}*`,
           italic: true,
           size: "Small",
-          isSubtle: true,
+          color: "Accent",
           spacing: "None",
         });
         break;
@@ -153,9 +162,9 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
       case "divider":
         blocks.push({
           type: "TextBlock",
-          text: "─".repeat(20),
+          text: "─".repeat(30),
           size: "Small",
-          isSubtle: true,
+          color: "Light",
           spacing: "None",
         });
         break;
@@ -165,26 +174,29 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
   return blocks;
 }
 
+function formatElapsed(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s`;
+}
+
 function escapeMd(text: string): string {
-  // Escape markdown special chars that would render incorrectly in Adaptive Cards
   return text.replace(/\[/g, "\\[").replace(/\*/g, "\\*").replace(/\]/g, "\\]");
 }
 
 // ─── SessionMessage ────────────────────────────────────────────────────────────
 
-/**
- * A single main message with hierarchical entry structure.
- * Entries are rendered into an Adaptive Card on each flush.
- */
 export class SessionMessage {
   private entries: BodyEntry[] = [];
   private titleId: string | null = null;
   private usageId: string | null = null;
-  private thoughtId: string | null = null;
+  /** The active tool whose children accumulate streaming output */
   private toolActive: string | null = null;
   private ref: MessageRef | null = null;
   private lastSent = "";
   private stallTimer?: ReturnType<typeof setTimeout>;
+  /** Interval handle for periodic elapsed-time updates on running tools */
+  private tickInterval?: ReturnType<typeof setInterval>;
 
   constructor(
     private context: TurnContext,
@@ -203,7 +215,6 @@ export class SessionMessage {
   }
 
   getBody(): string {
-    // Legacy compat — returns concatenated text entries
     return this.entries
       .filter((e) => e.kind === "text")
       .map((e) => (e as { kind: "text"; text: string }).text)
@@ -229,30 +240,47 @@ export class SessionMessage {
     this.requestFlush();
   }
 
-  /** Add a new tool-start entry, returns entry id. Sets toolActive. */
-  addToolStart(toolName: string, params?: string): string {
+  /**
+   * Add a tool-progress entry (🔄 Running...). Sets toolActive so subsequent
+   * addText() calls route children here. Returns entry id for tracking.
+   */
+  addToolStart(toolName: string, _params?: string): string {
     const id = nextId();
-    this.entries.push({ id, kind: "tool-start", toolName, params, status: "running", children: [] });
+    const startedAt = Date.now();
+    this.entries.push({ id, kind: "tool-start", toolName, startedAt, children: [] });
     this.toolActive = id;
     this.resetStallTimer();
+    this.startTickInterval();
     this.requestFlush();
     return id;
   }
 
   /**
-   * Replace a tool-start entry with a tool-result at the same id.
-   * Clears toolActive. Preserves any child text that streamed during execution.
+   * Add a tool-result entry (📄 Result...). Creates a NEW entry — does NOT
+   * replace the tool-progress entry. Both coexist as historical record.
+   * Clears toolActive so subsequent addText() goes to root body.
    */
-  updateToolResult(id: string, result: string): void {
-    const idx = this.entries.findIndex((e) => e.id === id);
-    if (idx === -1) return;
+  addToolResult(id: string, result: string): void {
+    const progressEntry = this.entries.find((e) => e.id === id);
+    if (!progressEntry || progressEntry.kind !== "tool-start") {
+      // Progress entry not found — create a standalone result
+      const startedAt = Date.now();
+      this.entries.push({ id: nextId(), kind: "tool-result", toolName: "", result, startedAt, endedAt: startedAt, children: [] });
+      this.toolActive = null;
+      this.stopTickInterval();
+      this.requestFlush();
+      return;
+    }
 
-    const entry = this.entries[idx];
-    if (entry.kind !== "tool-start") return;
+    const startedAt = progressEntry.startedAt;
+    const endedAt = Date.now();
+    const children = [...progressEntry.children];
 
-    const children = [...entry.children];
-    this.entries[idx] = { id, kind: "tool-result", toolName: entry.toolName, result, children };
+    // Keep the tool-start as historical record; add tool-result after it
+    this.entries.push({ id: nextId(), kind: "tool-result", toolName: progressEntry.toolName, result, startedAt, endedAt, children });
+
     if (this.toolActive === id) this.toolActive = null;
+    this.stopTickInterval();
     this.requestFlush();
   }
 
@@ -281,25 +309,12 @@ export class SessionMessage {
     this.requestFlush();
   }
 
-  /** Add or replace the thought entry (only one at a time). */
-  addOrReplaceThought(text: string): void {
-    if (this.thoughtId) {
-      const entry = this.findEntry(this.thoughtId);
-      if (entry && entry.kind === "thought") {
-        entry.text = text;
-      }
-    } else {
-      this.thoughtId = nextId();
-      this.entries.push({ id: this.thoughtId, kind: "thought", text });
-    }
-    this.requestFlush();
-  }
-
-  /** Remove the thought entry (e.g., when not relevant to final result). */
-  removeThought(): void {
-    if (!this.thoughtId) return;
-    this.removeEntry(this.thoughtId);
-    this.thoughtId = null;
+  /**
+   * Always append a new thought entry (thoughts persist, never replaced).
+   * Multiple thinking blocks can coexist — each is a historical record.
+   */
+  addThought(text: string): void {
+    this.entries.push({ id: nextId(), kind: "thought", text });
     this.requestFlush();
   }
 
@@ -326,22 +341,39 @@ export class SessionMessage {
   private findEntry(id: string): BodyEntry | undefined {
     for (const entry of this.entries) {
       if (entry.id === id) return entry;
-      if (entry.kind === "tool-start" || entry.kind === "tool-result") {
-        // Children are flat TextChild[], not full BodyEntry — no nested search needed
-      }
     }
     return undefined;
   }
 
-  private updateEntry(id: string, patch: Partial<BodyEntry>): void {
-    const idx = this.entries.findIndex((e) => e.id === id);
-    if (idx !== -1) {
-      this.entries[idx] = { ...this.entries[idx], ...patch } as BodyEntry;
-    }
-  }
-
   private removeEntry(id: string): void {
     this.entries = this.entries.filter((e) => e.id !== id);
+  }
+
+  // ─── Periodic tick for elapsed time updates ───────────────────────────────
+
+  /**
+   * Start a 1-second interval that updates elapsed time on running tool-progress
+   * entries. Called when a tool starts, stopped when tool completes or finalize.
+   */
+  private startTickInterval(): void {
+    if (this.tickInterval) return;
+    this.tickInterval = setInterval(() => {
+      // Only tick if there's an active tool-progress entry
+      const hasRunningTool = this.entries.some((e) => e.kind === "tool-start");
+      if (!hasRunningTool) {
+        this.stopTickInterval();
+        return;
+      }
+      this.requestFlush();
+    }, 1_000);
+    if (this.tickInterval.unref) this.tickInterval.unref();
+  }
+
+  private stopTickInterval(): void {
+    if (this.tickInterval) {
+      clearInterval(this.tickInterval);
+      this.tickInterval = undefined;
+    }
   }
 
   // ─── Card building ─────────────────────────────────────────────────────────
@@ -355,12 +387,13 @@ export class SessionMessage {
       body: [
         ...(body.length > 0 ? body : [{ type: "TextBlock", text: "…" }]),
       ],
+      // Use full available width
+      width: "stretch",
     };
   }
 
   // ─── Flush / Rate limiting ─────────────────────────────────────────────────
 
-  /** Request a flush through the rate limiter. */
   private requestFlush(): void {
     const card = this.buildCard();
     const key = this.ref ? `update:${this.ref.activityId}` : `new:${this.sessionId}`;
@@ -379,7 +412,6 @@ export class SessionMessage {
     if (!cardStr || cardStr === this.lastSent) return;
 
     if (!this.ref) {
-      // First send — create the card message
       const result = await sendCard(this.context, card) as { id?: string } | undefined;
       if (result?.id) {
         this.ref = {
@@ -390,14 +422,13 @@ export class SessionMessage {
       }
       this.lastSent = cardStr;
     } else {
-      // Update existing card via REST
       const success = await this.updateCardViaRest(card);
       if (success) {
         this.lastSent = cardStr;
       }
     }
 
-    // Check if new content arrived while flushing
+    // Content arrived while flushing — request another flush
     const current = this.buildCard();
     if (JSON.stringify(current) !== this.lastSent) {
       this.requestFlush();
@@ -440,7 +471,6 @@ export class SessionMessage {
   private resetStallTimer(): void {
     if (this.stallTimer) clearTimeout(this.stallTimer);
     this.stallTimer = setTimeout(() => {
-      // Check if we have content but no usage (stalled mid-stream)
       const hasContent = this.entries.some(
         (e) => (e.kind === "text" && e.text.length > 0) ||
                (e.kind === "tool-start" && e.children.length > 0),
@@ -448,7 +478,6 @@ export class SessionMessage {
       const hasUsage = this.entries.some((e) => e.kind === "usage");
       if (hasContent && !hasUsage) {
         log.warn({ sessionId: this.sessionId }, "[SessionMessage] Stream stalled — adding cutoff notice");
-        // Add a divider and notice as a text entry
         this.entries.push({ id: nextId(), kind: "divider" });
         this.entries.push({
           id: nextId(),
@@ -463,8 +492,8 @@ export class SessionMessage {
 
   // ─── Finalize ─────────────────────────────────────────────────────────────
 
-  /** Finalize: clear stall timer, do a last flush. */
   async finalize(): Promise<MessageRef | null> {
+    this.stopTickInterval();
     if (this.stallTimer) {
       clearTimeout(this.stallTimer);
       this.stallTimer = undefined;
@@ -504,7 +533,6 @@ export class SessionMessage {
 
   /** For split: finalize current message at limit, start fresh. */
   private split(): void {
-    // Collect root text entries and check total length
     const rootText = this.entries
       .filter((e) => e.kind === "text")
       .map((e) => (e as { kind: "text"; text: string }).text)
@@ -512,7 +540,6 @@ export class SessionMessage {
 
     if (rootText.length <= MAX_ROOT_TEXT_LENGTH) return;
 
-    // Find the split point
     let accLen = 0;
     const entriesToKeep: BodyEntry[] = [];
     const entriesToOverflow: BodyEntry[] = [];
@@ -527,14 +554,12 @@ export class SessionMessage {
           entriesToOverflow.push(entry);
         }
       } else {
-        // Non-text entries stay in the finalized message
         entriesToKeep.push(entry);
       }
     }
 
     log.info({ sessionId: this.sessionId, kept: entriesToKeep.length, overflow: entriesToOverflow.length }, "[SessionMessage] splitting");
 
-    // Clear entries, add overflow text as new text entry
     this.entries = entriesToKeep;
     if (entriesToOverflow.length > 0) {
       const overflowText = entriesToOverflow
@@ -546,7 +571,6 @@ export class SessionMessage {
       }
     }
 
-    // Finalize current message ref
     if (this.ref) {
       const card = this.buildCard();
       this.rateLimiter.enqueue(
@@ -556,23 +580,18 @@ export class SessionMessage {
       ).catch(() => {});
     }
 
-    // Reset ref for new message
     this.ref = null;
     this.lastSent = "";
     this.requestFlush();
   }
 
-  // ─── Legacy API (for adapter compat) ──────────────────────────────────────
+  // ─── Legacy API (no-ops for compat) ────────────────────────────────────────
 
-  /** @deprecated — use addToolStart instead */
-  setHeader(text: string): void {
-    // No-op — header zone is gone. Tool calls use addToolStart.
-  }
+  /** @deprecated — use addThought instead */
+  setHeader(_text: string): void { /* no-op */ }
 
-  /** @deprecated — use updateToolResult instead */
-  setHeaderResult(text: string): void {
-    // No-op — handled via updateToolResult
-  }
+  /** @deprecated — use addToolResult instead */
+  setHeaderResult(_text: string): void { /* no-op */ }
 
   /** @deprecated — use addText instead */
   appendBody(text: string): void {
@@ -584,16 +603,20 @@ export class SessionMessage {
     this.setUsage(text);
   }
 
-  /** @deprecated — use appendFooter via setUsage instead */
+  /** @deprecated — use setUsage instead */
   appendFooter(text: string): void {
     const current = this.getFooter();
     this.setUsage(current ? `${current} · ${text}` : text);
   }
 
-  /** @deprecated — no-op, header is gone */
-  clearHeader(): void {
-    // No-op
-  }
+  /** @deprecated — header zone is gone */
+  clearHeader(): void { /* no-op */ }
+
+  /** @deprecated — thoughts persist, use addThought */
+  removeThought(): void { /* no-op */ }
+
+  /** @deprecated — use addToolStart + addToolResult */
+  updateToolResult(_id: string, _result: string): void { /* no-op */ }
 }
 
 // ─── SessionMessageManager ─────────────────────────────────────────────────────
@@ -627,7 +650,6 @@ export class SessionMessageManager {
     return this.messages.has(sessionId);
   }
 
-  /** Finalize and remove a session's message and plan ref. */
   async finalize(sessionId: string): Promise<MessageRef | null> {
     const msg = this.messages.get(sessionId);
     if (!msg) return null;
@@ -636,7 +658,6 @@ export class SessionMessageManager {
     return msg.finalize();
   }
 
-  /** Get or set the plan message ref for a session. */
   getPlanRef(sessionId: string): MessageRef | undefined {
     return this.planRefs.get(sessionId);
   }
