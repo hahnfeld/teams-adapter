@@ -323,6 +323,8 @@ export class SessionMessage {
         entry.children.push({ text });
         this.resetStallTimer();
         this.requestFlush();
+        // Check for overflow (root text limit)
+        if (this.ref) this.checkSplit();
         return;
       }
     }
@@ -336,6 +338,8 @@ export class SessionMessage {
     }
     this.resetStallTimer();
     this.requestFlush();
+    // Check for overflow after root text grows
+    if (this.ref) this.checkSplit();
   }
 
   /**
@@ -558,6 +562,20 @@ export class SessionMessage {
         } catch { /* leave unchanged */ }
       }
     }
+  }
+
+  /**
+   * Check if root text exceeds limit and split into a new message.
+   * Called from addText when a message is already sent (this.ref != null).
+   */
+  private checkSplit(): void {
+    const rootText = this.entries
+      .filter((e) => e.kind === "text")
+      .map((e) => (e as { kind: "text"; text: string }).text)
+      .join("");
+
+    if (rootText.length <= MAX_ROOT_TEXT_LENGTH) return;
+    this.split();
   }
 
   /** For split: finalize current message at limit, start fresh. */
