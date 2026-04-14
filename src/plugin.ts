@@ -510,10 +510,16 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
       // ── Step 8d: Save Settings ──
 
-      // allowedChannelIds restricts which channels the bot will respond to.
-      // Only the main channel is included here. Additional channels can be
-      // added manually in the config file.
-      const allowedChannelIds: string[] = [channelId];
+      // Preserve any existing allowedChannelIds on reinstall — do not overwrite
+      // manually added channels. Only ensure the primary channelId is present.
+      const existingAllowed = (current.allowedChannelIds as string[]) ?? [];
+      const allowedChannelIds: string[] = existingAllowed.length > 0
+        ? existingAllowed
+        : [channelId];
+      // Ensure the main channelId is in the list (replace if stale)
+      if (!allowedChannelIds.includes(channelId)) {
+        allowedChannelIds.unshift(channelId);
+      }
 
       await settings.setAll({
         enabled: true,
