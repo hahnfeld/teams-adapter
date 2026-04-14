@@ -84,6 +84,9 @@ export class TeamsAdapter extends MessagingAdapter {
   /** Per-session typing pulse state (timeout + interval handles) */
   private _typingPulses = new Map<string, { timeout?: ReturnType<typeof setTimeout>; interval?: ReturnType<typeof setInterval> }>();
 
+  /** Per-session active tool entry ID for updateToolResult dispatch */
+  private _toolEntryIds = new Map<string, string>();
+
   /** Messages buffered during assistant initialization — replayed once ready. Capped to prevent unbounded growth. */
   private static readonly MAX_INIT_BUFFER = 50;
   private _assistantInitBuffer: Array<{ sessionId: string; content: OutgoingMessage }> = [];
@@ -1238,8 +1241,8 @@ export class TeamsAdapter extends MessagingAdapter {
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     this.ensureSessionTitle(sessionId, msg);
-    const summary = content.text?.split("\n")[0]?.slice(0, 100) || "Thinking...";
-    msg.setHeader(`💭 ${summary}`);
+    const summary = content.text?.split("\n")[0]?.slice(0, 300) || "Thinking...";
+    msg.addOrReplaceThought(summary);
   }
 
   protected async handleText(sessionId: string, content: OutgoingMessage): Promise<void> {
@@ -1249,7 +1252,7 @@ export class TeamsAdapter extends MessagingAdapter {
     if (!this.composer.has(sessionId)) this.sendTyping(ctx.context);
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     this.ensureSessionTitle(sessionId, msg);
-    if (content.text) msg.appendBody(content.text);
+    if (content.text) msg.addText(content.text);
   }
 
   protected async handleToolCall(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
@@ -1265,7 +1268,8 @@ export class TeamsAdapter extends MessagingAdapter {
       meta.rawInput,
       meta.displaySummary as string | undefined,
     );
-    msg.setHeader(`🔧 ${summary}`);
+    const entryId = msg.addToolStart(toolName, summary);
+    this._toolEntryIds.set(sessionId, entryId);
   }
 
   protected async handleToolUpdate(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
@@ -1275,14 +1279,23 @@ export class TeamsAdapter extends MessagingAdapter {
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     const meta = (content.metadata ?? {}) as Partial<ToolCallMeta>;
     const toolName = meta.name || content.text || "";
-    // Only update header if we have meaningful content — don't overwrite with empty
+    // Only update if we have meaningful content
     if (!toolName && !meta.displaySummary) return;
     const summary = formatToolSummary(
       toolName || "Tool",
       meta.rawInput,
       meta.displaySummary as string | undefined,
     );
-    msg.setHeader(`🔧 ${summary}`);
+    // Look up and use the stored entry id to replace tool-start with tool-result
+    const entryId = this._toolEntryIds.get(sessionId);
+    if (entryId) {
+      msg.updateToolResult(entryId, summary);
+      this._toolEntryIds.delete(sessionId);
+    } else {
+      // Fallback: add as a tool result directly
+      const newId = msg.addToolStart(toolName || "Tool", summary);
+      msg.updateToolResult(newId, summary);
+    }
   }
 
   /** Set the session title on the composer if not already set. */
@@ -1354,9 +1367,7 @@ export class TeamsAdapter extends MessagingAdapter {
       if (meta.cost != null) parts.push(`$${meta.cost.toFixed(4)}`);
       parts.push("Task completed");
       const footerText = parts.join(" · ");
-      msg.setFooter(footerText);
-      // Usage signals end of a turn — clear ephemeral header
-      msg.clearHeader();
+      msg.setUsage(footerText);
     }
   }
 
@@ -1404,6 +1415,7 @@ export class TeamsAdapter extends MessagingAdapter {
     this._sessionContexts.delete(sessionId);
     this._sessionOutputModes.delete(sessionId);
     this._planSending.delete(sessionId);
+    this._toolEntryIds.delete(sessionId);
     this.clearTypingPulse(sessionId);
     this.composer.cleanup(sessionId);
   }
@@ -1414,7 +1426,8 @@ export class TeamsAdapter extends MessagingAdapter {
 
     const msg = this.composer.get(sessionId);
     if (msg) {
-      msg.appendFooter("Task completed");
+      const current = msg.getFooter();
+      msg.setUsage(current ? `${current} · Task completed` : "Task completed");
     }
     const ref = await this.composer.finalize(sessionId);
     this.cleanupSessionState(sessionId);
@@ -1450,7 +1463,7 @@ export class TeamsAdapter extends MessagingAdapter {
     if (isAttachmentTooLarge(attachment.size)) {
       log.warn({ sessionId, fileName: attachment.fileName, size: attachment.size }, "[TeamsAdapter] File too large");
       const msg = this.composer.getOrCreate(sessionId, ctx.context);
-      msg.appendBody(`\n\n⚠️ File too large to send (${Math.round(attachment.size / 1024 / 1024)}MB): ${attachment.fileName}`);
+      msg.addText(`\n\n⚠️ File too large to send (${Math.round(attachment.size / 1024 / 1024)}MB): ${attachment.fileName}`);
       return;
     }
 
@@ -1466,9 +1479,9 @@ export class TeamsAdapter extends MessagingAdapter {
       // Append file info inline in the body
       const msg = this.composer.getOrCreate(sessionId, ctx.context);
       if (shareUrl) {
-        msg.appendBody(`\n\n📎 [${attachment.fileName}](${shareUrl})`);
+        msg.addText(`\n\n📎 [${attachment.fileName}](${shareUrl})`);
       } else {
-        msg.appendBody(`\n\n📎 ${attachment.fileName} (${Math.round(attachment.size / 1024)}KB)`);
+        msg.addText(`\n\n📎 ${attachment.fileName} (${Math.round(attachment.size / 1024)}KB)`);
       }
     } catch (err) {
       log.error({ err, sessionId, fileName: attachment.fileName }, "[TeamsAdapter] Failed to send attachment");

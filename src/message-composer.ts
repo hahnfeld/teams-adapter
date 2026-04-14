@@ -1,24 +1,23 @@
 /**
  * Message composer — manages a single "main message" per session in Teams.
  *
- * The main message has four zones:
- *   TITLE   (persistent, bold) — session name, survives finalize
- *   HEADER  (ephemeral, italic) — tool_call, tool_update, thought
- *   BODY    (persistent, streamed) — text, attachments
- *   FOOTER  (persistent, italic) — usage, session_end
+ * Uses an Adaptive Card with a hierarchical entry model:
+ *   - title: bold, persistent — session name, survives finalize
+ *   - tool-start/tool-result: shows tool name + status, with child text entries
+ *   - text: streaming text at root level
+ *   - thought: italic, can be replaced/removed
+ *   - usage: appended at end
  *
- * All zones are composed into a single markdown string and sent/updated
- * as one Teams message via the rate limiter.
+ * Text output during a tool call is indented as a child of that tool entry.
+ * This matches Claude Code's visual model where tool results "fill in" under
+ * the tool block before being replaced by the final result.
  */
 import type { TurnContext } from "@microsoft/agents-hosting";
 import { log } from "@openacp/plugin-sdk";
-import { splitMessage } from "./formatting.js";
-import { sendText } from "./send-utils.js";
+import { CardFactory } from "@microsoft/agents-hosting";
 import type { ConversationRateLimiter } from "./rate-limiter.js";
 
-const MAX_BODY_LENGTH = 25_000;
-/** How long to wait with no activity (body text or header changes) before warning about truncation. */
-const STALL_TIMEOUT = 120_000;
+// ─── Re-exports for backwards compat ───────────────────────────────────────────
 
 export interface MessageRef {
   activityId: string;
@@ -28,27 +27,161 @@ export interface MessageRef {
 
 export type AcquireBotToken = () => Promise<string | null>;
 
-/** Escape asterisks to prevent breaking markdown italic/bold spans. */
-function escapeEmphasis(text: string): string {
-  return text.replace(/\*/g, "\\*");
+const MAX_ROOT_TEXT_LENGTH = 25_000;
+/** How long to wait with no activity (text chunks or tool changes) before warning about truncation. */
+const STALL_TIMEOUT = 120_000;
+
+// ─── Entry Types ───────────────────────────────────────────────────────────────
+
+type BodyEntry =
+  | { id: string; kind: "title"; text: string }
+  | { id: string; kind: "tool-start"; toolName: string; params?: string; status: "running"; children: TextChild[] }
+  | { id: string; kind: "tool-result"; toolName: string; result: string; children: TextChild[] }
+  | { id: string; kind: "text"; text: string }
+  | { id: string; kind: "thought"; text: string }
+  | { id: string; kind: "usage"; text: string }
+  | { id: string; kind: "divider" };
+
+/** Text content inside a tool block — appended as tool runs */
+type TextChild = { text: string };
+
+// ─── ID generation ─────────────────────────────────────────────────────────────
+
+let _idCounter = 0;
+function nextId(): string {
+  return `e${++_idCounter}_${Date.now().toString(36)}`;
 }
 
-/**
- * Normalize newlines for Teams rendering.
- * Teams collapses single \n in markdown — use \n\n for line breaks.
- */
-function teamsNewlines(text: string): string {
-  return text.replace(/(?<!\n)\n(?!\n)/g, "\n\n");
+// ─── Adaptive Card Builder ────────────────────────────────────────────────────
+
+function buildCardBody(entries: BodyEntry[]): unknown[] {
+  const blocks: unknown[] = [];
+
+  for (const entry of entries) {
+    switch (entry.kind) {
+      case "title":
+        blocks.push({
+          type: "TextBlock",
+          text: `**${escapeMd(entry.text)}**`,
+          weight: "Bolder",
+          size: "Medium",
+          spacing: "None",
+        });
+        break;
+
+      case "tool-start":
+        blocks.push({
+          type: "Container",
+          items: [
+            {
+              type: "TextBlock",
+              text: `🔄 ${escapeMd(entry.toolName)}`,
+              isSubtle: false,
+              weight: "Bolder",
+              size: "Small",
+              spacing: "None",
+            },
+            ...entry.children.map((c) => ({
+              type: "TextBlock",
+              text: `    ${c.text}`,
+              size: "Small",
+              isSubtle: true,
+              spacing: "None",
+            })),
+          ],
+          style: "emphasis",
+          padding: "Small",
+        });
+        break;
+
+      case "tool-result":
+        blocks.push({
+          type: "Container",
+          items: [
+            {
+              type: "TextBlock",
+              text: `📄 ${escapeMd(entry.result)}`,
+              weight: "Bolder",
+              size: "Small",
+              spacing: "None",
+            },
+            ...entry.children.map((c) => ({
+              type: "TextBlock",
+              text: `    ${c.text}`,
+              size: "Small",
+              isSubtle: false,
+              spacing: "None",
+            })),
+          ],
+          style: "good",
+          padding: "Small",
+        });
+        break;
+
+      case "text":
+        blocks.push({
+          type: "TextBlock",
+          text: entry.text,
+          size: "Small",
+          wrap: true,
+          spacing: "None",
+        });
+        break;
+
+      case "thought":
+        blocks.push({
+          type: "TextBlock",
+          text: `💭 ${entry.text}`,
+          italic: true,
+          size: "Small",
+          isSubtle: true,
+          spacing: "None",
+        });
+        break;
+
+      case "usage":
+        blocks.push({
+          type: "TextBlock",
+          text: `*${escapeMd(entry.text)}*`,
+          italic: true,
+          size: "Small",
+          isSubtle: true,
+          spacing: "None",
+        });
+        break;
+
+      case "divider":
+        blocks.push({
+          type: "TextBlock",
+          text: "─".repeat(20),
+          size: "Small",
+          isSubtle: true,
+          spacing: "None",
+        });
+        break;
+    }
+  }
+
+  return blocks;
 }
 
+function escapeMd(text: string): string {
+  // Escape markdown special chars that would render incorrectly in Adaptive Cards
+  return text.replace(/\[/g, "\\[").replace(/\*/g, "\\*").replace(/\]/g, "\\]");
+}
+
+// ─── SessionMessage ────────────────────────────────────────────────────────────
+
 /**
- * A single main message with title/header/body/footer zones.
+ * A single main message with hierarchical entry structure.
+ * Entries are rendered into an Adaptive Card on each flush.
  */
 export class SessionMessage {
-  private title: string | null = null;
-  private header: string | null = null;
-  private body = "";
-  private footer: string | null = null;
+  private entries: BodyEntry[] = [];
+  private titleId: string | null = null;
+  private usageId: string | null = null;
+  private thoughtId: string | null = null;
+  private toolActive: string | null = null;
   private ref: MessageRef | null = null;
   private lastSent = "";
   private stallTimer?: ReturnType<typeof setTimeout>;
@@ -70,115 +203,166 @@ export class SessionMessage {
   }
 
   getBody(): string {
-    return this.body;
+    // Legacy compat — returns concatenated text entries
+    return this.entries
+      .filter((e) => e.kind === "text")
+      .map((e) => (e as { kind: "text"; text: string }).text)
+      .join("");
   }
 
   getFooter(): string | null {
-    return this.footer;
+    const usage = this.entries.find((e) => e.kind === "usage");
+    return usage ? (usage as { kind: "usage"; text: string }).text : null;
   }
+
+  // ─── Entry API ───────────────────────────────────────────────────────────
 
   /** Set the persistent session title (bold, survives finalize). */
   setTitle(text: string): void {
-    this.title = text;
-    this.requestFlush();
-  }
-
-  /** Max header length — tool notifications can include file paths and summaries. */
-  private static readonly MAX_HEADER_LENGTH = 300;
-
-  /** Replace the ephemeral header (tool_call, thought, etc.). Reset stall timer since tool activity counts as activity. */
-  setHeader(text: string): void {
-    // Truncate to first line, then cap length — headers are status indicators, not content
-    const firstLine = text.split("\n")[0];
-    this.header = firstLine.length > SessionMessage.MAX_HEADER_LENGTH
-      ? firstLine.slice(0, SessionMessage.MAX_HEADER_LENGTH) + "..."
-      : firstLine;
-    this.resetStallTimer();
-    this.requestFlush();
-  }
-
-  /** Clear the ephemeral header and flush the update. */
-  clearHeader(): void {
-    if (this.header === null) return;
-    this.header = null;
-    this.requestFlush();
-  }
-
-  /** Append text to the body (streaming text chunks). */
-  appendBody(text: string): void {
-    if (!text) return;
-    this.body += text;
-    this.resetStallTimer();
-
-    // Check if body needs splitting
-    if (this.body.length > MAX_BODY_LENGTH && this.ref) {
-      this.split();
-      return;
+    if (this.titleId) {
+      const entry = this.findEntry(this.titleId);
+      if (entry && entry.kind === "title") entry.text = text;
+    } else {
+      this.titleId = nextId();
+      this.entries.unshift({ id: this.titleId, kind: "title", text });
     }
-
     this.requestFlush();
   }
 
-  /** Set the persistent footer (usage, completion). */
-  setFooter(text: string): void {
-    this.footer = text;
+  /** Add a new tool-start entry, returns entry id. Sets toolActive. */
+  addToolStart(toolName: string, params?: string): string {
+    const id = nextId();
+    this.entries.push({ id, kind: "tool-start", toolName, params, status: "running", children: [] });
+    this.toolActive = id;
+    this.resetStallTimer();
     this.requestFlush();
-  }
-
-  /** Append to the existing footer (e.g., adding "Task completed" after usage). */
-  appendFooter(text: string): void {
-    this.footer = this.footer ? `${this.footer} · ${text}` : text;
-    this.requestFlush();
+    return id;
   }
 
   /**
-   * Close any unclosed code fences in the body.
-   * If the body has an odd number of ``` markers, the footer would
-   * be swallowed into the code block — append a closing fence.
+   * Replace a tool-start entry with a tool-result at the same id.
+   * Clears toolActive. Preserves any child text that streamed during execution.
    */
-  private static closeCodeFences(text: string): string {
-    const fenceCount = (text.match(/^```/gm) || []).length;
-    if (fenceCount % 2 !== 0) {
-      return text + "\n```";
-    }
-    return text;
+  updateToolResult(id: string, result: string): void {
+    const idx = this.entries.findIndex((e) => e.id === id);
+    if (idx === -1) return;
+
+    const entry = this.entries[idx];
+    if (entry.kind !== "tool-start") return;
+
+    const children = [...entry.children];
+    this.entries[idx] = { id, kind: "tool-result", toolName: entry.toolName, result, children };
+    if (this.toolActive === id) this.toolActive = null;
+    this.requestFlush();
   }
 
-  /** Compose the four zones into a single markdown string. */
-  compose(): string {
-    const parts: string[] = [];
+  /** Add text — goes to toolActive children if a tool is running, else root text entry. */
+  addText(text: string): void {
+    if (!text) return;
 
-    if (this.title) {
-      parts.push(`**${escapeEmphasis(this.title)}**`);
+    if (this.toolActive) {
+      const entry = this.findEntry(this.toolActive);
+      if (entry && (entry.kind === "tool-start" || entry.kind === "tool-result")) {
+        entry.children.push({ text });
+        this.resetStallTimer();
+        this.requestFlush();
+        return;
+      }
     }
 
-    if (this.header) {
-      parts.push(`*${escapeEmphasis(this.header)}*`);
+    // Root-level text — append to last root text entry or create new
+    const lastText = this.entries.filter((e) => e.kind === "text").at(-1);
+    if (lastText) {
+      lastText.text += text;
+    } else {
+      this.entries.push({ id: nextId(), kind: "text", text });
     }
-
-    if (this.title || this.header) {
-      parts.push("---");
-    }
-
-    if (this.body) {
-      parts.push(SessionMessage.closeCodeFences(this.body));
-    }
-
-    if (this.footer) {
-      if (this.body) parts.push("---");
-      parts.push(`*${escapeEmphasis(this.footer)}*`);
-    }
-
-    return parts.join("\n\n");
+    this.resetStallTimer();
+    this.requestFlush();
   }
+
+  /** Add or replace the thought entry (only one at a time). */
+  addOrReplaceThought(text: string): void {
+    if (this.thoughtId) {
+      const entry = this.findEntry(this.thoughtId);
+      if (entry && entry.kind === "thought") {
+        entry.text = text;
+      }
+    } else {
+      this.thoughtId = nextId();
+      this.entries.push({ id: this.thoughtId, kind: "thought", text });
+    }
+    this.requestFlush();
+  }
+
+  /** Remove the thought entry (e.g., when not relevant to final result). */
+  removeThought(): void {
+    if (!this.thoughtId) return;
+    this.removeEntry(this.thoughtId);
+    this.thoughtId = null;
+    this.requestFlush();
+  }
+
+  /** Set or replace the usage entry (only one at a time). */
+  setUsage(text: string): void {
+    if (this.usageId) {
+      const entry = this.findEntry(this.usageId);
+      if (entry && entry.kind === "usage") entry.text = text;
+    } else {
+      this.usageId = nextId();
+      this.entries.push({ id: this.usageId, kind: "usage", text });
+    }
+    this.requestFlush();
+  }
+
+  /** Add a divider entry. */
+  appendDivider(): void {
+    this.entries.push({ id: nextId(), kind: "divider" });
+    this.requestFlush();
+  }
+
+  // ─── Entry helpers ────────────────────────────────────────────────────────
+
+  private findEntry(id: string): BodyEntry | undefined {
+    for (const entry of this.entries) {
+      if (entry.id === id) return entry;
+      if (entry.kind === "tool-start" || entry.kind === "tool-result") {
+        // Children are flat TextChild[], not full BodyEntry — no nested search needed
+      }
+    }
+    return undefined;
+  }
+
+  private updateEntry(id: string, patch: Partial<BodyEntry>): void {
+    const idx = this.entries.findIndex((e) => e.id === id);
+    if (idx !== -1) {
+      this.entries[idx] = { ...this.entries[idx], ...patch } as BodyEntry;
+    }
+  }
+
+  private removeEntry(id: string): void {
+    this.entries = this.entries.filter((e) => e.id !== id);
+  }
+
+  // ─── Card building ─────────────────────────────────────────────────────────
+
+  private buildCard(): Record<string, unknown> {
+    const body = buildCardBody(this.entries);
+
+    return {
+      type: "AdaptiveCard",
+      version: "1.4",
+      body: [
+        ...(body.length > 0 ? body : [{ type: "TextBlock", text: "…" }]),
+      ],
+    };
+  }
+
+  // ─── Flush / Rate limiting ─────────────────────────────────────────────────
 
   /** Request a flush through the rate limiter. */
-  requestFlush(): void {
-    const composed = this.compose();
-    if (!composed) return;
-    if (composed === this.lastSent) return;
-
-    // Coalescing key: activityId for updates, session for new sends
+  private requestFlush(): void {
+    const card = this.buildCard();
     const key = this.ref ? `update:${this.ref.activityId}` : `new:${this.sessionId}`;
     this.rateLimiter.enqueue(
       this.conversationId,
@@ -190,12 +374,13 @@ export class SessionMessage {
   }
 
   private async flush(): Promise<void> {
-    const composed = this.compose();
-    if (!composed || composed === this.lastSent) return;
+    const card = this.buildCard();
+    const cardStr = JSON.stringify(card);
+    if (!cardStr || cardStr === this.lastSent) return;
 
     if (!this.ref) {
-      // First send — create the message
-      const result = await sendText(this.context, composed) as { id?: string } | undefined;
+      // First send — create the card message
+      const result = await sendCard(this.context, card) as { id?: string } | undefined;
       if (result?.id) {
         this.ref = {
           activityId: result.id,
@@ -203,23 +388,23 @@ export class SessionMessage {
           serviceUrl: this.context.activity.serviceUrl as string,
         };
       }
-      this.lastSent = composed;
+      this.lastSent = cardStr;
     } else {
-      // Update existing message via REST
-      const success = await this.updateViaRest(composed);
+      // Update existing card via REST
+      const success = await this.updateCardViaRest(card);
       if (success) {
-        this.lastSent = composed;
+        this.lastSent = cardStr;
       }
     }
 
-    // Check if state changed during the flush (new chunks arrived while we were awaiting)
-    const current = this.compose();
-    if (current && current !== this.lastSent) {
+    // Check if new content arrived while flushing
+    const current = this.buildCard();
+    if (JSON.stringify(current) !== this.lastSent) {
       this.requestFlush();
     }
   }
 
-  private async updateViaRest(text: string): Promise<boolean> {
+  private async updateCardViaRest(card: Record<string, unknown>): Promise<boolean> {
     if (!this.ref) return false;
     const token = await this.acquireBotToken();
     if (!token) return false;
@@ -235,81 +420,61 @@ export class SessionMessage {
         },
         body: JSON.stringify({
           type: "message",
-          text: teamsNewlines(text),
-          textFormat: "markdown",
+          attachments: [CardFactory.adaptiveCard(card)],
         }),
       });
 
       if (!response.ok) {
-        log.warn({ status: response.status, sessionId: this.sessionId }, "[SessionMessage] REST update failed");
+        log.warn({ status: response.status, sessionId: this.sessionId }, "[SessionMessage] REST card update failed");
         return false;
       }
       return true;
     } catch (err) {
-      log.warn({ err, sessionId: this.sessionId }, "[SessionMessage] REST update error");
+      log.warn({ err, sessionId: this.sessionId }, "[SessionMessage] REST card update error");
       return false;
     }
   }
 
-  /** Split: finalize current message at body limit, start fresh. */
-  private split(): void {
-    const finalBody = this.body.slice(0, MAX_BODY_LENGTH);
-    const overflow = this.body.slice(MAX_BODY_LENGTH);
-
-    log.info({ sessionId: this.sessionId, finalLen: finalBody.length, overflowLen: overflow.length }, "[SessionMessage] splitting");
-
-    // Clear ephemeral header on the finalized message; footer stays per spec
-    this.header = null;
-    this.body = finalBody;
-
-    // Final flush of the current message (with footer preserved)
-    const composed = this.compose();
-    if (this.ref && composed !== this.lastSent) {
-      this.rateLimiter.enqueue(
-        this.conversationId,
-        () => this.updateViaRest(composed).then(() => {}),
-        `update:${this.ref.activityId}`,
-      ).catch(() => {});
-    }
-
-    // Reset for a new message — footer carries over to new message
-    this.ref = null;
-    this.lastSent = "";
-    this.body = overflow;
-
-    if (overflow) {
-      this.requestFlush();
-    }
-  }
+  // ─── Stall timer ───────────────────────────────────────────────────────────
 
   private resetStallTimer(): void {
     if (this.stallTimer) clearTimeout(this.stallTimer);
     this.stallTimer = setTimeout(() => {
-      if (this.body && !this.footer) {
+      // Check if we have content but no usage (stalled mid-stream)
+      const hasContent = this.entries.some(
+        (e) => (e.kind === "text" && e.text.length > 0) ||
+               (e.kind === "tool-start" && e.children.length > 0),
+      );
+      const hasUsage = this.entries.some((e) => e.kind === "usage");
+      if (hasContent && !hasUsage) {
         log.warn({ sessionId: this.sessionId }, "[SessionMessage] Stream stalled — adding cutoff notice");
-        this.header = null;
-        // Use appendBody so split check is applied
-        this.appendBody("\n\n---\n_Response was cut short — the model likely reached its output token limit. Send a follow-up message to continue._");
+        // Add a divider and notice as a text entry
+        this.entries.push({ id: nextId(), kind: "divider" });
+        this.entries.push({
+          id: nextId(),
+          kind: "text",
+          text: "\n\n---\n_Response was cut short — the model likely reached its output token limit. Send a follow-up message to continue._",
+        });
+        this.requestFlush();
       }
     }, STALL_TIMEOUT);
     if (this.stallTimer.unref) this.stallTimer.unref();
   }
 
-  /** Finalize: clear stall timer, clear ephemeral header, do a last flush. */
+  // ─── Finalize ─────────────────────────────────────────────────────────────
+
+  /** Finalize: clear stall timer, do a last flush. */
   async finalize(): Promise<MessageRef | null> {
     if (this.stallTimer) {
       clearTimeout(this.stallTimer);
       this.stallTimer = undefined;
     }
 
-    // Clear ephemeral header on finalize; title and footer persist
-    this.header = null;
-
-    // Final flush
-    const composed = this.compose();
-    if (composed && composed !== this.lastSent) {
+    const card = this.buildCard();
+    const cardStr = JSON.stringify(card);
+    if (cardStr && cardStr !== this.lastSent) {
       if (!this.ref) {
-        const result = await sendText(this.context, composed) as { id?: string } | undefined;
+        const result = await sendCard(this.context, card) as { id?: string } | undefined;
         if (result?.id) {
           this.ref = {
             activityId: result.id,
@@ -318,25 +483,121 @@ export class SessionMessage {
           };
         }
       } else {
-        await this.updateViaRest(composed);
+        await this.updateCardViaRest(card);
       }
-      this.lastSent = composed;
+      this.lastSent = cardStr;
     }
 
     return this.ref;
   }
 
+  /** Legacy compat — strip pattern from root text entries. */
   async stripPattern(pattern: RegExp): Promise<void> {
-    if (!this.body) return;
-    try {
-      this.body = this.body.replace(pattern, "").trim();
-    } catch { /* leave unchanged */ }
+    for (const entry of this.entries) {
+      if (entry.kind === "text") {
+        try {
+          entry.text = entry.text.replace(pattern, "").trim();
+        } catch { /* leave unchanged */ }
+      }
+    }
+  }
+
+  /** For split: finalize current message at limit, start fresh. */
+  private split(): void {
+    // Collect root text entries and check total length
+    const rootText = this.entries
+      .filter((e) => e.kind === "text")
+      .map((e) => (e as { kind: "text"; text: string }).text)
+      .join("");
+
+    if (rootText.length <= MAX_ROOT_TEXT_LENGTH) return;
+
+    // Find the split point
+    let accLen = 0;
+    const entriesToKeep: BodyEntry[] = [];
+    const entriesToOverflow: BodyEntry[] = [];
+
+    for (const entry of this.entries) {
+      if (entry.kind === "text") {
+        const text = (entry as { kind: "text"; text: string }).text;
+        if (accLen + text.length <= MAX_ROOT_TEXT_LENGTH) {
+          entriesToKeep.push(entry);
+          accLen += text.length;
+        } else {
+          entriesToOverflow.push(entry);
+        }
+      } else {
+        // Non-text entries stay in the finalized message
+        entriesToKeep.push(entry);
+      }
+    }
+
+    log.info({ sessionId: this.sessionId, kept: entriesToKeep.length, overflow: entriesToOverflow.length }, "[SessionMessage] splitting");
+
+    // Clear entries, add overflow text as new text entry
+    this.entries = entriesToKeep;
+    if (entriesToOverflow.length > 0) {
+      const overflowText = entriesToOverflow
+        .filter((e) => e.kind === "text")
+        .map((e) => (e as { kind: "text"; text: string }).text)
+        .join("");
+      if (overflowText) {
+        this.entries.push({ id: nextId(), kind: "text", text: overflowText });
+      }
+    }
+
+    // Finalize current message ref
+    if (this.ref) {
+      const card = this.buildCard();
+      this.rateLimiter.enqueue(
+        this.conversationId,
+        () => this.updateCardViaRest(card).then(() => {}),
+        `update:${this.ref.activityId}`,
+      ).catch(() => {});
+    }
+
+    // Reset ref for new message
+    this.ref = null;
+    this.lastSent = "";
+    this.requestFlush();
+  }
+
+  // ─── Legacy API (for adapter compat) ──────────────────────────────────────
+
+  /** @deprecated — use addToolStart instead */
+  setHeader(text: string): void {
+    // No-op — header zone is gone. Tool calls use addToolStart.
+  }
+
+  /** @deprecated — use updateToolResult instead */
+  setHeaderResult(text: string): void {
+    // No-op — handled via updateToolResult
+  }
+
+  /** @deprecated — use addText instead */
+  appendBody(text: string): void {
+    this.addText(text);
+  }
+
+  /** @deprecated — use setUsage instead */
+  setFooter(text: string): void {
+    this.setUsage(text);
+  }
+
+  /** @deprecated — use appendFooter via setUsage instead */
+  appendFooter(text: string): void {
+    const current = this.getFooter();
+    this.setUsage(current ? `${current} · ${text}` : text);
+  }
+
+  /** @deprecated — no-op, header is gone */
+  clearHeader(): void {
+    // No-op
   }
 }
 
-/**
- * Manages SessionMessage instances and plan refs across sessions.
- */
+// ─── SessionMessageManager ─────────────────────────────────────────────────────
+
 export class SessionMessageManager {
   private messages = new Map<string, SessionMessage>();
   private planRefs = new Map<string, MessageRef>();
@@ -392,4 +653,17 @@ export class SessionMessageManager {
     this.messages.delete(sessionId);
     this.planRefs.delete(sessionId);
   }
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+
+async function sendCard(context: TurnContext, card: Record<string, unknown>): Promise<unknown> {
+  const activity = {
+    type: "message",
+    attachments: [CardFactory.adaptiveCard(card)],
+  };
+  if (typeof (context as any).send === "function") {
+    return (context as any).send(activity);
+  }
+  return (context.sendActivity as Function)(activity);
 }
