@@ -81,6 +81,9 @@ export class TeamsAdapter extends MessagingAdapter {
   private _processedActivities = new Map<string, number>();
   private _processedCleanupTimer?: ReturnType<typeof setInterval>;
 
+  /** Per-session typing pulse state (timeout + interval handles) */
+  private _typingPulses = new Map<string, { timeout?: ReturnType<typeof setTimeout>; interval?: ReturnType<typeof setInterval> }>();
+
   /** Messages buffered during assistant initialization — replayed once ready. Capped to prevent unbounded growth. */
   private static readonly MAX_INIT_BUFFER = 50;
   private _assistantInitBuffer: Array<{ sessionId: string; content: OutgoingMessage }> = [];
@@ -220,6 +223,11 @@ export class TeamsAdapter extends MessagingAdapter {
     this._sessionContexts.clear();
     this._sessionOutputModes.clear();
     this._processedActivities.clear();
+    for (const pulse of this._typingPulses.values()) {
+      if (pulse.timeout) clearTimeout(pulse.timeout);
+      if (pulse.interval) clearInterval(pulse.interval);
+    }
+    this._typingPulses.clear();
     this.rateLimiter.destroy();
     this.conversationStore.destroy();
     this.permissionHandler.dispose();
@@ -445,8 +453,24 @@ export class TeamsAdapter extends MessagingAdapter {
           this.composer.cleanup(sessionId);
         }
 
-        // Show typing indicator while the agent processes the message
-        this.sendTyping(context);
+        // Pulse typing indicator after 5s delay, then every 8s until response arrives.
+        // Cleared automatically when handleText/handleThought/etc. fires for a session.
+        const typingPulseKey = sessionId !== "unknown" ? sessionId : threadId;
+        const existingPulse = this._typingPulses.get(typingPulseKey);
+        if (!existingPulse) {
+          const pulseState: { timeout?: ReturnType<typeof setTimeout>; interval?: ReturnType<typeof setInterval> } = {};
+          this._typingPulses.set(typingPulseKey, pulseState);
+          pulseState.timeout = setTimeout(() => {
+            // Use the stored context for this thread
+            const ctx = this._sessionContexts.get(typingPulseKey);
+            if (ctx) this.sendTyping(ctx.context);
+            // Continue pulsing every 8s until cleared
+            pulseState.interval = setInterval(() => {
+              const c = this._sessionContexts.get(typingPulseKey);
+              if (c) this.sendTyping(c.context);
+            }, 8_000);
+          }, 5_000);
+        }
 
         const existingSessionBeforeSend = this.core.sessionManager.getSessionByThread("teams", threadId);
         if (!existingSessionBeforeSend) {
@@ -971,6 +995,16 @@ export class TeamsAdapter extends MessagingAdapter {
     sendActivity(context, { type: "typing" }).catch(() => {});
   }
 
+  /** Clear the typing pulse for a session once a response arrives. */
+  private clearTypingPulse(key: string): void {
+    const pulse = this._typingPulses.get(key);
+    if (pulse) {
+      if (pulse.timeout) clearTimeout(pulse.timeout);
+      if (pulse.interval) clearInterval(pulse.interval);
+      this._typingPulses.delete(key);
+    }
+  }
+
   // ─── Bot token for proactive messaging ────────────────────────────────────
 
   /**
@@ -1199,6 +1233,7 @@ export class TeamsAdapter extends MessagingAdapter {
   // ─── Handler overrides ───────────────────────────────────────────────────
 
   protected async handleThought(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
+    this.clearTypingPulse(sessionId);
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
@@ -1208,6 +1243,7 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleText(sessionId: string, content: OutgoingMessage): Promise<void> {
+    this.clearTypingPulse(sessionId);
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     if (!this.composer.has(sessionId)) this.sendTyping(ctx.context);
@@ -1217,6 +1253,7 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleToolCall(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
+    this.clearTypingPulse(sessionId);
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
@@ -1232,6 +1269,7 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleToolUpdate(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
+    this.clearTypingPulse(sessionId);
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
@@ -1258,6 +1296,7 @@ export class TeamsAdapter extends MessagingAdapter {
   private _planSending = new Set<string>();
 
   protected async handlePlan(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
+    this.clearTypingPulse(sessionId);
     const ctx = this._sessionContexts.get(sessionId);
     const planEntries = (content.metadata as { entries?: PlanEntry[] })?.entries ?? [];
     if (!ctx) return;
@@ -1365,6 +1404,7 @@ export class TeamsAdapter extends MessagingAdapter {
     this._sessionContexts.delete(sessionId);
     this._sessionOutputModes.delete(sessionId);
     this._planSending.delete(sessionId);
+    this.clearTypingPulse(sessionId);
     this.composer.cleanup(sessionId);
   }
 
