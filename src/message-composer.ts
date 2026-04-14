@@ -87,7 +87,6 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           size: "Medium",
           fontType: "Monospace",
           spacing: "None",
-          color: undefined,
         });
         break;
 
@@ -99,7 +98,6 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
             {
               type: "TextBlock",
               text: `🔄 ${escapeMd(entry.toolName)}…  (${elapsed})`,
-              color: undefined,
               hexColor: BRAND.blue,
               weight: "Bolder",
               size: "Small",
