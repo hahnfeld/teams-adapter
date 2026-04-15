@@ -351,8 +351,8 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       // Build options for notification channel selection
       const existingNotifChannel = (current.notificationChannelId as string | null) ?? null;
       const notifMethodOptions = [
-        { value: "link", label: "Paste a channel link (easiest)", hint: "Right-click channel → Get link" },
-        { value: "manual", label: "Enter channel ID manually", hint: existingNotifChannel ? `Current: ${existingNotifChannel.slice(0, 20)}...` : "" },
+        { value: "link", label: "Paste a channel link (easiest)", hint: "Right-click channel → Get link", default: !existingNotifChannel },
+        { value: "manual", label: "Enter channel ID manually", hint: existingNotifChannel ? `Current: ${existingNotifChannel.slice(0, 20)}...` : "", default: !!existingNotifChannel },
         { value: "none", label: "No notification channel", hint: "Don't set up a notification channel" },
       ];
       const notifMethod = await terminal.select({
@@ -709,8 +709,8 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         case "notifications": {
           const existingNotif = (current.notificationChannelId as string | null) ?? null;
           const notifOptions = [
-            { value: "link", label: "Paste a channel link (easiest)", hint: "Right-click channel → Get link" },
-            { value: "manual", label: "Enter channel ID manually", hint: existingNotif ? `Current: ${existingNotif.slice(0, 20)}...` : "" },
+            { value: "link", label: "Paste a channel link (easiest)", hint: "Right-click channel → Get link", default: !existingNotif },
+            { value: "manual", label: "Enter channel ID manually", hint: existingNotif ? `Current: ${existingNotif.slice(0, 20)}...` : "", default: !!existingNotif },
             { value: "none", label: "No notification channel", hint: "Don't use a notification channel" },
           ];
           const method = await terminal.select({
