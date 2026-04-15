@@ -719,7 +719,7 @@ export class TeamsAdapter extends MessagingAdapter {
    * Runs async without blocking the invoke response.
    */
   private createSessionInBackground(context: any, agentName: string, workspace: string): void {
-    const conversationId = context.activity.conversation?.id as string | undefined;
+    const conversationId = (context.activity.conversation?.id as string | undefined)?.split(";")[0];
     (async () => {
       try {
         // Use core.createSession (not sessionManager.createSession) so the
