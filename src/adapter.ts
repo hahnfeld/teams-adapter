@@ -1244,7 +1244,7 @@ export class TeamsAdapter extends MessagingAdapter {
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     this.ensureSessionTitle(sessionId, msg);
-    const summary = content.text?.split("\n")[0]?.slice(0, 300) || "Thinking...";
+    const summary = content.text?.split("\n")[0] || "";
     msg.addThought(summary);
   }
 

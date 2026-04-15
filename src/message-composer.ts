@@ -54,8 +54,7 @@ const BRAND = {
 
 type BodyEntry =
   | { id: string; kind: "title"; text: string }
-  | { id: string; kind: "tool-start"; toolName: string; params?: string; startedAt: number; children: TextChild[] }
-  | { id: string; kind: "tool-result"; toolName: string; result: string; startedAt: number; endedAt: number; children: TextChild[] }
+  | { id: string; kind: "tool"; toolName: string; startedAt: number; result?: string; endedAt?: number; children: TextChild[] }
   | { id: string; kind: "text"; text: string }
   | { id: string; kind: "thought"; text: string }
   | { id: string; kind: "usage"; text: string }
@@ -90,61 +89,45 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
         });
         break;
 
-      case "tool-start": {
-        const elapsed = formatElapsed(now - entry.startedAt);
+      case "tool": {
+        const elapsed = entry.result
+          ? formatElapsed((entry.endedAt ?? entry.startedAt) - entry.startedAt)
+          : formatElapsed(now - entry.startedAt);
         blocks.push({
           type: "Container",
           items: [
             {
               type: "TextBlock",
-              text: `🔄 ${escapeMd(entry.toolName)}…  (${elapsed})`,
-              hexColor: BRAND.blue,
-              weight: "Bolder",
+              text: entry.result
+                ? `🔧 ${escapeMd(entry.toolName)}`
+                : `🔧 ${escapeMd(entry.toolName)}…  (${elapsed})`,
               size: "Small",
               fontType: "Monospace",
               spacing: "None",
             },
+            // Result: indented with L-shaped bar
+            ...(entry.result
+              ? [{
+                  type: "TextBlock" as const,
+                  text: `\u00A0\u00A0⎿ ${escapeMd(entry.result)}  (${elapsed})`,
+                  size: "Small" as const,
+                  fontType: "Monospace",
+                  wrap: true,
+                  spacing: "None",
+                }]
+              : []),
+            // Children: further indented
             ...entry.children.map((c) => ({
               type: "TextBlock",
-              text: `    ${c.text}`,
+              text: `\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0${c.text}`,
               size: "Small",
-              hexColor: BRAND.cyan,
-              fontType: "Monospace",
-              spacing: "None",
-            })),
-          ],
-          style: "emphasis",
-          padding: "Small",
-        });
-        break;
-      }
-
-      case "tool-result": {
-        const elapsed = formatElapsed(entry.endedAt - entry.startedAt);
-        blocks.push({
-          type: "Container",
-          items: [
-            {
-              type: "TextBlock",
-              text: `📄 ${escapeMd(entry.result)}  (${elapsed})`,
-              hexColor: BRAND.purple,
-              weight: "Bolder",
-              size: "Small",
-              fontType: "Monospace",
-              spacing: "None",
-            },
-            ...entry.children.map((c) => ({
-              type: "TextBlock",
-              text: `    ${c.text}`,
-              size: "Small",
-              hexColor: BRAND.textDefault,
               fontType: "Monospace",
               wrap: true,
               spacing: "None",
             })),
           ],
-          style: "good",
           padding: "Small",
+          width: "stretch",
         });
         break;
       }
@@ -154,7 +137,6 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           type: "TextBlock",
           text: entry.text,
           size: "Small",
-          hexColor: BRAND.textDefault,
           fontType: "Monospace",
           wrap: true,
           spacing: "None",
@@ -164,11 +146,11 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
       case "thought":
         blocks.push({
           type: "TextBlock",
-          text: `💭 ${entry.text}`,
+          text: entry.text,
           italic: true,
           size: "Small",
-          hexColor: BRAND.textMuted,
           fontType: "Monospace",
+          wrap: true,
           spacing: "None",
         });
         break;
@@ -179,7 +161,6 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           text: `*${escapeMd(entry.text)}*`,
           italic: true,
           size: "Small",
-          hexColor: BRAND.blue,
           fontType: "Monospace",
           spacing: "None",
         });
@@ -190,7 +171,6 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           type: "TextBlock",
           text: "─".repeat(30),
           size: "Small",
-          hexColor: BRAND.textMuted,
           fontType: "Monospace",
           spacing: "None",
         });
@@ -274,7 +254,7 @@ export class SessionMessage {
   addToolStart(toolName: string, _params?: string): string {
     const id = nextId();
     const startedAt = Date.now();
-    this.entries.push({ id, kind: "tool-start", toolName, startedAt, children: [] });
+    this.entries.push({ id, kind: "tool", toolName, startedAt, children: [] });
     this.toolActive = id;
     this.resetStallTimer();
     this.startTickInterval();
@@ -283,30 +263,24 @@ export class SessionMessage {
   }
 
   /**
-   * Add a tool-result entry (📄 Result...). Creates a NEW entry — does NOT
-   * replace the tool-progress entry. Both coexist as historical record.
-   * Clears toolActive so subsequent addText() goes to root body.
+   * Append result to the tool entry (transforms it from running to complete).
+   * Subsequent text goes to the same entry's children.
    */
   addToolResult(id: string, result: string): void {
-    const progressEntry = this.entries.find((e) => e.id === id);
-    if (!progressEntry || progressEntry.kind !== "tool-start") {
-      // Progress entry not found — create a standalone result
+    const entry = this.entries.find((e) => e.id === id);
+    if (!entry || entry.kind !== "tool") {
+      // Entry not found — create a standalone tool entry
       const startedAt = Date.now();
-      this.entries.push({ id: nextId(), kind: "tool-result", toolName: "", result, startedAt, endedAt: startedAt, children: [] });
+      this.entries.push({ id: nextId(), kind: "tool", toolName: "", startedAt, result, endedAt: startedAt, children: [] });
       this.toolActive = null;
       this.stopTickInterval();
       this.requestFlush();
       return;
     }
 
-    const startedAt = progressEntry.startedAt;
-    const endedAt = Date.now();
-    const children = [...progressEntry.children];
-
-    // Keep the tool-start as historical record; add tool-result after it
-    this.entries.push({ id: nextId(), kind: "tool-result", toolName: progressEntry.toolName, result, startedAt, endedAt, children });
-
-    if (this.toolActive === id) this.toolActive = null;
+    entry.result = result;
+    entry.endedAt = Date.now();
+    this.toolActive = null; // Subsequent text goes to root level
     this.stopTickInterval();
     this.requestFlush();
   }
@@ -317,7 +291,7 @@ export class SessionMessage {
 
     if (this.toolActive) {
       const entry = this.findEntry(this.toolActive);
-      if (entry && (entry.kind === "tool-start" || entry.kind === "tool-result")) {
+      if (entry && entry.kind === "tool") {
         entry.children.push({ text });
         this.resetStallTimer();
         this.requestFlush();
@@ -341,11 +315,19 @@ export class SessionMessage {
   }
 
   /**
-   * Always append a new thought entry (thoughts persist, never replaced).
-   * Multiple thinking blocks can coexist — each is a historical record.
+   * Append text to the last thought entry, or create a new one if none exists.
+   * If text starts with "Thinking..." and it's a fresh entry, wrap with newlines.
+   * Subsequent chunks are appended as plain text with no bubble prefix.
    */
   addThought(text: string): void {
-    this.entries.push({ id: nextId(), kind: "thought", text });
+    const thoughts = this.entries.filter((e) => e.kind === "thought");
+    const last = thoughts[thoughts.length - 1];
+    if (last) {
+      // Add a space between consecutive chunks so they don't run together
+      last.text += ` ${text}`;
+    } else {
+      this.entries.push({ id: nextId(), kind: "thought", text });
+    }
     this.requestFlush();
   }
 
@@ -390,7 +372,7 @@ export class SessionMessage {
     if (this.tickInterval) return;
     this.tickInterval = setInterval(() => {
       // Only tick if there's an active tool-progress entry
-      const hasRunningTool = this.entries.some((e) => e.kind === "tool-start");
+      const hasRunningTool = this.entries.some((e) => e.kind === "tool" && !e.result);
       if (!hasRunningTool) {
         this.stopTickInterval();
         return;
@@ -510,7 +492,7 @@ export class SessionMessage {
     this.stallTimer = setTimeout(() => {
       const hasContent = this.entries.some(
         (e) => (e.kind === "text" && e.text.length > 0) ||
-               (e.kind === "tool-start" && e.children.length > 0),
+               (e.kind === "tool" && e.children.length > 0),
       );
       const hasUsage = this.entries.some((e) => e.kind === "usage");
       if (hasContent && !hasUsage) {
