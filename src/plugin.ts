@@ -199,7 +199,6 @@ export default function createTeamsPlugin(): OpenACPPlugin {
 
         botAppId = await terminal.text({
           message: "Bot App ID:",
-          defaultValue: botAppId,
           validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
         });
         botAppId = botAppId.trim();
@@ -288,12 +287,18 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           "Finding Team & Channel IDs",
         );
 
+        const hasExistingChannel = !!current.channelId;
         const method = await terminal.select({
           message: "How to provide Team and Channel IDs?",
-          options: [
-            { value: "link", label: "Paste a channel link (easiest)", hint: "Right-click channel → Get link" },
-            { value: "manual", label: "Enter IDs manually" },
-          ],
+          options: ([
+            { value: "link", label: "Paste a channel link (easiest)", hint: "Right-click channel → Get link", default: !hasExistingChannel },
+            {
+              value: "manual",
+              label: "Enter IDs manually",
+              hint: hasExistingChannel ? `Current: ${(current.channelId as string).slice(0, 20)}...` : undefined,
+              default: hasExistingChannel,
+            },
+          ] as any),
         });
 
         if (method === "link") {
@@ -625,7 +630,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         case "credentials": {
           const appId = await terminal.text({
             message: "Bot App ID:",
-            defaultValue: (current.botAppId as string) ?? "",
+            ...((current.botAppId as string) ? { initialValue: current.botAppId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }) as any,
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           const password = await terminal.password({
@@ -656,7 +661,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         case "tenant": {
           const tid = await terminal.text({
             message: "Tenant ID (GUID, or 'botframework.com' for multi-tenant):",
-            defaultValue: (current.tenantId as string) ?? "",
+            ...((current.tenantId as string) ? { initialValue: current.tenantId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }) as any,
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           await settings.set("tenantId", tid.trim());
@@ -667,12 +672,12 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         case "team": {
           const tid = await terminal.text({
             message: "Team ID:",
-            defaultValue: (current.teamId as string) ?? "",
+            ...((current.teamId as string) ? { initialValue: current.teamId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }) as any,
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           const cid = await terminal.text({
             message: "Channel ID:",
-            defaultValue: (current.channelId as string) ?? "",
+            ...((current.channelId as string) ? { initialValue: current.channelId as string } : { placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }) as any,
             validate: (v) => (!v.trim() ? "Cannot be empty" : undefined),
           });
           const newChannelId = cid.trim();
@@ -687,7 +692,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
         case "botPort": {
           const portInput = await terminal.text({
             message: `Bot port (Bot Framework HTTP server, default ${DEFAULT_BOT_PORT}):`,
-            defaultValue: String((current.botPort as number) ?? DEFAULT_BOT_PORT),
+            ...((current.botPort as number) ? { initialValue: String(current.botPort as number) } : {}) as any,
             validate: (v) => {
               const n = Number(v.trim());
               if (isNaN(n) || !Number.isInteger(n) || n < 1 || n > 65535) return "Port must be 1–65535";
