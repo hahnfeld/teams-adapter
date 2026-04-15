@@ -425,16 +425,22 @@ export class SessionMessage {
 
   // ─── Flush / Rate limiting ─────────────────────────────────────────────────
 
+  private flushTimer?: ReturnType<typeof setTimeout>;
+
   private requestFlush(): void {
-    const card = this.buildCard();
-    const key = this.ref ? `update:${this.ref.activityId}` : `new:${this.sessionId}`;
-    this.rateLimiter.enqueue(
-      this.conversationId,
-      () => this.flush(),
-      key,
-    ).catch((err) => {
-      log.warn({ err, sessionId: this.sessionId }, "[SessionMessage] flush failed");
-    });
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      const card = this.buildCard();
+      const key = this.ref ? `update:${this.ref.activityId}` : `new:${this.sessionId}`;
+      this.rateLimiter.enqueue(
+        this.conversationId,
+        () => this.flush(),
+        key,
+      ).catch((err) => {
+        log.warn({ err, sessionId: this.sessionId }, "[SessionMessage] flush failed");
+      });
+    }, 500);
   }
 
   private async flush(): Promise<void> {
