@@ -289,7 +289,10 @@ export class TeamsAdapter extends MessagingAdapter {
       // Use conversation.id as the thread discriminator — NOT activity.channelId
       // which is always "msteams" for Teams. Conversation ID uniquely identifies
       // the 1:1, group chat, or channel thread the message came from.
-      const conversationId = String(context.activity.conversation?.id ?? "unknown");
+      // conversation.id may include a messageid suffix when received via group chat
+      // or channel (e.g. "19:xxx@thread.tacv2;messageid=1776214235066"). Strip it before
+      // checking the allowlist so the bare thread ID matches what's stored in config.
+      const conversationId = String(context.activity.conversation?.id ?? "unknown").split(";")[0];
       const threadId = conversationId;
 
       // Security: only respond in configured channels
