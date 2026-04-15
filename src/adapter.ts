@@ -598,7 +598,7 @@ export class TeamsAdapter extends MessagingAdapter {
             return;
           }
           // Verify the action came from the session's conversation
-          const conversationId = context.activity.conversation?.id;
+          const conversationId = (context.activity.conversation?.id as string | undefined)?.split(";")[0];
           const sessionThread = session.threadIds.get("teams");
           if (sessionThread && conversationId && sessionThread !== conversationId) {
             log.warn({ sessionId, conversationId, sessionThread }, "[TeamsAdapter] om: conversation mismatch");
@@ -618,7 +618,7 @@ export class TeamsAdapter extends MessagingAdapter {
         const session = this.core.sessionManager.getSession(sessionId);
         if (session) {
           // Verify the action came from the session's conversation
-          const conversationId = context.activity.conversation?.id;
+          const conversationId = (context.activity.conversation?.id as string | undefined)?.split(";")[0];
           const sessionThread = session.threadIds.get("teams");
           if (sessionThread && conversationId && sessionThread !== conversationId) {
             log.warn({ sessionId, conversationId, sessionThread }, "[TeamsAdapter] cancel: conversation mismatch");
@@ -672,7 +672,7 @@ export class TeamsAdapter extends MessagingAdapter {
         const replyToId = context.activity.replyToId as string | undefined;
         const userId = context.activity.from?.id ?? "unknown";
         const userName = context.activity.from?.name;
-        const conversationId = context.activity.conversation?.id;
+        const conversationId = (context.activity.conversation?.id as string | undefined)?.split(";")[0];
 
         if (added?.length) {
           for (const reaction of added) {

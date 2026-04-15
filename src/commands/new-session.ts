@@ -44,7 +44,7 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
   try {
     await ctx.reply(`🔄 Creating session with **${agentName}**...`);
 
-    const conversationId = ctx.context.activity?.conversation?.id as string | undefined;
+    const conversationId = (ctx.context.activity?.conversation?.id as string | undefined)?.split(";")[0];
     const session = await (ctx.adapter.core as any).createSession({
       channelId: "teams",
       agentName,
@@ -91,7 +91,7 @@ export async function handleNewChat(ctx: CommandContext): Promise<void> {
   try {
     await ctx.reply(`🔄 Starting new chat with **${agentName}**...`);
 
-    const conversationId = ctx.context.activity?.conversation?.id as string | undefined;
+    const conversationId = (ctx.context.activity?.conversation?.id as string | undefined)?.split(";")[0];
     const newSession = await (ctx.adapter.core as any).createSession({
       channelId: "teams",
       agentName,
