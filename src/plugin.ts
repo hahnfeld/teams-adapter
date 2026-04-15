@@ -494,7 +494,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       );
 
       const tunnelOptions = [
-        { value: "devtunnel", label: "@hahnfeld/devtunnel-provider (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
+        { value: "devtunnel", label: "@hahnfeld/devtunnel-provider or @hahnfeld/msrelay-provider (Recommended)", hint: "Microsoft Dev Tunnels or msrelay — persistent URLs" },
         { value: "builtin", label: "Built-in tunnel service", hint: "Uses the system tunnel service if available" },
         { value: "manual", label: "Manual", hint: "I'll set up my own tunnel (ngrok, cloudflared, etc.)" },
       ];
@@ -571,8 +571,9 @@ export default function createTeamsPlugin(): OpenACPPlugin {
       let tunnelStep: string;
       if (tunnelMethod === "devtunnel") {
         tunnelStep =
-          `  2. Install the Dev Tunnels plugin:\n` +
+          `  2. Install a tunnel plugin:\n` +
           "     openacp plugin install @hahnfeld/devtunnel-provider\n" +
+          "     or @hahnfeld/msrelay-provider\n" +
           `     It will automatically tunnel port ${botPort} with a persistent URL.`;
       } else if (tunnelMethod === "builtin") {
         tunnelStep =
@@ -766,7 +767,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           const method = await terminal.select({
             message: "How should the bot port be tunneled?",
             options: [
-              { value: "devtunnel", label: "@hahnfeld/devtunnel-provider (Recommended)", hint: "Microsoft Dev Tunnels — persistent URLs" },
+              { value: "devtunnel", label: "@hahnfeld/devtunnel-provider or @hahnfeld/msrelay-provider (Recommended)", hint: "Microsoft Dev Tunnels or msrelay — persistent URLs" },
               { value: "builtin", label: "Built-in tunnel service", hint: "Uses the system tunnel service if available" },
               { value: "manual", label: "Manual", hint: "I'll set up my own tunnel (ngrok, cloudflared, etc.)" },
             ],
@@ -774,7 +775,7 @@ export default function createTeamsPlugin(): OpenACPPlugin {
           await settings.set("tunnelMethod", method);
           terminal.log.success(`Tunnel method: ${method === "builtin" ? "built-in (auto-create)" : method === "devtunnel" ? "devtunnel plugin" : "manual"}`);
           if (method === "devtunnel") {
-            terminal.log.info("Install with: openacp plugin install @hahnfeld/devtunnel-provider");
+            terminal.log.info("Install with: openacp plugin install @hahnfeld/devtunnel-provider (or @hahnfeld/msrelay-provider)");
           }
           break;
         }
