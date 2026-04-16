@@ -69,9 +69,9 @@ export function escapeMd(text: string): string {
 }
 
 const PLAN_STATUS_ICONS: Record<string, string> = {
-  completed: "✅",
-  in_progress: "🔄",
-  pending: "⏳",
+  completed: "✓",
+  in_progress: "◼",
+  pending: "◻",
 };
 
 // ─── Adaptive Card Builder ────────────────────────────────────────────────────
@@ -199,9 +199,11 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
         break;
 
       case "plan": {
-        const lines = entry.entries.map((e, i) =>
-          `${PLAN_STATUS_ICONS[e.status] || "⏳"} ${i + 1}. ${escapeMd(e.content)}`,
-        );
+        const lines = entry.entries.map((e, i) => {
+          const icon = PLAN_STATUS_ICONS[e.status] || "◻";
+          const text = e.status === "completed" ? `~~${escapeMd(e.content)}~~` : escapeMd(e.content);
+          return `${icon} ${i + 1}. ${text}`;
+        });
         blocks.push({
           type: "TextBlock",
           text: `📋 Plan\n${lines.join("\n")}`,
