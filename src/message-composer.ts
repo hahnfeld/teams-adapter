@@ -764,14 +764,28 @@ export class SessionMessage {
       .map((e) => (e as { kind: "text"; text: string }).text)
       .join("");
 
-    // Update the old card with only the kept entries (no overflow)
+    // Update the old card with only the kept entries (no overflow).
+    // Capture the old ref before nulling it — the rate limiter closure
+    // must use the old ref, not whatever this.ref points to later.
     this.entries = keep;
-    if (this.ref) {
+    const oldRef = this.ref;
+    if (oldRef) {
       const card = this.buildCard();
       this.rateLimiter.enqueue(
         this.conversationId,
-        () => this.updateCardViaRest(card).then(() => {}),
-        `update:${this.ref.activityId}`,
+        async () => {
+          const token = await this.acquireBotToken();
+          if (!token) return;
+          const url = `${oldRef.serviceUrl}/v3/conversations/${encodeURIComponent(oldRef.conversationId)}/activities/${encodeURIComponent(oldRef.activityId)}`;
+          try {
+            await fetch(url, {
+              method: "PUT",
+              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+              body: JSON.stringify({ type: "message", attachments: [CardFactory.adaptiveCard(card)] }),
+            });
+          } catch { /* best effort */ }
+        },
+        `update:${oldRef.activityId}`,
       ).catch(() => {});
     }
 

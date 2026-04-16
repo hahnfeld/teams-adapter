@@ -1228,18 +1228,20 @@ export class TeamsAdapter extends MessagingAdapter {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const meta = content.metadata as { tokensUsed?: number; contextSize?: number; cost?: number; duration?: number } | undefined;
-    if (meta?.tokensUsed != null) {
-      const msg = this.composer.getOrCreate(sessionId, ctx.context);
-      const parts: string[] = [];
-      parts.push(`${formatTokens(meta.tokensUsed)} tokens`);
-      if (meta.duration != null) parts.push(`${(meta.duration / 1000).toFixed(1)}s`);
-      if (meta.cost != null) parts.push(`$${meta.cost.toFixed(4)}`);
-      parts.push("Done");
-      msg.setUsage(parts.join(" · "));
-    }
-    // Usage is the last event of a prompt turn — finalize the card so
-    // the next turn gets a fresh one.
+    if (meta?.tokensUsed == null) return; // No usage data — let handleSessionEnd finalize
+
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    const parts: string[] = [];
+    parts.push(`${formatTokens(meta.tokensUsed)} tokens`);
+    if (meta.duration != null) parts.push(`${(meta.duration / 1000).toFixed(1)}s`);
+    if (meta.cost != null) parts.push(`$${meta.cost.toFixed(4)}`);
+    parts.push("Done");
+    msg.setUsage(parts.join(" · "));
+
+    // Usage is the last event of a prompt turn — finalize the card and
+    // clean up session state so the next turn gets a fresh start.
     await this.composer.finalize(sessionId);
+    this.cleanupSessionState(sessionId);
   }
 
   /**
