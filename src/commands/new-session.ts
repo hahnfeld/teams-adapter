@@ -1,6 +1,7 @@
 import type { CommandContext } from "./index.js";
 import { log } from "@openacp/plugin-sdk";
 import { sendCard } from "../send-utils.js";
+import { buildLevel1 } from "../message-composer.js";
 
 /**
  * Handle /new [agent] [workspace] — create a new agent session.
@@ -11,9 +12,17 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
   const workspace = args[1];
 
   if (!agentName) {
+    // Cancel the old session before showing the wizard
+    if (ctx.sessionId) {
+      await ctx.adapter["composer"].finalize(ctx.sessionId);
+      const oldSession = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
+      if (oldSession) {
+        try { await oldSession.destroy(); } catch { /* best effort */ }
+      }
+    }
+
     // Send the session wizard inline as an Adaptive Card.
-    // Task modules (task/fetch popups) don't work reliably for sideloaded apps,
-    // so we render the wizard directly in the chat.
+    // Uses the same Container + ColumnSet pattern as all other card entries.
     const agents = ctx.adapter.core.agentManager.getAvailableAgents();
     const defaultWorkspace = ctx.adapter.core.configManager.resolveWorkspace?.() ?? process.cwd();
     const agentChoices = agents.map((a: { name: string }) => ({ title: a.name, value: a.name }));
@@ -24,16 +33,45 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
       type: "AdaptiveCard",
       version: "1.4",
       body: [
-        { type: "TextBlock", text: "**New Session**", weight: "Bolder", size: "Large" },
-        { type: "TextBlock", text: "Select an agent and workspace to start a coding session.", wrap: true, isSubtle: true, spacing: "Small" },
-        { type: "TextBlock", text: "Agent", weight: "Bolder", spacing: "Large" },
-        { type: "Input.ChoiceSet", id: "agent", style: "compact", value: agentChoices[0].value, choices: agentChoices },
-        { type: "TextBlock", text: "Workspace (project directory)", weight: "Bolder", spacing: "Large" },
-        { type: "Input.Text", id: "workspace", placeholder: "/path/to/project", value: defaultWorkspace },
+        {
+          type: "Container",
+          spacing: "Small",
+          items: [
+            buildLevel1("➕", "New Session"),
+            {
+              type: "ColumnSet",
+              spacing: "None",
+              columns: [
+                { type: "Column", width: "20px" },
+                {
+                  type: "Column",
+                  width: "auto",
+                  items: [{ type: "TextBlock", text: "⎿", size: "Small", fontType: "Monospace", spacing: "None" }],
+                  verticalContentAlignment: "Top",
+                },
+                {
+                  type: "Column",
+                  width: "stretch",
+                  items: [
+                    { type: "TextBlock", text: "Agent", size: "Small", fontType: "Monospace", spacing: "None" },
+                    { type: "Input.ChoiceSet", id: "agent", style: "compact", value: agentChoices[0].value, choices: agentChoices, spacing: "None" },
+                    { type: "TextBlock", text: "Workspace", size: "Small", fontType: "Monospace", spacing: "Small" },
+                    { type: "Input.Text", id: "workspace", placeholder: "/path/to/project", value: defaultWorkspace, spacing: "None" },
+                  ],
+                },
+              ],
+            },
+            {
+              type: "ActionSet",
+              spacing: "Small",
+              actions: [
+                { type: "Action.Execute", title: "Create Session", verb: "dialog:new-session" },
+              ],
+            },
+          ],
+        },
       ],
-      actions: [
-        { type: "Action.Execute", title: "Create Session", verb: "dialog:new-session" },
-      ],
+      width: "stretch",
     };
     await sendCard(ctx.context, card as Record<string, unknown>);
     return;
@@ -42,6 +80,15 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
   const workDir = workspace ?? ctx.adapter.core.configManager.resolveWorkspace?.() ?? process.cwd();
 
   try {
+    // Cancel the old session before creating a new one
+    if (ctx.sessionId) {
+      await ctx.adapter["composer"].finalize(ctx.sessionId);
+      const oldSession = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
+      if (oldSession) {
+        try { await oldSession.destroy(); } catch { /* best effort */ }
+      }
+    }
+
     await ctx.reply(`🔄 Creating session with **${agentName}**...`);
 
     const conversationId = (ctx.context.activity?.conversation?.id as string | undefined)?.split(";")[0];
@@ -89,6 +136,10 @@ export async function handleNewChat(ctx: CommandContext): Promise<void> {
   const workspace = session.workingDirectory;
 
   try {
+    // Cancel the old session before creating a new one
+    await ctx.adapter["composer"].finalize(ctx.sessionId);
+    try { await session.destroy(); } catch { /* best effort */ }
+
     await ctx.reply(`🔄 Starting new chat with **${agentName}**...`);
 
     const conversationId = (ctx.context.activity?.conversation?.id as string | undefined)?.split(";")[0];

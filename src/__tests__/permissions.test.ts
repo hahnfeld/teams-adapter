@@ -86,9 +86,10 @@ describe("PermissionHandler", () => {
         "req-1",
       );
       expect(result).toBe(true);
-      expect(mockSendActivity).toHaveBeenCalledWith(
-        expect.objectContaining({ text: expect.stringContaining("expired") }),
-      );
+      expect(mockSendActivity).toHaveBeenCalledTimes(1);
+      // Now sends an Adaptive Card instead of plain text
+      const call = mockSendActivity.mock.calls[0][0];
+      expect(call.attachments).toHaveLength(1);
     });
 
     it("resolves permission and updates card on valid action", async () => {
@@ -120,9 +121,11 @@ describe("PermissionHandler", () => {
         sendContext as any,
       );
 
-      // Extract the callback key from the card action data
+      // Extract the callback key from the ActionSet inside the Container
       const cardData = mockSendActivity.mock.calls[0][0].attachments[0].content;
-      const allowAction = cardData.actions.find((a: any) => a.data.verb === "allow");
+      const container = cardData.body[0];
+      const actionSet = container.items.find((i: any) => i.type === "ActionSet");
+      const allowAction = actionSet.actions.find((a: any) => a.data.verb === "allow");
       const callbackKey = allowAction.data.callbackKey;
 
       // Now handle the card action

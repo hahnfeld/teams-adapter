@@ -2,38 +2,20 @@ import type { TurnContext } from "@microsoft/agents-hosting";
 import { nanoid } from "nanoid";
 import type { PermissionRequest, NotificationMessage, Session } from "@openacp/plugin-sdk";
 import { log } from "@openacp/plugin-sdk";
-import { sendCard, sendText, updateActivity, adaptiveCardAttachment } from "./send-utils.js";
+import { sendCard, updateActivity, adaptiveCardAttachment } from "./send-utils.js";
+import { buildLevel1, buildLevel2, escapeMd } from "./message-composer.js";
 
 interface PendingPermission {
   sessionId: string;
   requestId: string;
-  options: { id: string; isAllow: boolean }[];
+  description: string;
+  options: { id: string; label: string; isAllow: boolean }[];
   activityId?: string;
   conversationId?: string;
   createdAt: number;
 }
 
-/** Try to extract a tool/action name from the permission description text */
-function parseDescriptionContext(description: string): { tool?: string; target?: string; risk: "high" | "normal" } {
-  let tool: string | undefined;
-  let target: string | undefined;
-  let risk: "high" | "normal" = "normal";
-
-  // Common patterns: "Allow Read /path/to/file", "Execute: bash command", "Edit src/foo.ts"
-  const toolMatch = description.match(/^(Read|Write|Edit|Execute|Bash|Delete|Install|Command|Fetch|Search|Agent)\b/i);
-  if (toolMatch) tool = toolMatch[1];
-
-  // Extract file paths
-  const pathMatch = description.match(/[`"]?([/~][\w./\-@]+|[a-zA-Z]:\\[\w\\.\-]+)[`"]?/);
-  if (pathMatch) target = pathMatch[1];
-
-  // High-risk keywords
-  if (/\b(delete|remove|drop|rm\b|force|sudo|--hard|--force|push)\b/i.test(description)) {
-    risk = "high";
-  }
-
-  return { tool, target, risk };
-}
+// ─── PermissionHandler ────────────────────────────────────────────────────────
 
 export class PermissionHandler {
   private pending: Map<string, PendingPermission> = new Map();
@@ -44,7 +26,6 @@ export class PermissionHandler {
     private getSession: (sessionId: string) => Session | undefined,
     private sendNotification: (notification: NotificationMessage) => Promise<void>,
   ) {
-    // Periodically evict stale pending permissions even when idle
     this._evictionTimer = setInterval(() => this.evictStale(true), 5 * 60 * 1000);
     this._evictionTimer.unref();
   }
@@ -83,66 +64,39 @@ export class PermissionHandler {
     this.pending.set(callbackKey, {
       sessionId: session.id,
       requestId: request.id,
-      options: request.options.map((o) => ({ id: o.id, isAllow: o.isAllow })),
+      description: request.description,
+      options: request.options.map((o) => ({ id: o.id, label: o.label, isAllow: o.isAllow })),
       activityId: context.activity.id as string | undefined,
       conversationId: context.activity.conversation?.id as string | undefined,
       createdAt: now,
     });
     this.pendingTimestamps.set(callbackKey, now);
 
-    const { tool, target, risk } = parseDescriptionContext(request.description);
-    const headerColor = risk === "high" ? "Attention" : "Warning";
-
-    // Build rich permission card (Adaptive Card v1.2 for mobile compatibility)
-    const body: unknown[] = [
-      // Header with risk-colored icon
-      {
-        type: "ColumnSet",
-        columns: [
-          { type: "Column", width: "auto", items: [{ type: "TextBlock", text: risk === "high" ? "⚠️" : "🔐", size: "Large" }] },
-          {
-            type: "Column", width: "stretch", items: [
-              { type: "TextBlock", text: "Permission Request", weight: "Bolder", size: "Medium", color: headerColor },
-              ...(session.name ? [{ type: "TextBlock", text: session.name, size: "Small", isSubtle: true, spacing: "None" }] : []),
-            ],
-          },
-        ],
-      },
-      // Description
-      { type: "TextBlock", text: request.description, wrap: true, spacing: "Medium" },
-    ];
-
-    // Context facts (tool, target)
-    const facts: Array<{ title: string; value: string }> = [];
-    if (tool) facts.push({ title: "Action", value: tool });
-    if (target) facts.push({ title: "Target", value: target });
-    if (facts.length > 0) {
-      body.push({ type: "FactSet", facts, spacing: "Small" });
-    }
-
-    // Risk warning for destructive operations
-    if (risk === "high") {
-      body.push({
-        type: "TextBlock",
-        text: "⚠️ This action may be destructive or hard to reverse.",
-        color: "Attention",
-        size: "Small",
-        wrap: true,
-        spacing: "Medium",
-      });
-    }
-
+    // Build permission card matching the info Container style
     const card = {
       type: "AdaptiveCard" as const,
-      version: "1.2" as const,
-      body,
-      // Action.Submit sends activity.value as the flat data object
-      actions: request.options.map((option) => ({
-        type: "Action.Submit" as const,
-        title: `${option.isAllow ? "✅" : "❌"} ${option.label}`,
-        ...(risk === "high" && !option.isAllow ? { style: "destructive" } : {}),
-        data: { verb: option.isAllow ? "allow" : "deny", sessionId: session.id, callbackKey, requestId: request.id },
-      })),
+      version: "1.4" as const,
+      body: [
+        {
+          type: "Container",
+          spacing: "Small",
+          items: [
+            buildLevel1("🔐", "Permission"),
+            buildLevel2(request.description),
+            // Option buttons — inline ActionSet (smaller than top-level actions)
+            {
+              type: "ActionSet",
+              spacing: "Small",
+              actions: request.options.map((option) => ({
+                type: "Action.Submit" as const,
+                title: `${option.isAllow ? "✅" : "❌"} ${option.label}`,
+                data: { verb: option.isAllow ? "allow" : "deny", sessionId: session.id, callbackKey, requestId: request.id },
+              })),
+            },
+          ],
+        },
+      ],
+      width: "stretch",
     };
 
     try {
@@ -179,9 +133,22 @@ export class PermissionHandler {
 
     const pending = this.pending.get(callbackKey);
     if (!pending) {
-      // Update the original card to show expired state
       try {
-        await sendText(context, "❌ Permission request expired or already responded to.");
+        // Show expired as an info-style card
+        const card = {
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: [{
+            type: "Container",
+            spacing: "Small",
+            items: [
+              buildLevel1("🔐", "Permission"),
+              buildLevel2("Expired or already responded to"),
+            ],
+          }],
+          width: "stretch",
+        };
+        await sendCard(context, card);
       } catch (err) {
         log.warn({ err, callbackKey }, "[PermissionHandler] Failed to send expired message");
       }
@@ -209,42 +176,28 @@ export class PermissionHandler {
     this.pending.delete(callbackKey);
     this.pendingTimestamps.delete(callbackKey);
 
-    // Update the original card to show the response with who/when
+    // Update the original card to show the resolved state
     if (pending.activityId && pending.conversationId) {
       try {
         const decision = verb === "always" ? "Always Allowed" : verb === "allow" ? "Allowed" : "Denied";
-        const decisionColor = verb === "deny" ? "Attention" : "Good";
         const decisionIcon = verb === "deny" ? "❌" : "✅";
+        const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.round(elapsed / 60)}m`;
 
         const updatedCard = {
           type: "AdaptiveCard" as const,
-          version: "1.2" as const,
-          body: [
-            {
-              type: "ColumnSet",
-              columns: [
-                { type: "Column", width: "auto", items: [{ type: "TextBlock", text: decisionIcon, size: "Large" }] },
-                {
-                  type: "Column", width: "stretch", items: [
-                    { type: "TextBlock", text: `Permission — ${decision}`, weight: "Bolder", color: decisionColor },
-                  ],
-                },
-              ],
-            },
-            {
-              type: "FactSet",
-              facts: [
-                { title: "Responded by", value: respondedBy },
-                { title: "Response time", value: elapsed < 60 ? `${elapsed}s` : `${Math.round(elapsed / 60)}m` },
-              ],
-              spacing: "Small",
-            },
-          ],
-          actions: [] as unknown[],
+          version: "1.4" as const,
+          body: [{
+            type: "Container",
+            spacing: "Small",
+            items: [
+              buildLevel1(decisionIcon, `Permission — ${escapeMd(decision)}`),
+              buildLevel2(`${pending.description} (${respondedBy}, ${elapsedStr})`),
+            ],
+          }],
+          width: "stretch",
         };
         await updateActivity(context, {
           id: pending.activityId,
-          conversation: { id: pending.conversationId },
           attachments: [adaptiveCardAttachment(updatedCard as Record<string, unknown>)],
         });
       } catch { /* ignore update failures */ }

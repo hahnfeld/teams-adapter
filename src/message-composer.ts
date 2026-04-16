@@ -1,24 +1,27 @@
 /**
- * Message composer — manages a single "main message" per session in Teams.
+ * Message composer — manages a single Adaptive Card per session in Teams.
  *
- * Emulates Claude Code's terminal UX using Adaptive Cards:
- *   - Title: bold, persistent — session name
- *   - Thinking blocks: italic, 💭 prefix, ALWAYS append (never replaced)
- *   - Tool progress: 🔄 Running... with elapsed time, persistent as historical record
- *   - Tool result: 📄 Result... appears AFTER progress (both coexist)
- *   - Streaming text: root-level, appended
- *   - Usage: italic footer, persistent
+ * Every message type renders into the same card, updated in-place via REST PUT.
  *
- * Tool output during execution is indented as children under the tool block.
- * When a tool completes, a NEW tool-result entry is appended — the progress
- * entry stays as a historical record (matching Claude Code's behavior).
+ * Entry types:
+ *   - title:    Bold session name, always first
+ *   - timed:    Two-level Container with live timer (tool, thinking)
+ *   - info:     Two-level Container, no timer (error, system, mode, config, model)
+ *   - text:     Root-level streamed text, always at bottom
+ *   - plan:     Formatted plan list, updated in place
+ *   - resource: Inline 📎 line (attachments, resources, resource links)
+ *   - usage:    Italic footer, singleton
+ *   - divider:  Horizontal rule
+ *
+ * Level 2 lines use a 3-column ColumnSet for true indentation:
+ *   Column 1: spacer (20px)  |  Column 2: ⎿ (auto)  |  Column 3: content (stretch, wrap)
  */
 import type { TurnContext } from "@microsoft/agents-hosting";
 import { log } from "@openacp/plugin-sdk";
 import { CardFactory } from "@microsoft/agents-hosting";
 import type { ConversationRateLimiter } from "./rate-limiter.js";
 
-// ─── Re-exports for backwards compat ───────────────────────────────────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
 export interface MessageRef {
   activityId: string;
@@ -28,49 +31,114 @@ export interface MessageRef {
 
 export type AcquireBotToken = () => Promise<string | null>;
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
 const MAX_ROOT_TEXT_LENGTH = 25_000;
-/** How long to wait with no activity before warning about truncation. */
 const STALL_TIMEOUT = 120_000;
 
-// ─── Brand Colors ────────────────────────────────────────────────────────────
-// Primary blue #01426a | Dark blue #00274a | Purple #463c8f
-// Cyan #5de3f7 | Green #a3cd6a | Magenta #ce0c88
-// Text default #2a2a2a | Muted #676767 | White #ffffff
-
-const BRAND = {
-  blue: "#01426a",
-  blueDark: "#00274a",
-  purple: "#463c8f",
-  cyan: "#5de3f7",
-  green: "#a3cd6a",
-  magenta: "#ce0c88",
-  textDefault: "#2a2a2a",
-  textMuted: "#676767",
-  white: "#ffffff",
-  surfaceMuted: "#f7f7f7",
-} as const;
-
-// ─── Entry Types ───────────────────────────────────────────────────────────────
+// ─── Entry Types ──────────────────────────────────────────────────────────────
 
 type BodyEntry =
   | { id: string; kind: "title"; text: string }
-  | { id: string; kind: "tool"; toolName: string; startedAt: number; result?: string; endedAt?: number; children: TextChild[] }
+  | { id: string; kind: "timed"; emoji: string; label: string; startedAt: number; result?: string; endedAt?: number }
+  | { id: string; kind: "info"; emoji: string; label: string; detail: string }
   | { id: string; kind: "text"; text: string }
-  | { id: string; kind: "thought"; text: string }
+  | { id: string; kind: "plan"; entries: { content: string; status: string }[] }
+  | { id: string; kind: "resource"; text: string }
   | { id: string; kind: "usage"; text: string }
   | { id: string; kind: "divider" };
 
-/** Text content inside a tool block — appended as tool runs */
-type TextChild = { text: string };
-
-// ─── ID generation ─────────────────────────────────────────────────────────────
+// ─── ID generation ────────────────────────────────────────────────────────────
 
 let _idCounter = 0;
 function nextId(): string {
   return `e${++_idCounter}_${Date.now().toString(36)}`;
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function formatElapsed(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s`;
+}
+
+export function escapeMd(text: string): string {
+  return text.replace(/\[/g, "\\[").replace(/\*/g, "\\*").replace(/\]/g, "\\]");
+}
+
+const PLAN_STATUS_ICONS: Record<string, string> = {
+  completed: "✅",
+  in_progress: "🔄",
+  pending: "⏳",
+};
+
 // ─── Adaptive Card Builder ────────────────────────────────────────────────────
+
+/**
+ * Build a 2-column ColumnSet for level-1 headings.
+ * Column 1: emoji (auto), Column 2: text (stretch, wrap).
+ * Ensures long text wraps without breaking back to the left margin.
+ */
+export function buildLevel1(emoji: string, text: string): Record<string, unknown> {
+  return {
+    type: "ColumnSet",
+    spacing: "None",
+    columns: [
+      {
+        type: "Column",
+        width: "auto",
+        items: [{ type: "TextBlock", text: emoji, size: "Small", fontType: "Monospace", spacing: "None" }],
+        verticalContentAlignment: "Top",
+      },
+      {
+        type: "Column",
+        width: "stretch",
+        items: [{ type: "TextBlock", text, size: "Small", fontType: "Monospace", wrap: true, spacing: "None" }],
+      },
+    ],
+  };
+}
+
+/**
+ * Build a 3-column ColumnSet for indented level-2 content.
+ * Column 1: spacer (20px), Column 2: ⎿ (auto), Column 3: content (stretch, wrap).
+ */
+export function buildLevel2(text: string, elapsed?: string, raw = false): Record<string, unknown> {
+  const escaped = raw ? text : escapeMd(text);
+  const content = elapsed ? `${escaped}  (${elapsed})` : escaped;
+  return {
+    type: "ColumnSet",
+    spacing: "None",
+    columns: [
+      { type: "Column", width: "20px" },
+      {
+        type: "Column",
+        width: "auto",
+        items: [{
+          type: "TextBlock",
+          text: "⎿",
+          size: "Small",
+          fontType: "Monospace",
+          spacing: "None",
+        }],
+        verticalContentAlignment: "Top",
+      },
+      {
+        type: "Column",
+        width: "stretch",
+        items: [{
+          type: "TextBlock",
+          text: content,
+          size: "Small",
+          fontType: "Monospace",
+          wrap: true,
+          spacing: "None",
+        }],
+      },
+    ],
+  };
+}
 
 function buildCardBody(entries: BodyEntry[]): unknown[] {
   const blocks: unknown[] = [];
@@ -89,45 +157,30 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
         });
         break;
 
-      case "tool": {
+      case "timed": {
         const elapsed = entry.result
           ? formatElapsed((entry.endedAt ?? entry.startedAt) - entry.startedAt)
           : formatElapsed(now - entry.startedAt);
+        const headingText = entry.result
+          ? escapeMd(entry.label)
+          : `${escapeMd(entry.label)}…  (${elapsed})`;
+
+        const items: unknown[] = [buildLevel1(entry.emoji, headingText)];
+        if (entry.result) {
+          items.push(buildLevel2(entry.result, elapsed));
+        }
+        blocks.push({ type: "Container", items, spacing: "Small" });
+        break;
+      }
+
+      case "info": {
         blocks.push({
           type: "Container",
           items: [
-            {
-              type: "TextBlock",
-              text: entry.result
-                ? `🔧 ${escapeMd(entry.toolName)}`
-                : `🔧 ${escapeMd(entry.toolName)}…  (${elapsed})`,
-              size: "Small",
-              fontType: "Monospace",
-              spacing: "None",
-            },
-            // Result: indented with L-shaped bar
-            ...(entry.result
-              ? [{
-                  type: "TextBlock" as const,
-                  text: `\u00A0\u00A0⎿ ${escapeMd(entry.result)}  (${elapsed})`,
-                  size: "Small" as const,
-                  fontType: "Monospace",
-                  wrap: true,
-                  spacing: "None",
-                }]
-              : []),
-            // Children: further indented
-            ...entry.children.map((c) => ({
-              type: "TextBlock",
-              text: `\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0${c.text}`,
-              size: "Small",
-              fontType: "Monospace",
-              wrap: true,
-              spacing: "None",
-            })),
+            buildLevel1(entry.emoji, escapeMd(entry.label)),
+            buildLevel2(entry.detail),
           ],
-          padding: "Small",
-          width: "stretch",
+          spacing: "Small",
         });
         break;
       }
@@ -143,11 +196,25 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
         });
         break;
 
-      case "thought":
+      case "plan": {
+        const lines = entry.entries.map((e, i) =>
+          `${PLAN_STATUS_ICONS[e.status] || "⏳"} ${i + 1}. ${escapeMd(e.content)}`,
+        );
+        blocks.push({
+          type: "TextBlock",
+          text: `📋 Plan\n${lines.join("\n")}`,
+          size: "Small",
+          fontType: "Monospace",
+          wrap: true,
+          spacing: "Small",
+        });
+        break;
+      }
+
+      case "resource":
         blocks.push({
           type: "TextBlock",
           text: entry.text,
-          italic: true,
           size: "Small",
           fontType: "Monospace",
           wrap: true,
@@ -159,7 +226,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
         blocks.push({
           type: "TextBlock",
           text: `*${escapeMd(entry.text)}*`,
-          italic: true,
+          isSubtle: true,
           size: "Small",
           fontType: "Monospace",
           spacing: "None",
@@ -181,29 +248,26 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
   return blocks;
 }
 
-function formatElapsed(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s`;
-}
+// ─── SessionMessage ───────────────────────────────────────────────────────────
 
-function escapeMd(text: string): string {
-  return text.replace(/\[/g, "\\[").replace(/\*/g, "\\*").replace(/\]/g, "\\]");
-}
-
-// ─── SessionMessage ────────────────────────────────────────────────────────────
+/** Dot animation frames: Working. → Working.. → Working... → Working.. → repeat */
+const WORKING_FRAMES = ["Working.", "Working..", "Working...", "Working.."];
 
 export class SessionMessage {
   private entries: BodyEntry[] = [];
   private titleId: string | null = null;
   private usageId: string | null = null;
-  /** The active tool whose children accumulate streaming output */
-  private toolActive: string | null = null;
+  private planId: string | null = null;
+  private thinkingActive: string | null = null;
+  private thinkingText = "";
+  private working = true;
+  private workingFrame = 0;
+  private destroyed = false;
   private ref: MessageRef | null = null;
   private lastSent = "";
   private stallTimer?: ReturnType<typeof setTimeout>;
-  /** Interval handle for periodic elapsed-time updates on running tools */
   private tickInterval?: ReturnType<typeof setInterval>;
+  private emptyCardTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private context: TurnContext,
@@ -211,7 +275,16 @@ export class SessionMessage {
     private sessionId: string,
     private rateLimiter: ConversationRateLimiter,
     private acquireBotToken: AcquireBotToken,
-  ) {}
+  ) {
+    // Start the working animation immediately
+    this.usageId = nextId();
+    this.entries.push({ id: this.usageId, kind: "usage", text: WORKING_FRAMES[0] });
+    this.startTickInterval();
+
+    // If no real content arrives within 30s, delete the empty card
+    this.emptyCardTimer = setTimeout(() => this.deleteIfEmpty(), 30_000);
+    if (this.emptyCardTimer.unref) this.emptyCardTimer.unref();
+  }
 
   updateContext(context: TurnContext): void {
     this.context = context;
@@ -233,10 +306,50 @@ export class SessionMessage {
     return usage ? (usage as { kind: "usage"; text: string }).text : null;
   }
 
-  // ─── Entry API ───────────────────────────────────────────────────────────
+  // ─── Empty card cleanup ──────────────────────────────────────────────────
 
-  /** Set the persistent session title (bold, survives finalize). */
+  /** Cancel the empty-card timer (called when real content arrives). */
+  private cancelEmptyCardTimer(): void {
+    if (this.emptyCardTimer) {
+      clearTimeout(this.emptyCardTimer);
+      this.emptyCardTimer = undefined;
+    }
+  }
+
+  /** If no real content was added, delete the card activity and clean up. */
+  private async deleteIfEmpty(): Promise<void> {
+    this.emptyCardTimer = undefined;
+    if (this.entries.some((e) => e.kind !== "usage")) return;
+    this.destroyed = true;
+
+    // Delete the card activity if it was sent
+    if (this.ref) {
+      const token = await this.acquireBotToken();
+      // Re-check after await — content may have arrived while token was fetched
+      if (this.entries.some((e) => e.kind !== "usage")) {
+        this.destroyed = false;
+        return;
+      }
+      if (token) {
+        const url = `${this.ref.serviceUrl}/v3/conversations/${encodeURIComponent(this.ref.conversationId)}/activities/${encodeURIComponent(this.ref.activityId)}`;
+        try {
+          await fetch(url, { method: "DELETE", headers: { "Authorization": `Bearer ${token}` } });
+        } catch { /* best effort */ }
+      }
+      this.ref = null;
+    }
+
+    this.stopTickInterval();
+    this.working = false;
+    this.entries = [];
+    log.debug({ sessionId: this.sessionId }, "[SessionMessage] Empty card deleted after timeout");
+  }
+
+  // ─── Entry API ──────────────────────────────────────────────────────────
+
+  /** Set the persistent session title (bold, always first entry). */
   setTitle(text: string): void {
+    this.cancelEmptyCardTimer();
     if (this.titleId) {
       const entry = this.findEntry(this.titleId);
       if (entry && entry.kind === "title") entry.text = text;
@@ -248,14 +361,13 @@ export class SessionMessage {
   }
 
   /**
-   * Add a tool-progress entry (🔄 Running...). Sets toolActive so subsequent
-   * addText() calls route children here. Returns entry id for tracking.
+   * Start a timed entry (tool or thinking). Shows emoji + label with live elapsed timer.
+   * Returns the entry ID for pairing with addTimedResult().
    */
-  addToolStart(toolName: string, _params?: string): string {
+  addTimedStart(emoji: string, label: string): string {
+    this.cancelEmptyCardTimer();
     const id = nextId();
-    const startedAt = Date.now();
-    this.entries.push({ id, kind: "tool", toolName, startedAt, children: [] });
-    this.toolActive = id;
+    this.entries.push({ id, kind: "timed", emoji, label, startedAt: Date.now() });
     this.resetStallTimer();
     this.startTickInterval();
     this.requestFlush();
@@ -263,76 +375,100 @@ export class SessionMessage {
   }
 
   /**
-   * Append result to the tool entry (transforms it from running to complete).
-   * Subsequent text goes to the same entry's children.
+   * Close a timed entry by setting its result. Stops the tick interval if no
+   * other timed entries are still running.
    */
-  addToolResult(id: string, result: string): void {
-    const entry = this.entries.find((e) => e.id === id);
-    if (!entry || entry.kind !== "tool") {
-      // Entry not found — create a standalone tool entry
-      const startedAt = Date.now();
-      this.entries.push({ id: nextId(), kind: "tool", toolName: "", startedAt, result, endedAt: startedAt, children: [] });
-      this.toolActive = null;
-      this.stopTickInterval();
-      this.requestFlush();
-      return;
+  addTimedResult(id: string, result: string): void {
+    const entry = this.findEntry(id);
+    if (entry && entry.kind === "timed") {
+      entry.result = result;
+      entry.endedAt = Date.now();
+    } else {
+      // Orphan result — create a standalone completed entry
+      this.entries.push({ id: nextId(), kind: "timed", emoji: "🔧", label: result, startedAt: Date.now(), result, endedAt: Date.now() });
     }
-
-    entry.result = result;
-    entry.endedAt = Date.now();
-    this.toolActive = null; // Subsequent text goes to root level
-    this.stopTickInterval();
+    const hasRunning = this.entries.some((e) => e.kind === "timed" && !e.result);
+    if (!hasRunning) this.stopTickInterval();
     this.requestFlush();
   }
 
-  /** Add text — goes to toolActive children if a tool is running, else root text entry. */
-  addText(text: string): void {
-    if (!text) return;
+  /**
+   * Start or accumulate thinking text. The first call creates a timed entry;
+   * subsequent calls append to the pending result text. Call closeActiveThinking()
+   * to finalize.
+   */
+  addThinking(text: string): void {
+    this.cancelEmptyCardTimer();
+    if (!this.thinkingActive) {
+      const id = this.addTimedStart("☁️", "Thinking");
+      this.thinkingActive = id;
+      this.thinkingText = text;
+    } else {
+      this.thinkingText += ` ${text}`;
+    }
+    this.requestFlush();
+  }
 
-    if (this.toolActive) {
-      const entry = this.findEntry(this.toolActive);
-      if (entry && entry.kind === "tool") {
-        entry.children.push({ text });
-        this.resetStallTimer();
+  /**
+   * Close the active thinking entry (if any). Called by non-thought handlers
+   * so thinking ends when the next event type arrives.
+   */
+  closeActiveThinking(): void {
+    if (!this.thinkingActive) return;
+    const text = this.thinkingText.trim() || "…";
+    this.addTimedResult(this.thinkingActive, text);
+    this.thinkingActive = null;
+    this.thinkingText = "";
+  }
+
+  /** Add a one-shot info entry (error, system, mode, config, model). */
+  addInfo(emoji: string, label: string, detail: string): void {
+    this.cancelEmptyCardTimer();
+    this.entries.push({ id: nextId(), kind: "info", emoji, label, detail });
+    this.requestFlush();
+  }
+
+  /** Add or replace the plan entry. */
+  setPlan(entries: { content: string; status: string }[]): void {
+    this.cancelEmptyCardTimer();
+    if (this.planId) {
+      const entry = this.findEntry(this.planId);
+      if (entry && entry.kind === "plan") {
+        entry.entries = entries;
         this.requestFlush();
-        // Check for overflow (root text limit)
-        if (this.ref) this.checkSplit();
         return;
       }
     }
+    this.planId = nextId();
+    this.entries.push({ id: this.planId, kind: "plan", entries });
+    this.requestFlush();
+  }
 
-    // Root-level text — append to last root text entry or create new
+  /** Add text — always appended at root level. */
+  addText(text: string): void {
+    if (!text) return;
+    this.cancelEmptyCardTimer();
     const lastText = this.entries.filter((e) => e.kind === "text").at(-1);
-    if (lastText) {
+    if (lastText && lastText.kind === "text") {
       lastText.text += text;
     } else {
       this.entries.push({ id: nextId(), kind: "text", text });
     }
     this.resetStallTimer();
     this.requestFlush();
-    // Check for overflow after root text grows
     if (this.ref) this.checkSplit();
   }
 
-  /**
-   * Append text to the last thought entry, or create a new one if none exists.
-   * If text starts with "Thinking..." and it's a fresh entry, wrap with newlines.
-   * Subsequent chunks are appended as plain text with no bubble prefix.
-   */
-  addThought(text: string): void {
-    const thoughts = this.entries.filter((e) => e.kind === "thought");
-    const last = thoughts[thoughts.length - 1];
-    if (last) {
-      // Add a space between consecutive chunks so they don't run together
-      last.text += ` ${text}`;
-    } else {
-      this.entries.push({ id: nextId(), kind: "thought", text });
-    }
+  /** Add an inline resource line (📎 prefix). */
+  addResource(text: string): void {
+    this.cancelEmptyCardTimer();
+    this.entries.push({ id: nextId(), kind: "resource", text });
     this.requestFlush();
   }
 
-  /** Set or replace the usage entry (only one at a time). */
+  /** Set or replace the usage footer. Stops the working animation. */
   setUsage(text: string): void {
+    this.working = false;
     if (this.usageId) {
       const entry = this.findEntry(this.usageId);
       if (entry && entry.kind === "usage") entry.text = text;
@@ -340,6 +476,8 @@ export class SessionMessage {
       this.usageId = nextId();
       this.entries.push({ id: this.usageId, kind: "usage", text });
     }
+    const hasRunning = this.entries.some((e) => e.kind === "timed" && !e.result);
+    if (!hasRunning) this.stopTickInterval();
     this.requestFlush();
   }
 
@@ -349,31 +487,26 @@ export class SessionMessage {
     this.requestFlush();
   }
 
-  // ─── Entry helpers ────────────────────────────────────────────────────────
+  // ─── Entry helpers ──────────────────────────────────────────────────────
 
   private findEntry(id: string): BodyEntry | undefined {
-    for (const entry of this.entries) {
-      if (entry.id === id) return entry;
-    }
-    return undefined;
+    return this.entries.find((e) => e.id === id);
   }
 
-  private removeEntry(id: string): void {
-    this.entries = this.entries.filter((e) => e.id !== id);
-  }
+  // ─── Periodic tick for elapsed time updates ─────────────────────────────
 
-  // ─── Periodic tick for elapsed time updates ───────────────────────────────
-
-  /**
-   * Start a 1-second interval that updates elapsed time on running tool-progress
-   * entries. Called when a tool starts, stopped when tool completes or finalize.
-   */
   private startTickInterval(): void {
     if (this.tickInterval) return;
     this.tickInterval = setInterval(() => {
-      // Only tick if there's an active tool-progress entry
-      const hasRunningTool = this.entries.some((e) => e.kind === "tool" && !e.result);
-      if (!hasRunningTool) {
+      // Advance working dots animation
+      if (this.working && this.usageId) {
+        this.workingFrame = (this.workingFrame + 1) % WORKING_FRAMES.length;
+        const entry = this.findEntry(this.usageId);
+        if (entry && entry.kind === "usage") entry.text = WORKING_FRAMES[this.workingFrame];
+      }
+
+      const hasRunning = this.entries.some((e) => e.kind === "timed" && !e.result);
+      if (!hasRunning && !this.working) {
         this.stopTickInterval();
         return;
       }
@@ -389,23 +522,19 @@ export class SessionMessage {
     }
   }
 
-  // ─── Card building ─────────────────────────────────────────────────────────
+  // ─── Card building ──────────────────────────────────────────────────────
 
   private buildCard(): Record<string, unknown> {
     const body = buildCardBody(this.entries);
-
     return {
       type: "AdaptiveCard",
       version: "1.4",
-      body: [
-        ...(body.length > 0 ? body : [{ type: "TextBlock", text: "…" }]),
-      ],
-      // Use full available width
+      body: body.length > 0 ? body : [{ type: "TextBlock", text: "…" }],
       width: "stretch",
     };
   }
 
-  // ─── Flush / Rate limiting ─────────────────────────────────────────────────
+  // ─── Flush / Rate limiting ──────────────────────────────────────────────
 
   private flushTimer?: ReturnType<typeof setTimeout>;
 
@@ -413,7 +542,6 @@ export class SessionMessage {
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      const card = this.buildCard();
       const key = this.ref ? `update:${this.ref.activityId}` : `new:${this.sessionId}`;
       this.rateLimiter.enqueue(
         this.conversationId,
@@ -426,6 +554,7 @@ export class SessionMessage {
   }
 
   private async flush(): Promise<void> {
+    if (this.destroyed) return;
     const card = this.buildCard();
     const cardStr = JSON.stringify(card);
     if (!cardStr || cardStr === this.lastSent) return;
@@ -442,9 +571,7 @@ export class SessionMessage {
       this.lastSent = cardStr;
     } else {
       const success = await this.updateCardViaRest(card);
-      if (success) {
-        this.lastSent = cardStr;
-      }
+      if (success) this.lastSent = cardStr;
     }
 
     // Content arrived while flushing — request another flush
@@ -460,20 +587,15 @@ export class SessionMessage {
     if (!token) return false;
 
     const url = `${this.ref.serviceUrl}/v3/conversations/${encodeURIComponent(this.ref.conversationId)}/activities/${encodeURIComponent(this.ref.activityId)}`;
-
     try {
       const response = await fetch(url, {
         method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-        },
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify({
           type: "message",
           attachments: [CardFactory.adaptiveCard(card)],
         }),
       });
-
       if (!response.ok) {
         log.warn({ status: response.status, sessionId: this.sessionId }, "[SessionMessage] REST card update failed");
         return false;
@@ -485,15 +607,12 @@ export class SessionMessage {
     }
   }
 
-  // ─── Stall timer ───────────────────────────────────────────────────────────
+  // ─── Stall timer ────────────────────────────────────────────────────────
 
   private resetStallTimer(): void {
     if (this.stallTimer) clearTimeout(this.stallTimer);
     this.stallTimer = setTimeout(() => {
-      const hasContent = this.entries.some(
-        (e) => (e.kind === "text" && e.text.length > 0) ||
-               (e.kind === "tool" && e.children.length > 0),
-      );
+      const hasContent = this.entries.some((e) => e.kind === "text" && e.text.length > 0);
       const hasUsage = this.entries.some((e) => e.kind === "usage");
       if (hasContent && !hasUsage) {
         log.warn({ sessionId: this.sessionId }, "[SessionMessage] Stream stalled — adding cutoff notice");
@@ -509,10 +628,17 @@ export class SessionMessage {
     if (this.stallTimer.unref) this.stallTimer.unref();
   }
 
-  // ─── Finalize ─────────────────────────────────────────────────────────────
+  // ─── Finalize ───────────────────────────────────────────────────────────
 
   async finalize(): Promise<MessageRef | null> {
+    this.cancelEmptyCardTimer();
+    this.closeActiveThinking();
+    this.working = false;
     this.stopTickInterval();
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
     if (this.stallTimer) {
       clearTimeout(this.stallTimer);
       this.stallTimer = undefined;
@@ -539,7 +665,7 @@ export class SessionMessage {
     return this.ref;
   }
 
-  /** Legacy compat — strip pattern from root text entries. */
+  /** Strip a pattern from root text entries. */
   async stripPattern(pattern: RegExp): Promise<void> {
     for (const entry of this.entries) {
       if (entry.kind === "text") {
@@ -550,60 +676,50 @@ export class SessionMessage {
     }
   }
 
-  /**
-   * Check if root text exceeds limit and split into a new message.
-   * Called from addText when a message is already sent (this.ref != null).
-   */
+  // ─── Text overflow / split ──────────────────────────────────────────────
+
   private checkSplit(): void {
     const rootText = this.entries
       .filter((e) => e.kind === "text")
       .map((e) => (e as { kind: "text"; text: string }).text)
       .join("");
-
     if (rootText.length <= MAX_ROOT_TEXT_LENGTH) return;
     this.split();
   }
 
-  /** For split: finalize current message at limit, start fresh. */
   private split(): void {
     const rootText = this.entries
       .filter((e) => e.kind === "text")
       .map((e) => (e as { kind: "text"; text: string }).text)
       .join("");
-
     if (rootText.length <= MAX_ROOT_TEXT_LENGTH) return;
 
     let accLen = 0;
-    const entriesToKeep: BodyEntry[] = [];
-    const entriesToOverflow: BodyEntry[] = [];
+    const keep: BodyEntry[] = [];
+    const overflow: BodyEntry[] = [];
 
     for (const entry of this.entries) {
       if (entry.kind === "text") {
-        const text = (entry as { kind: "text"; text: string }).text;
-        if (accLen + text.length <= MAX_ROOT_TEXT_LENGTH) {
-          entriesToKeep.push(entry);
-          accLen += text.length;
+        if (accLen + entry.text.length <= MAX_ROOT_TEXT_LENGTH) {
+          keep.push(entry);
+          accLen += entry.text.length;
         } else {
-          entriesToOverflow.push(entry);
+          overflow.push(entry);
         }
       } else {
-        entriesToKeep.push(entry);
+        keep.push(entry);
       }
     }
 
-    log.info({ sessionId: this.sessionId, kept: entriesToKeep.length, overflow: entriesToOverflow.length }, "[SessionMessage] splitting");
+    log.info({ sessionId: this.sessionId, kept: keep.length, overflow: overflow.length }, "[SessionMessage] splitting");
 
-    this.entries = entriesToKeep;
-    if (entriesToOverflow.length > 0) {
-      const overflowText = entriesToOverflow
-        .filter((e) => e.kind === "text")
-        .map((e) => (e as { kind: "text"; text: string }).text)
-        .join("");
-      if (overflowText) {
-        this.entries.push({ id: nextId(), kind: "text", text: overflowText });
-      }
-    }
+    const overflowText = overflow
+      .filter((e) => e.kind === "text")
+      .map((e) => (e as { kind: "text"; text: string }).text)
+      .join("");
 
+    // Update the old card with only the kept entries (no overflow)
+    this.entries = keep;
     if (this.ref) {
       const card = this.buildCard();
       this.rateLimiter.enqueue(
@@ -613,50 +729,24 @@ export class SessionMessage {
       ).catch(() => {});
     }
 
+    // Start a new card with only the overflow text — reset all entry ID references
+    // so subsequent calls create new entries in the new card
     this.ref = null;
     this.lastSent = "";
+    this.titleId = null;
+    this.usageId = null;
+    this.planId = null;
+    this.entries = overflowText
+      ? [{ id: nextId(), kind: "text" as const, text: overflowText }]
+      : [];
     this.requestFlush();
   }
-
-  // ─── Legacy API (no-ops for compat) ────────────────────────────────────────
-
-  /** @deprecated — use addThought instead */
-  setHeader(_text: string): void { /* no-op */ }
-
-  /** @deprecated — use addToolResult instead */
-  setHeaderResult(_text: string): void { /* no-op */ }
-
-  /** @deprecated — use addText instead */
-  appendBody(text: string): void {
-    this.addText(text);
-  }
-
-  /** @deprecated — use setUsage instead */
-  setFooter(text: string): void {
-    this.setUsage(text);
-  }
-
-  /** @deprecated — use setUsage instead */
-  appendFooter(text: string): void {
-    const current = this.getFooter();
-    this.setUsage(current ? `${current} · ${text}` : text);
-  }
-
-  /** @deprecated — header zone is gone */
-  clearHeader(): void { /* no-op */ }
-
-  /** @deprecated — thoughts persist, use addThought */
-  removeThought(): void { /* no-op */ }
-
-  /** @deprecated — use addToolStart + addToolResult */
-  updateToolResult(_id: string, _result: string): void { /* no-op */ }
 }
 
-// ─── SessionMessageManager ─────────────────────────────────────────────────────
+// ─── SessionMessageManager ────────────────────────────────────────────────────
 
 export class SessionMessageManager {
   private messages = new Map<string, SessionMessage>();
-  private planRefs = new Map<string, MessageRef>();
 
   constructor(
     private rateLimiter: ConversationRateLimiter,
@@ -687,29 +777,17 @@ export class SessionMessageManager {
     const msg = this.messages.get(sessionId);
     if (!msg) return null;
     this.messages.delete(sessionId);
-    this.planRefs.delete(sessionId);
     return msg.finalize();
-  }
-
-  getPlanRef(sessionId: string): MessageRef | undefined {
-    return this.planRefs.get(sessionId);
-  }
-
-  setPlanRef(sessionId: string, ref: MessageRef): void {
-    this.planRefs.set(sessionId, ref);
   }
 
   cleanup(sessionId: string): void {
     const msg = this.messages.get(sessionId);
-    if (msg) {
-      msg.finalize().catch(() => {});
-    }
+    if (msg) msg.finalize().catch(() => {});
     this.messages.delete(sessionId);
-    this.planRefs.delete(sessionId);
   }
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function sendCard(context: TurnContext, card: Record<string, unknown>): Promise<unknown> {
   const activity = {

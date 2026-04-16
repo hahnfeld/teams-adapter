@@ -27,7 +27,7 @@ import { log, MessagingAdapter, BaseRenderer } from "@openacp/plugin-sdk";
 import type { CommandRegistry, ToolCallMeta, IRenderer } from "@openacp/plugin-sdk";
 import type { TeamsChannelConfig } from "./types.js";
 import { DEFAULT_BOT_PORT } from "./types.js";
-import { SessionMessageManager } from "./message-composer.js";
+import { SessionMessageManager, buildLevel1, buildLevel2, escapeMd } from "./message-composer.js";
 import { ConversationRateLimiter } from "./rate-limiter.js";
 import { PermissionHandler } from "./permissions.js";
 import { handleCommand, setupCardActionCallbacks, SLASH_COMMANDS } from "./commands/index.js";
@@ -35,14 +35,9 @@ import { spawnAssistant } from "./assistant.js";
 import { downloadTeamsFile, isAttachmentTooLarge, buildFileAttachmentCard, uploadFileViaGraph } from "./media.js";
 import { GraphFileClient } from "./graph.js";
 import { ConversationStore } from "./conversation-store.js";
-import { sendText, sendCard, sendActivity } from "./send-utils.js";
-import { formatTokens, formatToolSummary, formatPlan } from "./formatting.js";
+import { sendText, sendCard } from "./send-utils.js";
+import { formatTokens, formatToolSummary } from "./formatting.js";
 import type { OutputMode } from "./activity.js";
-
-/** Max retry attempts for transient Teams API failures */
-const MAX_RETRIES = 3;
-/** Base delay (ms) for exponential backoff */
-const BASE_RETRY_DELAY = 1000;
 
 export class TeamsAdapter extends MessagingAdapter {
   readonly name = "teams";
@@ -80,9 +75,6 @@ export class TeamsAdapter extends MessagingAdapter {
   /** Track processed activity IDs to handle Teams 15-second retry deduplication */
   private _processedActivities = new Map<string, number>();
   private _processedCleanupTimer?: ReturnType<typeof setInterval>;
-
-  /** Per-session typing pulse state (timeout + interval handles) */
-  private _typingPulses = new Map<string, { timeout?: ReturnType<typeof setTimeout>; interval?: ReturnType<typeof setInterval> }>();
 
   /** Per-session active tool entry ID for updateToolResult dispatch */
   private _toolEntryIds = new Map<string, string>();
@@ -226,11 +218,6 @@ export class TeamsAdapter extends MessagingAdapter {
     this._sessionContexts.clear();
     this._sessionOutputModes.clear();
     this._processedActivities.clear();
-    for (const pulse of this._typingPulses.values()) {
-      if (pulse.timeout) clearTimeout(pulse.timeout);
-      if (pulse.interval) clearInterval(pulse.interval);
-    }
-    this._typingPulses.clear();
     this.rateLimiter.destroy();
     this.conversationStore.destroy();
     this.permissionHandler.dispose();
@@ -455,28 +442,11 @@ export class TeamsAdapter extends MessagingAdapter {
           return;
         }
 
-        if (sessionId !== "unknown") {
-          this.composer.cleanup(sessionId);
-        }
-
-        // Pulse typing indicator after 5s delay, then every 8s until response arrives.
-        // Cleared automatically when handleText/handleThought/etc. fires for a session.
-        const typingPulseKey = sessionId !== "unknown" ? sessionId : threadId;
-        const existingPulse = this._typingPulses.get(typingPulseKey);
-        if (!existingPulse) {
-          const pulseState: { timeout?: ReturnType<typeof setTimeout>; interval?: ReturnType<typeof setInterval> } = {};
-          this._typingPulses.set(typingPulseKey, pulseState);
-          pulseState.timeout = setTimeout(() => {
-            // Use the stored context for this thread
-            const ctx = this._sessionContexts.get(typingPulseKey);
-            if (ctx) this.sendTyping(ctx.context);
-            // Continue pulsing every 8s until cleared
-            pulseState.interval = setInterval(() => {
-              const c = this._sessionContexts.get(typingPulseKey);
-              if (c) this.sendTyping(c.context);
-            }, 8_000);
-          }, 5_000);
-        }
+        // Don't cleanup the existing card here — if the agent is still working on
+        // the previous prompt, its remaining events need the current card. The card
+        // finalizes naturally via handleSessionEnd or handleError. The new prompt is
+        // queued by core and its events will create a fresh card after the current
+        // turn completes.
 
         const existingSessionBeforeSend = this.core.sessionManager.getSessionByThread("teams", threadId);
         if (!existingSessionBeforeSend) {
@@ -775,6 +745,16 @@ export class TeamsAdapter extends MessagingAdapter {
         return;
       }
 
+      // Destroy any existing session in this conversation before creating a new one
+      const conversationId = (context.activity.conversation?.id as string | undefined)?.split(";")[0];
+      if (conversationId) {
+        const existing = this.core.sessionManager.getSessionByThread("teams", conversationId);
+        if (existing) {
+          await this.composer.finalize(existing.id);
+          try { await existing.destroy(); } catch { /* best effort */ }
+        }
+      }
+
       // Send acknowledgment immediately, then create session in the background.
       // Session creation spawns an agent process (~30s) which would timeout the invoke.
       await sendText(context, `🔄 Creating session with **${agentName}**...`);
@@ -994,23 +974,6 @@ export class TeamsAdapter extends MessagingAdapter {
     await this.respawnAssistant();
   }
 
-  // ─── Typing indicator ────────────────────────────────────────────────────
-
-  /** Send a typing indicator to the user. Non-critical — failures are silently ignored. */
-  private sendTyping(context: TurnContext): void {
-    sendActivity(context, { type: "typing" }).catch(() => {});
-  }
-
-  /** Clear the typing pulse for a session once a response arrives. */
-  private clearTypingPulse(key: string): void {
-    const pulse = this._typingPulses.get(key);
-    if (pulse) {
-      if (pulse.timeout) clearTimeout(pulse.timeout);
-      if (pulse.interval) clearInterval(pulse.interval);
-      this._typingPulses.delete(key);
-    }
-  }
-
   // ─── Bot token for proactive messaging ────────────────────────────────────
 
   /**
@@ -1077,62 +1040,6 @@ export class TeamsAdapter extends MessagingAdapter {
 
   static isValidServiceUrl(url: string): boolean {
     return TeamsAdapter.TRUSTED_SERVICE_URL_PATTERNS.some((pattern) => pattern.test(url));
-  }
-
-  /** AI-generated content entity — attached to all outbound messages for the Teams "AI generated" badge */
-  private static readonly AI_ENTITY = {
-    type: "https://schema.org/Message",
-    "@type": "Message",
-    "@context": "https://schema.org",
-    additionalType: ["AIGeneratedContent"],
-  };
-
-  /**
-   * Send a Teams activity with exponential backoff retry on transient failures.
-   * Handles HTTP 429 (rate limited), 502, 504 per Microsoft best practices.
-   */
-  private async sendActivityWithRetry(
-    context: TurnContext,
-    activity: Record<string, unknown>,
-  ): Promise<unknown> {
-    // Attach AI-generated content label to all message activities.
-    // Clone the activity to avoid mutating the caller's object (and duplicating on retries).
-    if (!activity.type || activity.type === "message") {
-      const existing = (activity.entities as unknown[] | undefined) ?? [];
-      // Skip if an AIGeneratedContent entity is already present (e.g., citation entities)
-      const hasAiLabel = existing.some((e: any) =>
-        Array.isArray(e?.additionalType) && e.additionalType.includes("AIGeneratedContent"),
-      );
-      if (!hasAiLabel) {
-        activity = { ...activity, entities: [...existing, TeamsAdapter.AI_ENTITY] };
-      }
-    }
-
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        return await sendActivity(context, activity);
-      } catch (err: unknown) {
-        const statusCode = (err as { statusCode?: number })?.statusCode;
-        // Teams docs require retrying 412, 429, 502, and 504
-        const isRetryable = statusCode === 412 || statusCode === 429 || statusCode === 502 || statusCode === 504;
-
-        if (!isRetryable || attempt === MAX_RETRIES) throw err;
-
-        // Parse Retry-After header if available, otherwise use exponential backoff + jitter
-        const retryAfterRaw = (err as { headers?: Record<string, string> })?.headers?.["retry-after"];
-        const retryAfterSec = retryAfterRaw ? parseInt(retryAfterRaw, 10) : NaN;
-        const delayMs = !isNaN(retryAfterSec) && retryAfterSec > 0
-          ? retryAfterSec * 1000
-          : BASE_RETRY_DELAY * Math.pow(2, attempt) + Math.random() * 500;
-
-        log.warn(
-          { statusCode, attempt: attempt + 1, delayMs },
-          "[TeamsAdapter] Rate limited or transient error, retrying",
-        );
-        await new Promise((r) => setTimeout(r, delayMs));
-      }
-    }
-    throw new Error("unreachable");
   }
 
   // ─── Helper: resolve context ─────────────────────────────────────────────
@@ -1239,31 +1146,32 @@ export class TeamsAdapter extends MessagingAdapter {
   // ─── Handler overrides ───────────────────────────────────────────────────
 
   protected async handleThought(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    this.clearTypingPulse(sessionId);
+
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     this.ensureSessionTitle(sessionId, msg);
     const summary = content.text?.split("\n")[0] || "";
-    msg.addThought(summary);
+    msg.addThinking(summary);
   }
 
   protected async handleText(sessionId: string, content: OutgoingMessage): Promise<void> {
-    this.clearTypingPulse(sessionId);
+
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
-    if (!this.composer.has(sessionId)) this.sendTyping(ctx.context);
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     this.ensureSessionTitle(sessionId, msg);
+    msg.closeActiveThinking();
     if (content.text) msg.addText(content.text);
   }
 
   protected async handleToolCall(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    this.clearTypingPulse(sessionId);
+
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     this.ensureSessionTitle(sessionId, msg);
+    msg.closeActiveThinking();
     const meta = (content.metadata ?? {}) as Partial<ToolCallMeta>;
     const toolName = meta.name || content.text || "Tool";
     const summary = formatToolSummary(
@@ -1271,32 +1179,29 @@ export class TeamsAdapter extends MessagingAdapter {
       meta.rawInput,
       meta.displaySummary as string | undefined,
     );
-    const entryId = msg.addToolStart(toolName, summary);
+    const entryId = msg.addTimedStart("🔧", summary);
     this._toolEntryIds.set(sessionId, entryId);
   }
 
   protected async handleToolUpdate(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    this.clearTypingPulse(sessionId);
+
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     const meta = (content.metadata ?? {}) as Partial<ToolCallMeta>;
     const toolName = meta.name || content.text || "";
-    // Only update if we have meaningful content
     if (!toolName && !meta.displaySummary) return;
     const summary = formatToolSummary(
       toolName || "Tool",
       meta.rawInput,
       meta.displaySummary as string | undefined,
     );
-    // Look up and use the stored entry id to create tool-result entry (progress stays)
     const entryId = this._toolEntryIds.get(sessionId);
     if (entryId) {
-      msg.addToolResult(entryId, summary);
+      msg.addTimedResult(entryId, summary);
       this._toolEntryIds.delete(sessionId);
     } else {
-      // Fallback: create a standalone tool result
-      msg.addToolResult("", summary);
+      msg.addTimedResult("", summary);
     }
   }
 
@@ -1307,59 +1212,20 @@ export class TeamsAdapter extends MessagingAdapter {
     if (name) msg.setTitle(name);
   }
 
-  /** Per-session plan send mutex to prevent TOCTOU race on first plan message. */
-  private _planSending = new Set<string>();
-
   protected async handlePlan(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
-    this.clearTypingPulse(sessionId);
-    const ctx = this._sessionContexts.get(sessionId);
-    const planEntries = (content.metadata as { entries?: PlanEntry[] })?.entries ?? [];
-    if (!ctx) return;
-    const { context } = ctx;
-    const conversationId = context.activity.conversation?.id as string;
-    const entries = planEntries;
-    const text = formatPlan(entries, "high");
-    const planRef = this.composer.getPlanRef(sessionId);
 
-    if (planRef) {
-      // Update existing plan message via rate limiter
-      await this.rateLimiter.enqueue(conversationId, async () => {
-        const token = await this.acquireBotToken();
-        if (!token) return;
-        const url = `${planRef.serviceUrl}/v3/conversations/${encodeURIComponent(planRef.conversationId)}/activities/${encodeURIComponent(planRef.activityId)}`;
-        await fetch(url, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-          body: JSON.stringify({ type: "message", text: text.replace(/(?<!\n)\n(?!\n)/g, "\n\n"), textFormat: "markdown" }),
-        });
-      }, `plan:${sessionId}`);
-    } else {
-      // Prevent TOCTOU: if another plan event is already sending the first message, skip
-      if (this._planSending.has(sessionId)) return;
-      this._planSending.add(sessionId);
-      try {
-        const result = await this.rateLimiter.enqueue(conversationId, async () => {
-          return sendText(context, text) as Promise<{ id?: string } | undefined>;
-        }, `plan:${sessionId}`);
-        if (result?.id) {
-          this.composer.setPlanRef(sessionId, {
-            activityId: result.id,
-            conversationId,
-            serviceUrl: context.activity.serviceUrl as string,
-          });
-        }
-      } catch (err) {
-        log.warn({ err, sessionId }, "[TeamsAdapter] handlePlan: send failed");
-      } finally {
-        this._planSending.delete(sessionId);
-      }
-    }
+    const ctx = this._sessionContexts.get(sessionId);
+    if (!ctx) return;
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    this.ensureSessionTitle(sessionId, msg);
+    msg.closeActiveThinking();
+    const planEntries = (content.metadata as { entries?: PlanEntry[] })?.entries ?? [];
+    msg.setPlan(planEntries.map((e) => ({ content: e.content, status: e.status })));
   }
 
   protected async handleUsage(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
-
     const meta = content.metadata as { tokensUsed?: number; contextSize?: number; cost?: number; duration?: number } | undefined;
     if (meta?.tokensUsed != null) {
       const msg = this.composer.getOrCreate(sessionId, ctx.context);
@@ -1367,31 +1233,8 @@ export class TeamsAdapter extends MessagingAdapter {
       parts.push(`${formatTokens(meta.tokensUsed)} tokens`);
       if (meta.duration != null) parts.push(`${(meta.duration / 1000).toFixed(1)}s`);
       if (meta.cost != null) parts.push(`$${meta.cost.toFixed(4)}`);
-      parts.push("Task completed");
-      const footerText = parts.join(" · ");
-      msg.setUsage(footerText);
+      msg.setUsage(parts.join(" · "));
     }
-  }
-
-  /** Suggested quick-reply actions (Teams restricts these to 1:1 personal chat only) */
-  private static readonly QUICK_ACTIONS = {
-    suggestedActions: {
-      actions: [
-        { type: "imBack", title: "➕ New Session", value: "/new" },
-        { type: "imBack", title: "📊 Status", value: "/status" },
-        { type: "imBack", title: "📋 Sessions", value: "/sessions" },
-        { type: "imBack", title: "📋 Menu", value: "/menu" },
-      ],
-    },
-  };
-
-  /** Return QUICK_ACTIONS only if the conversation is 1:1 personal chat (Teams requirement) */
-  private getQuickActions(context: TurnContext): Record<string, unknown> {
-    const convType = (context.activity as Record<string, unknown>).conversation as Record<string, unknown> | undefined;
-    if (convType?.conversationType === "personal") {
-      return TeamsAdapter.QUICK_ACTIONS;
-    }
-    return {};
   }
 
   /**
@@ -1416,9 +1259,8 @@ export class TeamsAdapter extends MessagingAdapter {
 
     this._sessionContexts.delete(sessionId);
     this._sessionOutputModes.delete(sessionId);
-    this._planSending.delete(sessionId);
     this._toolEntryIds.delete(sessionId);
-    this.clearTypingPulse(sessionId);
+
     this.composer.cleanup(sessionId);
   }
 
@@ -1428,24 +1270,22 @@ export class TeamsAdapter extends MessagingAdapter {
 
     const msg = this.composer.get(sessionId);
     if (msg) {
+      msg.closeActiveThinking();
       const current = msg.getFooter();
       msg.setUsage(current ? `${current} · Task completed` : "Task completed");
     }
-    const ref = await this.composer.finalize(sessionId);
+    await this.composer.finalize(sessionId);
     this.cleanupSessionState(sessionId);
   }
 
   protected async handleError(sessionId: string, content: OutgoingMessage): Promise<void> {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    msg.closeActiveThinking();
+    msg.addInfo("❌", "Error", content.text || "Unknown error");
     await this.composer.finalize(sessionId);
     this.cleanupSessionState(sessionId);
-    try {
-      await this.sendActivityWithRetry(ctx.context, {
-        text: `❌ **Error:** ${content.text}`,
-        ...this.getQuickActions(ctx.context),
-      });
-    } catch { /* best effort */ }
   }
 
   protected async handleAttachment(sessionId: string, content: OutgoingMessage): Promise<void> {
@@ -1465,7 +1305,7 @@ export class TeamsAdapter extends MessagingAdapter {
     if (isAttachmentTooLarge(attachment.size)) {
       log.warn({ sessionId, fileName: attachment.fileName, size: attachment.size }, "[TeamsAdapter] File too large");
       const msg = this.composer.getOrCreate(sessionId, ctx.context);
-      msg.addText(`\n\n⚠️ File too large to send (${Math.round(attachment.size / 1024 / 1024)}MB): ${attachment.fileName}`);
+      msg.addResource(`📎 ⚠️ File too large (${Math.round(attachment.size / 1024 / 1024)}MB): ${attachment.fileName}`);
       return;
     }
 
@@ -1478,12 +1318,11 @@ export class TeamsAdapter extends MessagingAdapter {
         attachment.mimeType,
       );
 
-      // Append file info inline in the body
       const msg = this.composer.getOrCreate(sessionId, ctx.context);
       if (shareUrl) {
-        msg.addText(`\n\n📎 [${attachment.fileName}](${shareUrl})`);
+        msg.addResource(`📎 [${attachment.fileName}](${shareUrl})`);
       } else {
-        msg.addText(`\n\n📎 ${attachment.fileName} (${Math.round(attachment.size / 1024)}KB)`);
+        msg.addResource(`📎 ${attachment.fileName} (${Math.round(attachment.size / 1024)}KB)`);
       }
     } catch (err) {
       log.error({ err, sessionId, fileName: attachment.fileName }, "[TeamsAdapter] Failed to send attachment");
@@ -1494,9 +1333,8 @@ export class TeamsAdapter extends MessagingAdapter {
     if (!content.text) return;
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
-    try {
-      await this.sendActivityWithRetry(ctx.context, { text: `⚙️ ${content.text}` });
-    } catch { /* best effort */ }
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    msg.addInfo("⚙️", "System", content.text);
   }
 
   /** Sanitize metadata strings for safe markdown interpolation. */
@@ -1508,46 +1346,41 @@ export class TeamsAdapter extends MessagingAdapter {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const modeId = TeamsAdapter.sanitizeMd(String((content.metadata as Record<string, unknown>)?.modeId ?? ""));
-    try {
-      await this.sendActivityWithRetry(ctx.context, { text: `⚙️ **Mode:** ${modeId}` });
-    } catch { /* best effort */ }
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    msg.addInfo("⚙️", "Mode", modeId);
   }
 
   protected async handleConfigUpdate(sessionId: string, content: OutgoingMessage): Promise<void> {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const key = (content.metadata as Record<string, unknown>)?.key;
-    const detail = key ? ` \`${TeamsAdapter.sanitizeMd(String(key))}\`` : "";
-    try {
-      await this.sendActivityWithRetry(ctx.context, { text: `⚙️ **Config updated**${detail}` });
-    } catch { /* best effort */ }
+    const detail = key ? TeamsAdapter.sanitizeMd(String(key)) : "updated";
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    msg.addInfo("⚙️", "Config", detail);
   }
 
   protected async handleModelUpdate(sessionId: string, content: OutgoingMessage): Promise<void> {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
     const modelId = TeamsAdapter.sanitizeMd(String((content.metadata as Record<string, unknown>)?.modelId ?? ""));
-    try {
-      await this.sendActivityWithRetry(ctx.context, { text: `⚙️ **Model:** ${modelId}` });
-    } catch { /* best effort */ }
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    msg.addInfo("⚙️", "Model", modelId);
   }
 
   protected async handleUserReplay(sessionId: string, content: OutgoingMessage): Promise<void> {
     if (!content.text) return;
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
-    try {
-      await this.sendActivityWithRetry(ctx.context, { text: content.text });
-    } catch { /* best effort */ }
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    msg.addText(content.text);
   }
 
   protected async handleResource(sessionId: string, content: OutgoingMessage): Promise<void> {
     if (!content.text) return;
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
-    try {
-      await this.sendActivityWithRetry(ctx.context, { text: content.text });
-    } catch { /* best effort */ }
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    msg.addResource(`📎 ${content.text}`);
   }
 
   protected async handleResourceLink(sessionId: string, content: OutgoingMessage): Promise<void> {
@@ -1557,10 +1390,9 @@ export class TeamsAdapter extends MessagingAdapter {
     const rawName = (content.metadata as Record<string, unknown>)?.name as string | undefined;
     const url = rawUrl && /^https?:\/\//i.test(rawUrl) ? rawUrl : undefined;
     const name = rawName?.replace(/[\[\]\(\)]/g, "") || undefined;
-    const text = url ? `📎 [${name || url}](${url})` : content.text;
-    try {
-      await this.sendActivityWithRetry(ctx.context, { text });
-    } catch { /* best effort */ }
+    const text = url ? `📎 [${name || url}](${url})` : `📎 ${content.text || "Resource"}`;
+    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    msg.addResource(text);
   }
 
   // ─── sendPermissionRequest ──────────────────────────────────────────────
@@ -1585,17 +1417,20 @@ export class TeamsAdapter extends MessagingAdapter {
     const typeIcon: Record<string, string> = {
       completed: "✅", error: "❌", permission: "🔐", input_required: "💬", budget_warning: "⚠️",
     };
+    const typeLabel: Record<string, string> = {
+      completed: "Completed", error: "Error", permission: "Permission", input_required: "Input Required", budget_warning: "Budget Warning",
+    };
 
     const icon = typeIcon[notification.type] ?? "ℹ️";
-    const name = notification.sessionName ? ` **${notification.sessionName}**` : "";
-    let text = `${icon}${name}: ${notification.summary}`;
-    if (notification.deepLink) {
-      text += `\n${notification.deepLink}`;
-    }
+    const label = typeLabel[notification.type] ?? "Notification";
+    const detail = notification.sessionName
+      ? `${notification.sessionName} — ${notification.summary}`
+      : notification.summary;
+
+    // Build a mini Adaptive Card matching the info Container style
+    const card = TeamsAdapter.buildNotificationCard(icon, label, detail, notification.deepLink);
 
     // Post to the notification channel via Bot Framework REST API.
-    // Use any stored ref for the serviceUrl and bot identity, but target
-    // the notification channel ID directly as the conversation.
     if (this.notificationChannelId) {
       const ref = this.conversationStore.getAny();
       if (ref && TeamsAdapter.isValidServiceUrl(ref.serviceUrl)) {
@@ -1613,7 +1448,10 @@ export class TeamsAdapter extends MessagingAdapter {
                 },
                 body: JSON.stringify({
                   type: "message",
-                  text,
+                  attachments: [{
+                    contentType: "application/vnd.microsoft.card.adaptive",
+                    content: card,
+                  }],
                   from: { id: ref.botId, name: ref.botName },
                 }),
                 signal: controller.signal,
@@ -1630,13 +1468,12 @@ export class TeamsAdapter extends MessagingAdapter {
       }
     }
 
-    // Session-specific context fallback — last resort, may fail if the
-    // TurnContext's HTTP response stream has closed since the turn ended.
+    // Session-specific context fallback
     if (notification.sessionId) {
       const ctx = this._sessionContexts.get(notification.sessionId);
       if (ctx) {
         try {
-          await sendText(ctx.context, text);
+          await sendCard(ctx.context, card);
           return;
         } catch (err) {
           log.debug({ err, sessionId: notification.sessionId }, "[TeamsAdapter] Session context fallback failed (context may be stale)");
@@ -1645,6 +1482,29 @@ export class TeamsAdapter extends MessagingAdapter {
     }
 
     log.debug({ type: notification.type, sessionName: notification.sessionName }, "[TeamsAdapter] sendNotification: no delivery path available");
+  }
+
+  /** Build a notification Adaptive Card with the same info Container style. */
+  private static buildNotificationCard(emoji: string, label: string, detail: string, deepLink?: string): Record<string, unknown> {
+    // Pre-escape detail, then append raw markdown link (buildLevel2 would double-escape it)
+    const content = deepLink
+      ? `${escapeMd(detail)}\n[Open →](${deepLink})`
+      : escapeMd(detail);
+    return {
+      type: "AdaptiveCard",
+      version: "1.4",
+      body: [
+        {
+          type: "Container",
+          spacing: "Small",
+          items: [
+            buildLevel1(emoji, escapeMd(label)),
+            buildLevel2(content, undefined, true),
+          ],
+        },
+      ],
+      width: "stretch",
+    };
   }
 
   // ─── createSessionThread ─────────────────────────────────────────────────

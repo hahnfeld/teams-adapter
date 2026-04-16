@@ -2,8 +2,7 @@ import type { CommandContext } from "./index.js";
 import { log } from "@openacp/plugin-sdk";
 
 /**
- * Handle /cancel — abort the current prompt in the active session.
- * Mirrors Telegram's handleCancel pattern: abortPrompt, not destroy.
+ * Handle /cancel — finalize the current card and destroy the session.
  */
 export async function handleCancel(ctx: CommandContext): Promise<void> {
   if (!ctx.sessionId) {
@@ -17,17 +16,12 @@ export async function handleCancel(ctx: CommandContext): Promise<void> {
   }
 
   try {
-    await session.abortPrompt();
-    await ctx.reply("⛔ Prompt aborted. Session is still active — send a new message to continue.");
+    await ctx.adapter["composer"].finalize(ctx.sessionId);
+    try { await session.destroy(); } catch { /* best effort */ }
+    await ctx.reply("🚫 Session cancelled.");
   } catch (err) {
-    log.error({ err, sessionId: ctx.sessionId }, "[session] abortPrompt failed");
-    // Fallback: destroy the session
-    try {
-      await session.destroy();
-      await ctx.reply("🚫 Session cancelled.");
-    } catch {
-      await ctx.reply("❌ Failed to cancel session.");
-    }
+    log.error({ err, sessionId: ctx.sessionId }, "[session] cancel failed");
+    await ctx.reply("❌ Failed to cancel session.");
   }
 }
 
