@@ -4,23 +4,37 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { PermissionHandler } from "../permissions.js";
 
+function mockComposer() {
+  const addPermission = vi.fn().mockReturnValue("entry-1");
+  const resolvePermission = vi.fn();
+  const msg = { addPermission, resolvePermission };
+  return {
+    getOrCreate: vi.fn().mockReturnValue(msg),
+    get: vi.fn().mockReturnValue(msg),
+    msg,
+    addPermission,
+    resolvePermission,
+  };
+}
+
 describe("PermissionHandler", () => {
   let handler: PermissionHandler;
   let mockGetSession: ReturnType<typeof vi.fn>;
   let mockSendNotification: ReturnType<typeof vi.fn>;
+  let composer: ReturnType<typeof mockComposer>;
 
   beforeEach(() => {
     mockGetSession = vi.fn();
     mockSendNotification = vi.fn().mockResolvedValue(undefined);
-    handler = new PermissionHandler(mockGetSession, mockSendNotification);
+    composer = mockComposer();
+    handler = new PermissionHandler(mockGetSession, mockSendNotification, composer as any);
   });
 
   describe("sendPermissionRequest", () => {
-    it("sends an Adaptive Card with permission buttons", async () => {
-      const mockSendActivity = vi.fn().mockResolvedValue({ id: "activity-1" });
+    it("adds a permission entry to the session card", async () => {
       const mockContext = {
         activity: { id: "a1", conversation: { id: "conv-1" } },
-        sendActivity: mockSendActivity,
+        sendActivity: vi.fn().mockResolvedValue({ id: "activity-1" }),
       };
 
       const session = {
@@ -40,121 +54,79 @@ describe("PermissionHandler", () => {
 
       await handler.sendPermissionRequest(session as any, request, mockContext as any);
 
-      expect(mockSendActivity).toHaveBeenCalledTimes(1);
-      const call = mockSendActivity.mock.calls[0][0];
-      expect(call.attachments).toHaveLength(1);
+      // Permission entry added to the composer
+      expect(composer.addPermission).toHaveBeenCalledWith(
+        "Allow file read?",
+        expect.arrayContaining([
+          expect.objectContaining({ title: "✅ Allow", data: expect.objectContaining({ verb: "allow" }) }),
+          expect.objectContaining({ title: "❌ Deny", data: expect.objectContaining({ verb: "deny" }) }),
+        ]),
+      );
 
-      // Verify notification was fired (fire-and-forget)
+      // Notification fired
       expect(mockSendNotification).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionId: "session-1",
-          type: "permission",
-        }),
+        expect.objectContaining({ sessionId: "session-1", type: "permission" }),
       );
     });
   });
 
   describe("handleCardAction", () => {
     it("returns false for unknown verbs", async () => {
-      const mockContext = {
-        sendActivity: vi.fn().mockResolvedValue(undefined),
-        updateActivity: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const result = await handler.handleCardAction(
-        mockContext as any,
-        "unknown_verb",
-        "session-1",
-        "callback-key",
-        "req-1",
-      );
+      const mockContext = { activity: { from: { id: "user-1" } } };
+      const result = await handler.handleCardAction(mockContext as any, "unknown_verb", "session-1", "key", "req-1");
       expect(result).toBe(false);
     });
 
-    it("returns true and sends expired message for unknown callback key", async () => {
-      const mockSendActivity = vi.fn().mockResolvedValue(undefined);
-      const mockContext = {
-        sendActivity: mockSendActivity,
-        updateActivity: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const result = await handler.handleCardAction(
-        mockContext as any,
-        "allow",
-        "session-1",
-        "nonexistent-key",
-        "req-1",
-      );
+    it("returns true for unknown callback key (expired)", async () => {
+      const mockContext = { activity: { from: { id: "user-1" } } };
+      const result = await handler.handleCardAction(mockContext as any, "allow", "session-1", "nonexistent-key", "req-1");
       expect(result).toBe(true);
-      expect(mockSendActivity).toHaveBeenCalledTimes(1);
-      // Now sends an Adaptive Card instead of plain text
-      const call = mockSendActivity.mock.calls[0][0];
-      expect(call.attachments).toHaveLength(1);
     });
 
-    it("resolves permission and updates card on valid action", async () => {
-      const mockSendActivity = vi.fn().mockResolvedValue({ id: "activity-1" });
-      const mockUpdateActivity = vi.fn().mockResolvedValue(undefined);
+    it("resolves permission and updates the entry in the card", async () => {
       const mockResolve = vi.fn();
-
       const session = {
         id: "session-1",
         permissionGate: { requestId: "req-1", resolve: mockResolve },
       };
       mockGetSession.mockReturnValue(session);
 
-      // First, send a permission request to create a pending entry
+      // Send a permission request to create a pending entry
       const sendContext = {
         activity: { id: "a1", conversation: { id: "conv-1" } },
-        sendActivity: mockSendActivity,
+        sendActivity: vi.fn().mockResolvedValue({ id: "activity-1" }),
       };
-      await handler.sendPermissionRequest(
-        session as any,
-        {
-          id: "req-1",
-          description: "Allow?",
-          options: [
-            { id: "opt-allow", label: "Allow", isAllow: true },
-            { id: "opt-deny", label: "Deny", isAllow: false },
-          ],
-        },
-        sendContext as any,
-      );
+      await handler.sendPermissionRequest(session as any, {
+        id: "req-1",
+        description: "Allow?",
+        options: [
+          { id: "opt-allow", label: "Allow", isAllow: true },
+          { id: "opt-deny", label: "Deny", isAllow: false },
+        ],
+      }, sendContext as any);
 
-      // Extract the callback key from the ActionSet inside the Container
-      const cardData = mockSendActivity.mock.calls[0][0].attachments[0].content;
-      const container = cardData.body[0];
-      const actionSet = container.items.find((i: any) => i.type === "ActionSet");
-      const allowAction = actionSet.actions.find((a: any) => a.data.verb === "allow");
-      const callbackKey = allowAction.data.callbackKey;
+      // Extract the callbackKey from the addPermission call
+      const actions = composer.addPermission.mock.calls[0][1];
+      const callbackKey = actions[0].data.callbackKey;
 
-      // Now handle the card action
-      const actionContext = {
-        activity: { from: { id: "user-1", name: "Test User" } },
-        sendActivity: vi.fn().mockResolvedValue(undefined),
-        updateActivity: mockUpdateActivity,
-      };
-
-      const result = await handler.handleCardAction(
-        actionContext as any,
-        "allow",
-        "session-1",
-        callbackKey,
-        "req-1",
-      );
+      // Handle the card action
+      const actionContext = { activity: { from: { id: "user-1", name: "Test User" } } };
+      const result = await handler.handleCardAction(actionContext as any, "allow", "session-1", callbackKey, "req-1");
 
       expect(result).toBe(true);
       expect(mockResolve).toHaveBeenCalledWith("opt-allow");
+      expect(composer.resolvePermission).toHaveBeenCalledWith(
+        "entry-1",
+        expect.stringContaining("Allowed"),
+      );
     });
   });
 
   describe("evictStale", () => {
     it("does not crash with many pending entries", async () => {
-      // Create 100+ pending entries to trigger eviction
-      const mockSendActivity = vi.fn().mockResolvedValue({ id: "a1" });
       const mockContext = {
         activity: { id: "a1", conversation: { id: "c1" } },
-        sendActivity: mockSendActivity,
+        sendActivity: vi.fn().mockResolvedValue({ id: "a1" }),
       };
       const session = { id: "s1", name: "Test" };
       const request = {
@@ -167,8 +139,7 @@ describe("PermissionHandler", () => {
         await handler.sendPermissionRequest(session as any, request, mockContext as any);
       }
 
-      // Should not throw
-      expect(mockSendActivity).toHaveBeenCalledTimes(110);
+      expect(composer.addPermission).toHaveBeenCalledTimes(110);
     });
   });
 });

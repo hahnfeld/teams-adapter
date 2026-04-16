@@ -45,6 +45,7 @@ type BodyEntry =
   | { id: string; kind: "text"; text: string }
   | { id: string; kind: "plan"; entries: { content: string; status: string }[] }
   | { id: string; kind: "resource"; text: string }
+  | { id: string; kind: "permission"; description: string; actions: { type: string; title: string; data: Record<string, unknown> }[]; resolved?: string }
   | { id: string; kind: "usage"; text: string }
   | { id: string; kind: "divider" };
 
@@ -222,6 +223,27 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           spacing: "None",
         });
         break;
+
+      case "permission": {
+        const permItems: unknown[] = [];
+        if (entry.resolved) {
+          // Resolved — show result
+          const icon = entry.resolved.startsWith("Denied") ? "❌" : "✅";
+          permItems.push(buildLevel1(icon, `Permission — ${escapeMd(entry.resolved)}`));
+          permItems.push(buildLevel2(entry.description));
+        } else {
+          // Pending — show description + action buttons
+          permItems.push(buildLevel1("🔐", "Permission"));
+          permItems.push(buildLevel2(entry.description));
+          permItems.push({
+            type: "ActionSet",
+            spacing: "Small",
+            actions: entry.actions,
+          });
+        }
+        blocks.push({ type: "Container", items: permItems, spacing: "Small" });
+        break;
+      }
 
       case "usage":
         // Captured and appended after the loop to ensure it's always last
@@ -429,6 +451,28 @@ export class SessionMessage {
     this.cancelEmptyCardTimer();
     this.entries.push({ id: nextId(), kind: "info", emoji, label, detail });
     this.requestFlush();
+  }
+
+  /**
+   * Add a permission request entry with action buttons. Returns the entry ID
+   * for resolving later with resolvePermission().
+   */
+  addPermission(description: string, actions: { type: string; title: string; data: Record<string, unknown> }[]): string {
+    this.cancelEmptyCardTimer();
+    const id = nextId();
+    this.entries.push({ id, kind: "permission", description, actions });
+    this.requestFlush();
+    return id;
+  }
+
+  /** Resolve a permission entry — replace buttons with the result text. */
+  resolvePermission(id: string, result: string): void {
+    const entry = this.findEntry(id);
+    if (entry && entry.kind === "permission") {
+      entry.resolved = result;
+      entry.actions = [];
+      this.requestFlush();
+    }
   }
 
   /** Add or replace the plan entry. */

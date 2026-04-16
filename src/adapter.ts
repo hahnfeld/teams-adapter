@@ -163,6 +163,7 @@ export class TeamsAdapter extends MessagingAdapter {
       this.permissionHandler = new PermissionHandler(
         (sessionId) => this.core.sessionManager.getSession(sessionId),
         (notification) => this.sendNotification(notification),
+        this.composer,
       );
 
       this.setupMessageHandler();

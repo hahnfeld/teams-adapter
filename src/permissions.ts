@@ -2,16 +2,14 @@ import type { TurnContext } from "@microsoft/agents-hosting";
 import { nanoid } from "nanoid";
 import type { PermissionRequest, NotificationMessage, Session } from "@openacp/plugin-sdk";
 import { log } from "@openacp/plugin-sdk";
-import { sendCard, updateActivity, adaptiveCardAttachment } from "./send-utils.js";
-import { buildLevel1, buildLevel2, escapeMd } from "./message-composer.js";
+import type { SessionMessageManager } from "./message-composer.js";
 
 interface PendingPermission {
   sessionId: string;
   requestId: string;
   description: string;
+  entryId: string;
   options: { id: string; label: string; isAllow: boolean }[];
-  activityId?: string;
-  conversationId?: string;
   createdAt: number;
 }
 
@@ -25,6 +23,7 @@ export class PermissionHandler {
   constructor(
     private getSession: (sessionId: string) => Session | undefined,
     private sendNotification: (notification: NotificationMessage) => Promise<void>,
+    private composer: SessionMessageManager,
   ) {
     this._evictionTimer = setInterval(() => this.evictStale(true), 5 * 60 * 1000);
     this._evictionTimer.unref();
@@ -61,56 +60,27 @@ export class PermissionHandler {
     this.evictStale();
     const callbackKey = nanoid(8);
     const now = Date.now();
+
+    // Build Action.Submit buttons for the card
+    const actions = request.options.map((option) => ({
+      type: "Action.Submit" as const,
+      title: `${option.isAllow ? "✅" : "❌"} ${option.label}`,
+      data: { verb: option.isAllow ? "allow" : "deny", sessionId: session.id, callbackKey, requestId: request.id },
+    }));
+
+    // Add to the session card
+    const msg = this.composer.getOrCreate(session.id, context);
+    const entryId = msg.addPermission(request.description, actions);
+
     this.pending.set(callbackKey, {
       sessionId: session.id,
       requestId: request.id,
       description: request.description,
+      entryId,
       options: request.options.map((o) => ({ id: o.id, label: o.label, isAllow: o.isAllow })),
-      activityId: context.activity.id as string | undefined,
-      conversationId: context.activity.conversation?.id as string | undefined,
       createdAt: now,
     });
     this.pendingTimestamps.set(callbackKey, now);
-
-    // Build permission card matching the info Container style
-    const card = {
-      type: "AdaptiveCard" as const,
-      version: "1.4" as const,
-      body: [
-        {
-          type: "Container",
-          spacing: "Small",
-          items: [
-            buildLevel1("🔐", "Permission"),
-            buildLevel2(request.description),
-            // Option buttons — inline ActionSet (smaller than top-level actions)
-            {
-              type: "ActionSet",
-              spacing: "Small",
-              actions: request.options.map((option) => ({
-                type: "Action.Submit" as const,
-                title: `${option.isAllow ? "✅" : "❌"} ${option.label}`,
-                data: { verb: option.isAllow ? "allow" : "deny", sessionId: session.id, callbackKey, requestId: request.id },
-              })),
-            },
-          ],
-        },
-      ],
-      width: "stretch",
-    };
-
-    try {
-      const result = await sendCard(context, card as Record<string, unknown>);
-      const activityId = (result as { id?: string })?.id;
-      const pendingEntry = this.pending.get(callbackKey);
-      if (pendingEntry && activityId) {
-        pendingEntry.activityId = activityId;
-        pendingEntry.conversationId = context.activity.conversation?.id as string | undefined;
-      }
-    } catch (err) {
-      log.warn({ err, sessionId: session.id }, "[PermissionHandler] Failed to send permission request");
-      return;
-    }
 
     this.sendNotification({
       sessionId: session.id,
@@ -133,25 +103,7 @@ export class PermissionHandler {
 
     const pending = this.pending.get(callbackKey);
     if (!pending) {
-      try {
-        // Show expired as an info-style card
-        const card = {
-          type: "AdaptiveCard",
-          version: "1.4",
-          body: [{
-            type: "Container",
-            spacing: "Small",
-            items: [
-              buildLevel1("🔐", "Permission"),
-              buildLevel2("Expired or already responded to"),
-            ],
-          }],
-          width: "stretch",
-        };
-        await sendCard(context, card);
-      } catch (err) {
-        log.warn({ err, callbackKey }, "[PermissionHandler] Failed to send expired message");
-      }
+      log.debug({ callbackKey }, "[PermissionHandler] Permission expired or already responded to");
       return true;
     }
 
@@ -173,35 +125,16 @@ export class PermissionHandler {
       }
     }
 
+    // Update the permission entry in the session card
+    const decision = verb === "always" ? "Always Allowed" : verb === "allow" ? "Allowed" : "Denied";
+    const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.round(elapsed / 60)}m`;
+    const msg = this.composer.get(pending.sessionId);
+    if (msg) {
+      msg.resolvePermission(pending.entryId, `${decision} (${respondedBy}, ${elapsedStr})`);
+    }
+
     this.pending.delete(callbackKey);
     this.pendingTimestamps.delete(callbackKey);
-
-    // Update the original card to show the resolved state
-    if (pending.activityId && pending.conversationId) {
-      try {
-        const decision = verb === "always" ? "Always Allowed" : verb === "allow" ? "Allowed" : "Denied";
-        const decisionIcon = verb === "deny" ? "❌" : "✅";
-        const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.round(elapsed / 60)}m`;
-
-        const updatedCard = {
-          type: "AdaptiveCard" as const,
-          version: "1.4" as const,
-          body: [{
-            type: "Container",
-            spacing: "Small",
-            items: [
-              buildLevel1(decisionIcon, `Permission — ${escapeMd(decision)}`),
-              buildLevel2(`${pending.description} (${respondedBy}, ${elapsedStr})`),
-            ],
-          }],
-          width: "stretch",
-        };
-        await updateActivity(context, {
-          id: pending.activityId,
-          attachments: [adaptiveCardAttachment(updatedCard as Record<string, unknown>)],
-        });
-      } catch { /* ignore update failures */ }
-    }
 
     return true;
   }
