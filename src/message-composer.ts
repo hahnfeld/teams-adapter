@@ -576,7 +576,7 @@ export class SessionMessage {
       type: "AdaptiveCard",
       version: "1.4",
       body: body.length > 0 ? body : [{ type: "TextBlock", text: "…" }],
-      width: "stretch",
+      msteams: { width: "Full" },
     };
   }
 

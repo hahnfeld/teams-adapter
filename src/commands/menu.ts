@@ -21,7 +21,7 @@ export async function handleMenu(ctx: CommandContext): Promise<void> {
       { type: "Action.Submit", title: "📋 Sessions", data: { verb: "cmd:sessions" } },
       { type: "Action.Submit", title: "🔍 Doctor", data: { verb: "cmd:doctor" } },
     ],
-    width: "stretch",
+    msteams: { width: "Full" },
   };
 
   await sendCard(ctx.context, card as Record<string, unknown>);

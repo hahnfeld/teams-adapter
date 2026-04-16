@@ -870,7 +870,7 @@ export class TeamsAdapter extends MessagingAdapter {
             title: opt.label.slice(0, 20),
             data: { verb: `cmd:${opt.command}` },
           })),
-          width: "stretch",
+          msteams: { width: "Full" },
         };
         await sendCard(context, card);
         break;
@@ -889,7 +889,7 @@ export class TeamsAdapter extends MessagingAdapter {
             { type: "Action.Submit", title: "Yes", data: { verb: `cmd:${response.onYes}` } },
             { type: "Action.Submit", title: "No", data: { verb: "cmd:noop" } },
           ],
-          width: "stretch",
+          msteams: { width: "Full" },
         };
         await sendCard(context, card);
         break;
@@ -1517,7 +1517,7 @@ export class TeamsAdapter extends MessagingAdapter {
           ],
         },
       ],
-      width: "stretch",
+      msteams: { width: "Full" },
     };
   }
 

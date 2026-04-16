@@ -97,7 +97,7 @@ export function buildFileAttachmentCard(
   size: number,
   contentType: string,
   shareUrl?: string,
-): { type: "AdaptiveCard"; version: "1.2"; body: unknown[]; actions?: unknown[]; width?: string } {
+): { type: "AdaptiveCard"; version: "1.2"; body: unknown[]; actions?: unknown[]; msteams?: { width: string } } {
   const sizeStr = size >= 1024 * 1024
     ? `${(size / 1024 / 1024).toFixed(1)} MB`
     : `${(size / 1024).toFixed(1)} KB`;
@@ -133,7 +133,7 @@ export function buildFileAttachmentCard(
           url: shareUrl,
         },
       ],
-      width: "stretch",
+      msteams: { width: "Full" },
     };
   }
 
@@ -145,5 +145,5 @@ export function buildFileAttachmentCard(
     wrap: true,
   });
 
-  return { type: "AdaptiveCard", version: "1.2", body, width: "stretch" };
+  return { type: "AdaptiveCard", version: "1.2", body, msteams: { width: "Full" } };
 }

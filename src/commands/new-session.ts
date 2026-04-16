@@ -67,7 +67,7 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
           ],
         },
       ],
-      width: "stretch",
+      msteams: { width: "Full" },
     };
     await sendCard(ctx.context, card as Record<string, unknown>);
     return;

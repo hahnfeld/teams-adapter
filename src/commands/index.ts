@@ -26,7 +26,7 @@ export async function sendInfoCard(ctx: CommandContext, emoji: string, label: st
         buildLevel2(detail),
       ],
     }],
-    width: "stretch",
+    msteams: { width: "Full" },
   };
   await sendCard(ctx.context, card as Record<string, unknown>);
 }
