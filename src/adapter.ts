@@ -1332,12 +1332,28 @@ export class TeamsAdapter extends MessagingAdapter {
     }
   }
 
-  protected async handleSystem(sessionId: string, content: OutgoingMessage): Promise<void> {
-    if (!content.text) return;
+  /**
+   * Send an info entry. If a card is active (mid-turn), adds to it.
+   * Otherwise sends a standalone info card that completes immediately.
+   */
+  private async sendInfo(sessionId: string, emoji: string, label: string, detail: string): Promise<void> {
     const ctx = this._sessionContexts.get(sessionId);
     if (!ctx) return;
-    const msg = this.composer.getOrCreate(sessionId, ctx.context);
-    msg.addInfo("⚙️", "System", content.text);
+
+    if (this.composer.has(sessionId)) {
+      // Mid-turn — add to the existing card
+      const msg = this.composer.getOrCreate(sessionId, ctx.context);
+      msg.addInfo(emoji, label, detail);
+    } else {
+      // Standalone — send a one-shot card (no "Working." animation)
+      const card = TeamsAdapter.buildNotificationCard(emoji, label, detail);
+      await sendCard(ctx.context, card);
+    }
+  }
+
+  protected async handleSystem(sessionId: string, content: OutgoingMessage): Promise<void> {
+    if (!content.text) return;
+    await this.sendInfo(sessionId, "⚙️", "System", content.text);
   }
 
   /** Sanitize metadata strings for safe markdown interpolation. */
@@ -1346,28 +1362,19 @@ export class TeamsAdapter extends MessagingAdapter {
   }
 
   protected async handleModeChange(sessionId: string, content: OutgoingMessage): Promise<void> {
-    const ctx = this._sessionContexts.get(sessionId);
-    if (!ctx) return;
     const modeId = TeamsAdapter.sanitizeMd(String((content.metadata as Record<string, unknown>)?.modeId ?? ""));
-    const msg = this.composer.getOrCreate(sessionId, ctx.context);
-    msg.addInfo("⚙️", "Mode", modeId);
+    await this.sendInfo(sessionId, "⚙️", "Mode", modeId);
   }
 
   protected async handleConfigUpdate(sessionId: string, content: OutgoingMessage): Promise<void> {
-    const ctx = this._sessionContexts.get(sessionId);
-    if (!ctx) return;
     const key = (content.metadata as Record<string, unknown>)?.key;
     const detail = key ? TeamsAdapter.sanitizeMd(String(key)) : "updated";
-    const msg = this.composer.getOrCreate(sessionId, ctx.context);
-    msg.addInfo("⚙️", "Config", detail);
+    await this.sendInfo(sessionId, "⚙️", "Config", detail);
   }
 
   protected async handleModelUpdate(sessionId: string, content: OutgoingMessage): Promise<void> {
-    const ctx = this._sessionContexts.get(sessionId);
-    if (!ctx) return;
     const modelId = TeamsAdapter.sanitizeMd(String((content.metadata as Record<string, unknown>)?.modelId ?? ""));
-    const msg = this.composer.getOrCreate(sessionId, ctx.context);
-    msg.addInfo("⚙️", "Model", modelId);
+    await this.sendInfo(sessionId, "⚙️", "Model", modelId);
   }
 
   protected async handleUserReplay(sessionId: string, content: OutgoingMessage): Promise<void> {
