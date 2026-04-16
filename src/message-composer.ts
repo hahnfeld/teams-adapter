@@ -65,7 +65,7 @@ function formatElapsed(ms: number): string {
 }
 
 export function escapeMd(text: string): string {
-  return text.replace(/\[/g, "\\[").replace(/\*/g, "\\*").replace(/\]/g, "\\]");
+  return text.replace(/[[\]*_]/g, "\\$&");
 }
 
 const PLAN_STATUS_ICONS: Record<string, string> = {

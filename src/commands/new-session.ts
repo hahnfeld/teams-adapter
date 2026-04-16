@@ -13,14 +13,9 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
   const workspace = args[1];
 
   if (!agentName) {
-    // Cancel the old session before showing the wizard
-    if (ctx.sessionId) {
-      await ctx.adapter["composer"].finalize(ctx.sessionId);
-      const oldSession = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
-      if (oldSession) {
-        try { await oldSession.destroy(); } catch { /* best effort */ }
-      }
-    }
+    // Don't destroy the existing session here — the user hasn't committed yet.
+    // The session is destroyed in handleDialogAction("new-session") when the
+    // user actually submits the wizard form.
 
     // Send the session wizard inline as an Adaptive Card.
     // Uses the same Container + ColumnSet pattern as all other card entries.
