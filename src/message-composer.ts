@@ -40,7 +40,7 @@ const STALL_TIMEOUT = 120_000;
 
 type BodyEntry =
   | { id: string; kind: "title"; text: string }
-  | { id: string; kind: "timed"; emoji: string; label: string; startedAt: number; result?: string; endedAt?: number }
+  | { id: string; kind: "timed"; emoji: string; label: string; startedAt: number; result?: string; endedAt?: number; collapsible?: boolean }
   | { id: string; kind: "info"; emoji: string; label: string; detail: string }
   | { id: string; kind: "text"; text: string }
   | { id: string; kind: "plan"; entries: { content: string; status: string }[] }
@@ -163,15 +163,74 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
         const elapsed = entry.result
           ? formatElapsed((entry.endedAt ?? entry.startedAt) - entry.startedAt)
           : formatElapsed(now - entry.startedAt);
-        const headingText = entry.result
-          ? escapeMd(entry.label)
-          : `${escapeMd(entry.label)}…  (${elapsed})`;
 
-        const items: unknown[] = [buildLevel1(entry.emoji, headingText)];
-        if (entry.result) {
-          items.push(buildLevel2(entry.result, elapsed));
+        if (entry.collapsible && entry.result) {
+          // Completed thinking — collapsible with toggle
+          const detailId = `detail-${entry.id}`;
+          const showId = `show-${entry.id}`;
+          const hideId = `hide-${entry.id}`;
+          blocks.push({
+            type: "Container",
+            spacing: "Small",
+            items: [
+              {
+                type: "ColumnSet",
+                spacing: "None",
+                columns: [
+                  {
+                    type: "Column",
+                    width: "auto",
+                    items: [buildLevel1(entry.emoji, `${escapeMd(entry.label)}  (${elapsed})`)],
+                    verticalContentAlignment: "Center",
+                  },
+                  {
+                    type: "Column",
+                    width: "auto",
+                    items: [
+                      // "▶ Show" button — visible when collapsed
+                      {
+                        type: "ActionSet",
+                        id: showId,
+                        isVisible: true,
+                        spacing: "None",
+                        actions: [{
+                          type: "Action.ToggleVisibility",
+                          title: "▶ Show",
+                          targetElements: [detailId, showId, hideId],
+                        }],
+                      },
+                      // "▼ Hide" button — visible when expanded
+                      {
+                        type: "ActionSet",
+                        id: hideId,
+                        isVisible: false,
+                        spacing: "None",
+                        actions: [{
+                          type: "Action.ToggleVisibility",
+                          title: "▼ Hide",
+                          targetElements: [detailId, showId, hideId],
+                        }],
+                      },
+                    ],
+                    verticalContentAlignment: "Center",
+                  },
+                ],
+              },
+              // Collapsible detail — hidden by default
+              { ...buildLevel2(entry.result, elapsed), id: detailId, isVisible: false },
+            ],
+          });
+        } else {
+          // Running (no result) or non-collapsible — standard rendering
+          const headingText = entry.result
+            ? escapeMd(entry.label)
+            : `${escapeMd(entry.label)}…  (${elapsed})`;
+          const items: unknown[] = [buildLevel1(entry.emoji, headingText)];
+          if (entry.result) {
+            items.push(buildLevel2(entry.result, elapsed));
+          }
+          blocks.push({ type: "Container", items, spacing: "Small" });
         }
-        blocks.push({ type: "Container", items, spacing: "Small" });
         break;
       }
 
@@ -425,6 +484,9 @@ export class SessionMessage {
     this.cancelEmptyCardTimer();
     if (!this.thinkingActive) {
       const id = this.addTimedStart("☁️", "Thinking");
+      // Mark as collapsible so the card builder adds a toggle after completion
+      const entry = this.findEntry(id);
+      if (entry && entry.kind === "timed") entry.collapsible = true;
       this.thinkingActive = id;
       this.thinkingText = text;
     } else {
