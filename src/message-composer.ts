@@ -142,6 +142,7 @@ export function buildLevel2(text: string, elapsed?: string, raw = false): Record
 
 function buildCardBody(entries: BodyEntry[]): unknown[] {
   const blocks: unknown[] = [];
+  let usageBlock: unknown | null = null;
   const now = Date.now();
 
   for (const entry of entries) {
@@ -223,14 +224,15 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
         break;
 
       case "usage":
-        blocks.push({
+        // Captured and appended after the loop to ensure it's always last
+        usageBlock = {
           type: "TextBlock",
           text: `*${escapeMd(entry.text)}*`,
           isSubtle: true,
           size: "Small",
           fontType: "Monospace",
           spacing: "None",
-        });
+        };
         break;
 
       case "divider":
@@ -245,6 +247,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
     }
   }
 
+  if (usageBlock) blocks.push(usageBlock);
   return blocks;
 }
 

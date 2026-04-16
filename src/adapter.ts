@@ -1235,6 +1235,9 @@ export class TeamsAdapter extends MessagingAdapter {
       if (meta.cost != null) parts.push(`$${meta.cost.toFixed(4)}`);
       msg.setUsage(parts.join(" · "));
     }
+    // Usage is the last event of a prompt turn — finalize the card so
+    // the next turn gets a fresh one.
+    await this.composer.finalize(sessionId);
   }
 
   /**
