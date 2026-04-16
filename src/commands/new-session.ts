@@ -1,25 +1,8 @@
+import { sendInfoCard } from "./index.js";
 import type { CommandContext } from "./index.js";
 import { log } from "@openacp/plugin-sdk";
 import { sendCard } from "../send-utils.js";
-import { buildLevel1, buildLevel2, escapeMd } from "../message-composer.js";
-
-/** Send a one-shot info card matching the standard Container style. */
-async function sendInfoCard(ctx: CommandContext, emoji: string, label: string, detail: string): Promise<void> {
-  const card = {
-    type: "AdaptiveCard",
-    version: "1.4",
-    body: [{
-      type: "Container",
-      spacing: "Small",
-      items: [
-        buildLevel1(emoji, escapeMd(label)),
-        buildLevel2(detail),
-      ],
-    }],
-    width: "stretch",
-  };
-  await sendCard(ctx.context, card as Record<string, unknown>);
-}
+import { buildLevel1 } from "../message-composer.js";
 
 /**
  * Handle /new [agent] [workspace] — create a new agent session.

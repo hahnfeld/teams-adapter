@@ -1,6 +1,8 @@
 import type { TurnContext } from "@microsoft/agents-hosting";
 import { log } from "@openacp/plugin-sdk";
 import type { TeamsAdapter } from "../adapter.js";
+import { sendCard } from "../send-utils.js";
+import { buildLevel1, buildLevel2, escapeMd } from "../message-composer.js";
 
 import { handleNew, handleNewChat } from "./new-session.js";
 import { handleCancel, handleStatus, handleSessions, handleHandoff } from "./session.js";
@@ -10,6 +12,24 @@ import { handleAgents, handleInstall } from "./agents.js";
 import { handleDoctor } from "./doctor.js";
 import { handleIntegrate } from "./integrate.js";
 import { handleSettings } from "./settings.js";
+
+/** Send a one-shot info card matching the standard Container style. */
+export async function sendInfoCard(ctx: CommandContext, emoji: string, label: string, detail: string): Promise<void> {
+  const card = {
+    type: "AdaptiveCard",
+    version: "1.4",
+    body: [{
+      type: "Container",
+      spacing: "Small",
+      items: [
+        buildLevel1(emoji, escapeMd(label)),
+        buildLevel2(detail),
+      ],
+    }],
+    width: "stretch",
+  };
+  await sendCard(ctx.context, card as Record<string, unknown>);
+}
 
 export interface CommandContext {
   context: TurnContext;
@@ -154,9 +174,8 @@ export async function handleCommand(
     return true;
   } catch (err) {
     log.error({ err, commandName }, "[teams-router] Command handler failed");
-    const errMsg = `❌ Command failed: ${err instanceof Error ? err.message : String(err)}`;
     try {
-      await ctx.reply(errMsg);
+      await sendInfoCard(ctx, "❌", "Command failed", err instanceof Error ? err.message : String(err));
     } catch { /* ignore */ }
     return true;
   }
@@ -225,11 +244,11 @@ export async function setupCardActionCallbacks(
         case "noop":
           break;
         default:
-          await ctx.reply(`Unknown action: ${command}`);
+          await sendInfoCard(ctx, "⚠️", "Unknown action", command);
       }
     } catch (err) {
       log.error({ err, command }, "[teams-router] Card action command failed");
-      await ctx.reply(`❌ Command failed`);
+      await sendInfoCard(ctx, "❌", "Command failed", err instanceof Error ? err.message : "Unknown error");
     }
   }
 }
@@ -241,38 +260,38 @@ export async function setupCardActionCallbacks(
  * dispatches through the CommandRegistry. Avoids duplicating registry
  * lookup logic that the adapter already handles.
  */
-async function delegateToRegistry(ctx: CommandContext, commandText: string, fallbackMsg: string): Promise<void> {
+async function delegateToRegistry(ctx: CommandContext, commandText: string, fallbackEmoji: string, fallbackLabel: string, fallbackDetail: string): Promise<void> {
   if (!ctx.sessionId) {
-    await ctx.reply("❌ No active session.");
+    await sendInfoCard(ctx, "❌", "Error", "No active session.");
     return;
   }
   try {
     await ctx.adapter.handleCommand(commandText, ctx.context, ctx.sessionId, ctx.userId);
   } catch {
-    await ctx.reply(fallbackMsg);
+    await sendInfoCard(ctx, fallbackEmoji, fallbackLabel, fallbackDetail);
   }
 }
 
 async function handleModeSwitch(ctx: CommandContext, mode?: string): Promise<void> {
   if (!mode) {
-    await ctx.reply("Usage: `/mode <mode-name>`\n\nExample: `/mode plan`, `/mode code`");
+    await sendInfoCard(ctx, "⚙️", "Mode", "Usage: /mode <mode-name>");
     return;
   }
-  await delegateToRegistry(ctx, `/mode ${mode}`, `🔄 Mode set to **${mode}** (may require core command support)`);
+  await delegateToRegistry(ctx, `/mode ${mode}`, "⚙️", "Mode", mode);
 }
 
 async function handleModelSwitch(ctx: CommandContext, model?: string): Promise<void> {
   if (!model) {
-    await ctx.reply("Usage: `/model <model-name>`\n\nExample: `/model claude-sonnet`, `/model gpt-4o`");
+    await sendInfoCard(ctx, "🤖", "Model", "Usage: /model <model-name>");
     return;
   }
-  await delegateToRegistry(ctx, `/model ${model}`, `🤖 Model set to **${model}** (may require core command support)`);
+  await delegateToRegistry(ctx, `/model ${model}`, "🤖", "Model", model);
 }
 
 async function handleThoughtLevel(ctx: CommandContext, level?: string): Promise<void> {
   if (!level) {
-    await ctx.reply("Usage: `/thought <level>`\n\nExample: `/thought high`, `/thought low`, `/thought off`");
+    await sendInfoCard(ctx, "🧠", "Thought", "Usage: /thought <level>");
     return;
   }
-  await delegateToRegistry(ctx, `/thought ${level}`, `🧠 Thinking level set to **${level}** (may require core command support)`);
+  await delegateToRegistry(ctx, `/thought ${level}`, "🧠", "Thought", level);
 }

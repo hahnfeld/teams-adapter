@@ -1,9 +1,9 @@
+import { sendInfoCard } from "./index.js";
 import type { CommandContext } from "./index.js";
 import type { CommandRegistry } from "@openacp/plugin-sdk";
 
 /**
  * Handle /settings — show current configuration.
- * Delegates to core settings command if available, otherwise shows adapter config.
  */
 export async function handleSettings(ctx: CommandContext): Promise<void> {
   const registry = ctx.adapter.core.lifecycleManager?.serviceRegistry?.get<CommandRegistry>("command-registry");
@@ -16,42 +16,40 @@ export async function handleSettings(ctx: CommandContext): Promise<void> {
           sessionId: ctx.sessionId,
           channelId: "teams",
           userId: ctx.userId,
-          reply: async (content: string) => { await ctx.reply(content); },
+          reply: async (content: string) => {
+            await sendInfoCard(ctx, "⚙️", "Settings", content);
+          },
         });
         if (response.type === "text") {
-          await ctx.reply(response.text);
+          await sendInfoCard(ctx, "⚙️", "Settings", response.text);
         }
         return;
       } catch { /* fall through */ }
     }
   }
 
-  // Show adapter-level config
   const config = ctx.adapter.core.configManager.get();
   const defaultAgent = config.defaultAgent ?? "not set";
   const workspace = ctx.adapter.core.configManager.resolveWorkspace?.() ?? "not set";
 
-  let sessionInfo = "";
+  const lines: string[] = [
+    `Default agent: ${defaultAgent}`,
+    `Workspace: ${workspace}`,
+    `Channel: ${ctx.adapter.getChannelId() || "not set"}`,
+    `Graph API: ${ctx.adapter.getTeamId() ? "configured" : "not configured"}`,
+  ];
+
   if (ctx.sessionId) {
     const session = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
     if (session) {
-      sessionInfo = `\n\n---\n\n**Session Settings:**\n\n` +
-        `- Agent: ${session.agentName}\n\n` +
-        `- Mode: ${session.getConfigByCategory?.("mode")?.currentValue ?? "default"}\n\n` +
-        `- Model: ${session.getConfigByCategory?.("model")?.currentValue ?? "default"}\n\n` +
-        `- Bypass: ${session.clientOverrides?.bypassPermissions ? "on" : "off"}\n\n` +
-        `- TTS: ${session.voiceMode ?? "off"}`;
+      lines.push("");
+      lines.push(`Session: ${session.agentName}`);
+      lines.push(`Mode: ${session.getConfigByCategory?.("mode")?.currentValue ?? "default"}`);
+      lines.push(`Model: ${session.getConfigByCategory?.("model")?.currentValue ?? "default"}`);
+      lines.push(`Bypass: ${session.clientOverrides?.bypassPermissions ? "on" : "off"}`);
+      lines.push(`TTS: ${session.voiceMode ?? "off"}`);
     }
   }
 
-  await ctx.reply(
-    `**⚙️ Configuration**\n\n` +
-    `**Global:**\n\n` +
-    `- Default agent: ${defaultAgent}\n\n` +
-    `- Workspace: \`${workspace}\`\n\n` +
-    `- Teams channel: ${ctx.adapter.getChannelId() || "not set"}\n\n` +
-    `- Notification channel: ${ctx.adapter.getAssistantThreadId() ? "configured" : "not set"}\n\n` +
-    `- Graph API: ${ctx.adapter.getTeamId() ? "configured" : "not configured"}` +
-    sessionInfo,
-  );
+  await sendInfoCard(ctx, "⚙️", "Settings", lines.join("\n"));
 }

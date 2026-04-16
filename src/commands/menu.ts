@@ -1,3 +1,4 @@
+import { sendInfoCard } from "./index.js";
 import type { CommandContext } from "./index.js";
 import { sendCard, sendActivity } from "../send-utils.js";
 
@@ -85,8 +86,8 @@ export async function handleHelp(ctx: CommandContext): Promise<void> {
 export async function handleClear(ctx: CommandContext): Promise<void> {
   try {
     await ctx.adapter.respawnAssistant();
-    await ctx.reply("🗑️ Assistant session cleared and restarted.");
+    await sendInfoCard(ctx, "🗑️", "Cleared", "Assistant session restarted.");
   } catch (err) {
-    await ctx.reply(`❌ Clear failed: ${err instanceof Error ? err.message : String(err)}`);
+    await sendInfoCard(ctx, "❌", "Clear failed", err instanceof Error ? err.message : String(err));
   }
 }
