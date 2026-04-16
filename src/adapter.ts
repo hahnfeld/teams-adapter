@@ -1234,6 +1234,7 @@ export class TeamsAdapter extends MessagingAdapter {
       parts.push(`${formatTokens(meta.tokensUsed)} tokens`);
       if (meta.duration != null) parts.push(`${(meta.duration / 1000).toFixed(1)}s`);
       if (meta.cost != null) parts.push(`$${meta.cost.toFixed(4)}`);
+      parts.push("Done");
       msg.setUsage(parts.join(" · "));
     }
     // Usage is the last event of a prompt turn — finalize the card so
