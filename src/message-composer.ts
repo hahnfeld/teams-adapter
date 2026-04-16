@@ -155,7 +155,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           weight: "Bolder",
           size: "Medium",
           fontType: "Monospace",
-          spacing: "None",
+          spacing: "Small",
         });
         break;
 
@@ -194,7 +194,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           size: "Small",
           fontType: "Monospace",
           wrap: true,
-          spacing: "None",
+          spacing: "Small",
         });
         break;
 
@@ -220,19 +220,17 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           size: "Small",
           fontType: "Monospace",
           wrap: true,
-          spacing: "None",
+          spacing: "Small",
         });
         break;
 
       case "permission": {
         const permItems: unknown[] = [];
         if (entry.resolved) {
-          // Resolved — show result
           const icon = entry.resolved.startsWith("Denied") ? "❌" : "✅";
           permItems.push(buildLevel1(icon, `Permission — ${escapeMd(entry.resolved)}`));
           permItems.push(buildLevel2(entry.description));
         } else {
-          // Pending — show description + action buttons
           permItems.push(buildLevel1("🔐", "Permission"));
           permItems.push(buildLevel2(entry.description));
           permItems.push({
@@ -246,14 +244,13 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
       }
 
       case "usage":
-        // Captured and appended after the loop to ensure it's always last
         usageBlock = {
           type: "TextBlock",
           text: `*${escapeMd(entry.text)}*`,
           isSubtle: true,
           size: "Small",
           fontType: "Monospace",
-          spacing: "None",
+          spacing: "Small",
         };
         break;
 
@@ -263,7 +260,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           text: "─".repeat(30),
           size: "Small",
           fontType: "Monospace",
-          spacing: "None",
+          spacing: "Small",
         });
         break;
     }
