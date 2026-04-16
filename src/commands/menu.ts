@@ -17,11 +17,11 @@ export async function handleMenu(ctx: CommandContext): Promise<void> {
     actions: [
       { type: "Action.Submit", title: "➕ New Session", data: { verb: "cmd:new" } },
       { type: "Action.Submit", title: "⚙️ Settings", data: { verb: "cmd:settings" } },
-      // Inline commands
       { type: "Action.Submit", title: "📊 Status", data: { verb: "cmd:status" } },
       { type: "Action.Submit", title: "📋 Sessions", data: { verb: "cmd:sessions" } },
       { type: "Action.Submit", title: "🔍 Doctor", data: { verb: "cmd:doctor" } },
     ],
+    width: "stretch",
   };
 
   await sendCard(ctx.context, card as Record<string, unknown>);
