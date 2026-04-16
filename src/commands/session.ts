@@ -1,27 +1,47 @@
 import type { CommandContext } from "./index.js";
 import { log } from "@openacp/plugin-sdk";
+import { sendCard } from "../send-utils.js";
+import { buildLevel1, buildLevel2, escapeMd } from "../message-composer.js";
+
+/** Send a one-shot info card matching the standard Container style. */
+async function sendInfoCard(ctx: CommandContext, emoji: string, label: string, detail: string): Promise<void> {
+  const card = {
+    type: "AdaptiveCard",
+    version: "1.4",
+    body: [{
+      type: "Container",
+      spacing: "Small",
+      items: [
+        buildLevel1(emoji, escapeMd(label)),
+        buildLevel2(detail),
+      ],
+    }],
+    width: "stretch",
+  };
+  await sendCard(ctx.context, card as Record<string, unknown>);
+}
 
 /**
  * Handle /cancel — finalize the current card and destroy the session.
  */
 export async function handleCancel(ctx: CommandContext): Promise<void> {
   if (!ctx.sessionId) {
-    await ctx.reply("❌ No active session to cancel.");
+    await sendInfoCard(ctx, "❌", "Error", "No active session to cancel.");
     return;
   }
   const session = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
   if (!session) {
-    await ctx.reply("❌ Session not found.");
+    await sendInfoCard(ctx, "❌", "Error", "Session not found.");
     return;
   }
 
   try {
     await ctx.adapter["composer"].finalize(ctx.sessionId);
     try { await session.destroy(); } catch { /* best effort */ }
-    await ctx.reply("🚫 Session cancelled.");
+    await sendInfoCard(ctx, "🚫", "Cancelled", session.name || ctx.sessionId.slice(0, 8));
   } catch (err) {
     log.error({ err, sessionId: ctx.sessionId }, "[session] cancel failed");
-    await ctx.reply("❌ Failed to cancel session.");
+    await sendInfoCard(ctx, "❌", "Failed", "Could not cancel session.");
   }
 }
 

@@ -712,16 +712,13 @@ export class TeamsAdapter extends MessagingAdapter {
         // Store context so the adapter can send responses to this conversation
         this._sessionContexts.set(session.id, { context, isAssistant: false, threadId: conversationId });
 
-        await sendText(context,
-          `✅ Session created\n\n` +
-          `**Agent:** ${agentName}\n\n` +
-          `**Workspace:** \`${workspace}\`\n\n` +
-          `**Session:** ${session.id.slice(0, 8)}`,
-        );
+        const successCard = TeamsAdapter.buildNotificationCard("✅", "Session created", `${agentName} · ${workspace}`);
+        await sendCard(context, successCard);
       } catch (err) {
         log.error({ err, agentName, workspace }, "[TeamsAdapter] createSessionInBackground error");
         try {
-          await sendText(context, `❌ Failed to create session: ${(err as Error).message}`);
+          const errorCard = TeamsAdapter.buildNotificationCard("❌", "Failed", (err as Error).message);
+          await sendCard(context, errorCard);
         } catch { /* best effort */ }
       }
     })();
@@ -758,7 +755,8 @@ export class TeamsAdapter extends MessagingAdapter {
 
       // Send acknowledgment immediately, then create session in the background.
       // Session creation spawns an agent process (~30s) which would timeout the invoke.
-      await sendText(context, `🔄 Creating session with **${agentName}**...`);
+      const creatingCard = TeamsAdapter.buildNotificationCard("🔧", "Creating session", agentName);
+      await sendCard(context, creatingCard);
       this.createSessionInBackground(context, agentName, workspace);
       return;
     }

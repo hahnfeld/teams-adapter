@@ -1,7 +1,25 @@
 import type { CommandContext } from "./index.js";
 import { log } from "@openacp/plugin-sdk";
 import { sendCard } from "../send-utils.js";
-import { buildLevel1 } from "../message-composer.js";
+import { buildLevel1, buildLevel2, escapeMd } from "../message-composer.js";
+
+/** Send a one-shot info card matching the standard Container style. */
+async function sendInfoCard(ctx: CommandContext, emoji: string, label: string, detail: string): Promise<void> {
+  const card = {
+    type: "AdaptiveCard",
+    version: "1.4",
+    body: [{
+      type: "Container",
+      spacing: "Small",
+      items: [
+        buildLevel1(emoji, escapeMd(label)),
+        buildLevel2(detail),
+      ],
+    }],
+    width: "stretch",
+  };
+  await sendCard(ctx.context, card as Record<string, unknown>);
+}
 
 /**
  * Handle /new [agent] [workspace] — create a new agent session.
@@ -89,7 +107,7 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
       }
     }
 
-    await ctx.reply(`🔄 Creating session with **${agentName}**...`);
+    await sendInfoCard(ctx, "🔧", "Creating session", agentName);
 
     const conversationId = (ctx.context.activity?.conversation?.id as string | undefined)?.split(";")[0];
     const session = await (ctx.adapter.core as any).createSession({
@@ -104,15 +122,10 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
     }
     ctx.adapter["_sessionContexts"].set(session.id, { context: ctx.context, isAssistant: false, threadId: conversationId });
 
-    await ctx.reply(
-      `✅ Session created\n\n` +
-      `**Agent:** ${agentName}\n\n` +
-      `**Workspace:** \`${workDir}\`\n\n` +
-      `**Session:** ${session.id.slice(0, 8)}`,
-    );
+    await sendInfoCard(ctx, "✅", "Session created", `${agentName} · ${workDir}`);
   } catch (err) {
     log.error({ err, agentName }, "[new-session] Failed to create session");
-    await ctx.reply(`❌ Failed to create session: ${err instanceof Error ? err.message : String(err)}`);
+    await sendInfoCard(ctx, "❌", "Failed", err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -122,13 +135,13 @@ export async function handleNew(ctx: CommandContext, args: string[]): Promise<vo
  */
 export async function handleNewChat(ctx: CommandContext): Promise<void> {
   if (!ctx.sessionId) {
-    await ctx.reply("❌ No active session. Use `/new <agent>` to create one.");
+    await sendInfoCard(ctx, "❌", "Error", "No active session. Use /new to create one.");
     return;
   }
 
   const session = ctx.adapter.core.sessionManager.getSession(ctx.sessionId);
   if (!session) {
-    await ctx.reply("❌ Session not found.");
+    await sendInfoCard(ctx, "❌", "Error", "Session not found.");
     return;
   }
 
@@ -140,7 +153,7 @@ export async function handleNewChat(ctx: CommandContext): Promise<void> {
     await ctx.adapter["composer"].finalize(ctx.sessionId);
     try { await session.destroy(); } catch { /* best effort */ }
 
-    await ctx.reply(`🔄 Starting new chat with **${agentName}**...`);
+    await sendInfoCard(ctx, "🔧", "Starting new chat", agentName);
 
     const conversationId = (ctx.context.activity?.conversation?.id as string | undefined)?.split(";")[0];
     const newSession = await (ctx.adapter.core as any).createSession({
@@ -155,13 +168,9 @@ export async function handleNewChat(ctx: CommandContext): Promise<void> {
     }
     ctx.adapter["_sessionContexts"].set(newSession.id, { context: ctx.context, isAssistant: false, threadId: conversationId });
 
-    await ctx.reply(
-      `✅ New chat started\n\n` +
-      `**Agent:** ${agentName}\n\n` +
-      `**Session:** ${newSession.id.slice(0, 8)}`,
-    );
+    await sendInfoCard(ctx, "✅", "New chat started", `${agentName} · ${workspace}`);
   } catch (err) {
     log.error({ err }, "[new-session] Failed to create new chat");
-    await ctx.reply(`❌ Failed: ${err instanceof Error ? err.message : String(err)}`);
+    await sendInfoCard(ctx, "❌", "Failed", err instanceof Error ? err.message : String(err));
   }
 }
