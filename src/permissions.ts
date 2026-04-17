@@ -68,8 +68,8 @@ export class PermissionHandler {
       data: { verb: option.isAllow ? "allow" : "deny", sessionId: session.id, callbackKey, requestId: request.id },
     }));
 
-    // Add to the session card
-    const msg = this.composer.getOrCreate(session.id, context);
+    // Add to the existing session card (even if sealed after usage), or create fresh
+    const msg = this.composer.get(session.id) ?? this.composer.getOrCreate(session.id, context);
     const entryId = msg.addPermission(request.description, actions);
 
     this.pending.set(callbackKey, {

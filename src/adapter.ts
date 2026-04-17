@@ -493,6 +493,15 @@ export class TeamsAdapter extends MessagingAdapter {
           return;
         }
 
+        // Pre-create the "Working." card so the user sees instant feedback
+        // before the agent starts processing.
+        const existingSessionId = existingSessionBeforeSend.id;
+        this._sessionContexts.set(existingSessionId, { context, isAssistant: false, threadId });
+        if (existingSessionBeforeSend.threadId && existingSessionBeforeSend.threadId !== existingSessionId) {
+          this._sessionContexts.set(existingSessionBeforeSend.threadId, { context, isAssistant: false, threadId });
+        }
+        this.composer.getOrCreate(existingSessionId, context);
+
         // Fire and forget — response comes back via sendMessage/SessionBridge.
         // Don't await: a hung prompt (token exhaustion, etc.) would block all
         // subsequent messages in this conversation.
@@ -1166,6 +1175,14 @@ export class TeamsAdapter extends MessagingAdapter {
     if (content.text) msg.addText(content.text);
   }
 
+  /** Return the string if it's a real value, or null if empty/undefined/"undefined". */
+  private sanitizeMetaStr(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim().replace(/^["']+|["']+$/g, "");
+    if (!trimmed || trimmed === "undefined" || trimmed === "null") return null;
+    return value;
+  }
+
   protected async handleToolCall(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
 
     const ctx = this._sessionContexts.get(sessionId);
@@ -1174,11 +1191,12 @@ export class TeamsAdapter extends MessagingAdapter {
     this.ensureSessionTitle(sessionId, msg);
     msg.closeActiveThinking();
     const meta = (content.metadata ?? {}) as Partial<ToolCallMeta>;
-    const toolName = meta.name || content.text || "Tool";
+    const toolName = this.sanitizeMetaStr(meta.name)
+      ?? this.sanitizeMetaStr(content.text) ?? "Tool";
     const summary = formatToolSummary(
       toolName,
       meta.rawInput,
-      meta.displaySummary as string | undefined,
+      this.sanitizeMetaStr(meta.displaySummary) ?? undefined,
     );
     const entryId = msg.addTimedStart("🔧", summary);
     this._toolEntryIds.set(sessionId, entryId);
@@ -1190,12 +1208,14 @@ export class TeamsAdapter extends MessagingAdapter {
     if (!ctx) return;
     const msg = this.composer.getOrCreate(sessionId, ctx.context);
     const meta = (content.metadata ?? {}) as Partial<ToolCallMeta>;
-    const toolName = meta.name || content.text || "";
-    if (!toolName && !meta.displaySummary) return;
+    const toolName = this.sanitizeMetaStr(meta.name)
+      ?? this.sanitizeMetaStr(content.text) ?? "";
+    const displaySummary = this.sanitizeMetaStr(meta.displaySummary);
+    if (!toolName && !displaySummary) return;
     const summary = formatToolSummary(
       toolName || "Tool",
       meta.rawInput,
-      meta.displaySummary as string | undefined,
+      displaySummary ?? undefined,
     );
     const entryId = this._toolEntryIds.get(sessionId);
     if (entryId) {
@@ -1238,10 +1258,10 @@ export class TeamsAdapter extends MessagingAdapter {
     parts.push("Done");
     msg.setUsage(parts.join(" · "));
 
-    // Usage is the last event of a prompt turn — finalize the card and
-    // clean up session state so the next turn gets a fresh start.
-    await this.composer.finalize(sessionId);
-    this.cleanupSessionState(sessionId);
+    // Soft-finalize: flush the final card but keep the SessionMessage in the
+    // map so late events (permissions) can still append to this card.
+    // The next turn's first content event will finalize and start fresh.
+    await this.composer.softFinalize(sessionId);
   }
 
   /**

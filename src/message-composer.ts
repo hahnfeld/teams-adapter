@@ -65,7 +65,11 @@ function formatElapsed(ms: number): string {
 }
 
 export function escapeMd(text: string): string {
-  return text.replace(/[[\]*_]/g, "\\$&");
+  // Adaptive Cards only support a subset of markdown in TextBlocks.
+  // Backslash escapes render literally in Teams, so only escape brackets
+  // (which trigger link syntax). Leave * and _ alone — they rarely form
+  // valid bold/italic pairs in tool output and \* shows as literal \*.
+  return text.replace(/[[\]]/g, "\\$&");
 }
 
 const PLAN_STATUS_ICONS: Record<string, string> = {
@@ -169,53 +173,35 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           const detailId = `detail-${entry.id}`;
           const showId = `show-${entry.id}`;
           const hideId = `hide-${entry.id}`;
+
+          // "▶ Show" row — whole row is clickable, no separate button
+          const showRow = {
+            ...buildLevel1(entry.emoji, `${escapeMd(entry.label)}  (${elapsed})  ▶ Show`),
+            id: showId,
+            isVisible: true,
+            selectAction: {
+              type: "Action.ToggleVisibility",
+              targetElements: [detailId, showId, hideId],
+            },
+          };
+
+          // "▼ Hide" row — replaces show row when expanded
+          const hideRow = {
+            ...buildLevel1(entry.emoji, `${escapeMd(entry.label)}  (${elapsed})  ▼ Hide`),
+            id: hideId,
+            isVisible: false,
+            selectAction: {
+              type: "Action.ToggleVisibility",
+              targetElements: [detailId, showId, hideId],
+            },
+          };
+
           blocks.push({
             type: "Container",
             spacing: "Small",
             items: [
-              {
-                type: "ColumnSet",
-                spacing: "None",
-                columns: [
-                  {
-                    type: "Column",
-                    width: "auto",
-                    items: [buildLevel1(entry.emoji, `${escapeMd(entry.label)}  (${elapsed})`)],
-                    verticalContentAlignment: "Center",
-                  },
-                  {
-                    type: "Column",
-                    width: "auto",
-                    items: [
-                      // "▶ Show" button — visible when collapsed
-                      {
-                        type: "ActionSet",
-                        id: showId,
-                        isVisible: true,
-                        spacing: "None",
-                        actions: [{
-                          type: "Action.ToggleVisibility",
-                          title: "▶ Show",
-                          targetElements: [detailId, showId, hideId],
-                        }],
-                      },
-                      // "▼ Hide" button — visible when expanded
-                      {
-                        type: "ActionSet",
-                        id: hideId,
-                        isVisible: false,
-                        spacing: "None",
-                        actions: [{
-                          type: "Action.ToggleVisibility",
-                          title: "▼ Hide",
-                          targetElements: [detailId, showId, hideId],
-                        }],
-                      },
-                    ],
-                    verticalContentAlignment: "Center",
-                  },
-                ],
-              },
+              showRow,
+              hideRow,
               // Collapsible detail — hidden by default
               { ...buildLevel2(entry.result, elapsed), id: detailId, isVisible: false },
             ],
@@ -347,6 +333,8 @@ export class SessionMessage {
   private workingFrame = 0;
   private destroyed = false;
   private ref: MessageRef | null = null;
+  private creating = false;
+  private sealed = false;
   private lastSent = "";
   private stallTimer?: ReturnType<typeof setTimeout>;
   private tickInterval?: ReturnType<typeof setInterval>;
@@ -359,14 +347,23 @@ export class SessionMessage {
     private rateLimiter: ConversationRateLimiter,
     private acquireBotToken: AcquireBotToken,
   ) {
-    // Start the working animation immediately
+    // Start the working animation immediately — enqueue flush with no debounce
     this.usageId = nextId();
     this.entries.push({ id: this.usageId, kind: "usage", text: WORKING_FRAMES[0] });
     this.startTickInterval();
+    this.rateLimiter.enqueue(
+      this.conversationId,
+      () => this.flush(),
+      `new:${this.sessionId}`,
+    ).catch(() => {});
 
     // If no real content arrives within 30s, delete the empty card
     this.emptyCardTimer = setTimeout(() => this.deleteIfEmpty(), 30_000);
     if (this.emptyCardTimer.unref) this.emptyCardTimer.unref();
+  }
+
+  get isSealed(): boolean {
+    return this.sealed;
   }
 
   updateContext(context: TurnContext): void {
@@ -471,7 +468,7 @@ export class SessionMessage {
       this.entries.push({ id: nextId(), kind: "timed", emoji: "🔧", label: result, startedAt: Date.now(), result, endedAt: Date.now() });
     }
     const hasRunning = this.entries.some((e) => e.kind === "timed" && !e.result);
-    if (!hasRunning) this.stopTickInterval();
+    if (!hasRunning && !this.working) this.stopTickInterval();
     this.requestFlush();
   }
 
@@ -668,15 +665,22 @@ export class SessionMessage {
     if (!cardStr || cardStr === this.lastSent) return;
 
     if (!this.ref) {
-      const result = await sendCard(this.context, card) as { id?: string } | undefined;
-      if (result?.id) {
-        this.ref = {
-          activityId: result.id,
-          conversationId: this.context.activity.conversation?.id as string,
-          serviceUrl: this.context.activity.serviceUrl as string,
-        };
+      // Guard against concurrent creates (flush + finalize racing)
+      if (this.creating) return;
+      this.creating = true;
+      try {
+        const result = await sendCard(this.context, card) as { id?: string } | undefined;
+        if (result?.id) {
+          this.ref = {
+            activityId: result.id,
+            conversationId: this.context.activity.conversation?.id as string,
+            serviceUrl: this.context.activity.serviceUrl as string,
+          };
+        }
+        this.lastSent = cardStr;
+      } finally {
+        this.creating = false;
       }
-      this.lastSent = cardStr;
     } else {
       const success = await this.updateCardViaRest(card);
       if (success) this.lastSent = cardStr;
@@ -742,6 +746,7 @@ export class SessionMessage {
     this.cancelEmptyCardTimer();
     this.closeActiveThinking();
     this.working = false;
+    this.sealed = true;
     this.stopTickInterval();
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
@@ -752,17 +757,31 @@ export class SessionMessage {
       this.stallTimer = undefined;
     }
 
+    // Wait for any in-flight create to finish before finalizing
+    if (this.creating) {
+      await new Promise<void>((r) => {
+        const check = setInterval(() => {
+          if (!this.creating) { clearInterval(check); r(); }
+        }, 50);
+      });
+    }
+
     const card = this.buildCard();
     const cardStr = JSON.stringify(card);
     if (cardStr && cardStr !== this.lastSent) {
       if (!this.ref) {
-        const result = await sendCard(this.context, card) as { id?: string } | undefined;
-        if (result?.id) {
-          this.ref = {
-            activityId: result.id,
-            conversationId: this.context.activity.conversation?.id as string,
-            serviceUrl: this.context.activity.serviceUrl as string,
-          };
+        this.creating = true;
+        try {
+          const result = await sendCard(this.context, card) as { id?: string } | undefined;
+          if (result?.id) {
+            this.ref = {
+              activityId: result.id,
+              conversationId: this.context.activity.conversation?.id as string,
+              serviceUrl: this.context.activity.serviceUrl as string,
+            };
+          }
+        } finally {
+          this.creating = false;
         }
       } else {
         await this.updateCardViaRest(card);
@@ -877,6 +896,11 @@ export class SessionMessageManager {
 
   getOrCreate(sessionId: string, context: TurnContext): SessionMessage {
     let msg = this.messages.get(sessionId);
+    if (msg && msg.isSealed) {
+      // Previous turn's card was soft-finalized — remove it and start fresh
+      this.messages.delete(sessionId);
+      msg = undefined;
+    }
     if (!msg) {
       const conversationId = context.activity.conversation?.id as string;
       msg = new SessionMessage(context, conversationId, sessionId, this.rateLimiter, this.acquireBotToken);
@@ -899,6 +923,13 @@ export class SessionMessageManager {
     const msg = this.messages.get(sessionId);
     if (!msg) return null;
     this.messages.delete(sessionId);
+    return msg.finalize();
+  }
+
+  /** Flush the final card state but keep the SessionMessage in the map for late events. */
+  async softFinalize(sessionId: string): Promise<MessageRef | null> {
+    const msg = this.messages.get(sessionId);
+    if (!msg) return null;
     return msg.finalize();
   }
 
