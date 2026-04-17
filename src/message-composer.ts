@@ -40,7 +40,7 @@ const STALL_TIMEOUT = 120_000;
 
 type BodyEntry =
   | { id: string; kind: "title"; text: string }
-  | { id: string; kind: "timed"; emoji: string; label: string; startedAt: number; result?: string; endedAt?: number; collapsible?: boolean }
+  | { id: string; kind: "timed"; emoji: string; label: string; startedAt: number; result?: string; endedAt?: number; collapsible?: boolean; collapsed?: boolean }
   | { id: string; kind: "info"; emoji: string; label: string; detail: string }
   | { id: string; kind: "text"; text: string }
   | { id: string; kind: "plan"; entries: { content: string; status: string }[] }
@@ -174,22 +174,24 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
           const showId = `show-${entry.id}`;
           const hideId = `hide-${entry.id}`;
 
-          // "▶ Show" row — whole row is clickable, no separate button
+          const isCollapsed = !!entry.collapsed;
+
+          // "▶ Show" row — visible when collapsed
           const showRow = {
             ...buildLevel1(entry.emoji, `${escapeMd(entry.label)}  (${elapsed})  ▶ Show`),
             id: showId,
-            isVisible: true,
+            isVisible: isCollapsed,
             selectAction: {
               type: "Action.ToggleVisibility",
               targetElements: [detailId, showId, hideId],
             },
           };
 
-          // "▼ Hide" row — replaces show row when expanded
+          // "▼ Hide" row — visible when expanded
           const hideRow = {
             ...buildLevel1(entry.emoji, `${escapeMd(entry.label)}  (${elapsed})  ▼ Hide`),
             id: hideId,
-            isVisible: false,
+            isVisible: !isCollapsed,
             selectAction: {
               type: "Action.ToggleVisibility",
               targetElements: [detailId, showId, hideId],
@@ -202,8 +204,7 @@ function buildCardBody(entries: BodyEntry[]): unknown[] {
             items: [
               showRow,
               hideRow,
-              // Collapsible detail — hidden by default
-              { ...buildLevel2(entry.result, elapsed), id: detailId, isVisible: false },
+              { ...buildLevel2(entry.result, elapsed), id: detailId, isVisible: !isCollapsed },
             ],
           });
         } else {
@@ -480,6 +481,12 @@ export class SessionMessage {
   addThinking(text: string): void {
     this.cancelEmptyCardTimer();
     if (!this.thinkingActive) {
+      // Collapse any previous completed thinking entries
+      for (const e of this.entries) {
+        if (e.kind === "timed" && e.collapsible && e.result && !e.collapsed) {
+          e.collapsed = true;
+        }
+      }
       const id = this.addTimedStart("☁️", "Thinking");
       // Mark as collapsible so the card builder adds a toggle after completion
       const entry = this.findEntry(id);
@@ -745,6 +752,12 @@ export class SessionMessage {
   async finalize(): Promise<MessageRef | null> {
     this.cancelEmptyCardTimer();
     this.closeActiveThinking();
+    // Collapse all expanded thinking entries on turn end
+    for (const e of this.entries) {
+      if (e.kind === "timed" && e.collapsible && e.result && !e.collapsed) {
+        e.collapsed = true;
+      }
+    }
     this.working = false;
     this.sealed = true;
     this.stopTickInterval();

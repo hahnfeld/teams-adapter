@@ -1502,8 +1502,9 @@ export class TeamsAdapter extends MessagingAdapter {
       }
     }
 
-    // Session-specific context fallback
-    if (notification.sessionId) {
+    // Session-specific context fallback — skip for permissions since they are
+    // already rendered inline in the session card via the PermissionHandler.
+    if (notification.sessionId && notification.type !== "permission") {
       const ctx = this._sessionContexts.get(notification.sessionId);
       if (ctx) {
         try {
