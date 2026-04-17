@@ -1,6 +1,6 @@
 {
   "name": "@hahnfeld/teams-adapter",
-  "version": "1.5.15",
+  "version": "1.5.16",
   "description": "Teams adapter plugin for OpenACP — streaming message composer, rate limiter, commands",
   "type": "module",
   "main": "dist/index.js",

@@ -465,8 +465,8 @@ export class SessionMessage {
       entry.result = result;
       entry.endedAt = Date.now();
     } else {
-      // Orphan result — create a standalone completed entry
-      this.entries.push({ id: nextId(), kind: "timed", emoji: "🔧", label: result, startedAt: Date.now(), result, endedAt: Date.now() });
+      // Orphan result — create a standalone completed entry with generic label
+      this.entries.push({ id: nextId(), kind: "timed", emoji: "🔧", label: "Tool", startedAt: Date.now(), result, endedAt: Date.now() });
     }
     const hasRunning = this.entries.some((e) => e.kind === "timed" && !e.result);
     if (!hasRunning && !this.working) this.stopTickInterval();
@@ -683,8 +683,8 @@ export class SessionMessage {
             conversationId: this.context.activity.conversation?.id as string,
             serviceUrl: this.context.activity.serviceUrl as string,
           };
+          this.lastSent = cardStr;
         }
-        this.lastSent = cardStr;
       } finally {
         this.creating = false;
       }
@@ -747,7 +747,22 @@ export class SessionMessage {
     if (this.stallTimer.unref) this.stallTimer.unref();
   }
 
-  // ─── Finalize ───────────────────────────────────────────────────────────
+  // ─── Seal / Finalize ─────────────────────────────────────────────────────
+
+  /** Seal the card (stop animation, mark done) and flush, but keep alive for late events. */
+  async sealAndFlush(): Promise<MessageRef | null> {
+    this.sealed = true;
+    this.working = false;
+    this.stopTickInterval();
+    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = undefined; }
+    // Flush the current state
+    await this.rateLimiter.enqueue(
+      this.conversationId,
+      () => this.flush(),
+      this.ref ? `update:${this.ref.activityId}` : `new:${this.sessionId}`,
+    );
+    return this.ref;
+  }
 
   async finalize(): Promise<MessageRef | null> {
     this.cancelEmptyCardTimer();
@@ -792,14 +807,15 @@ export class SessionMessage {
               conversationId: this.context.activity.conversation?.id as string,
               serviceUrl: this.context.activity.serviceUrl as string,
             };
+            this.lastSent = cardStr;
           }
         } finally {
           this.creating = false;
         }
       } else {
-        await this.updateCardViaRest(card);
+        const success = await this.updateCardViaRest(card);
+        if (success) this.lastSent = cardStr;
       }
-      this.lastSent = cardStr;
     }
 
     return this.ref;
@@ -939,11 +955,11 @@ export class SessionMessageManager {
     return msg.finalize();
   }
 
-  /** Flush the final card state but keep the SessionMessage in the map for late events. */
+  /** Flush the current card state and seal it, but keep in the map for late events (permissions). */
   async softFinalize(sessionId: string): Promise<MessageRef | null> {
     const msg = this.messages.get(sessionId);
     if (!msg) return null;
-    return msg.finalize();
+    return msg.sealAndFlush();
   }
 
   cleanup(sessionId: string): void {

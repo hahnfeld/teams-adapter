@@ -1180,7 +1180,7 @@ export class TeamsAdapter extends MessagingAdapter {
     if (typeof value !== "string") return null;
     const trimmed = value.trim().replace(/^["']+|["']+$/g, "");
     if (!trimmed || trimmed === "undefined" || trimmed === "null") return null;
-    return value;
+    return trimmed;
   }
 
   protected async handleToolCall(sessionId: string, content: OutgoingMessage, _verbosity: DisplayVerbosity): Promise<void> {
@@ -1250,7 +1250,9 @@ export class TeamsAdapter extends MessagingAdapter {
     const meta = content.metadata as { tokensUsed?: number; contextSize?: number; cost?: number; duration?: number } | undefined;
     if (meta?.tokensUsed == null) return; // No usage data — let handleSessionEnd finalize
 
-    const msg = this.composer.getOrCreate(sessionId, ctx.context);
+    // Use get() not getOrCreate() — if the card is already sealed (duplicate usage event),
+    // don't create a new "Working." card.
+    const msg = this.composer.get(sessionId) ?? this.composer.getOrCreate(sessionId, ctx.context);
     const parts: string[] = [];
     parts.push(`${formatTokens(meta.tokensUsed)} tokens`);
     if (meta.duration != null) parts.push(`${(meta.duration / 1000).toFixed(1)}s`);
@@ -1258,10 +1260,11 @@ export class TeamsAdapter extends MessagingAdapter {
     parts.push("Done");
     msg.setUsage(parts.join(" · "));
 
-    // Soft-finalize: flush the final card but keep the SessionMessage in the
-    // map so late events (permissions) can still append to this card.
-    // The next turn's first content event will finalize and start fresh.
-    await this.composer.softFinalize(sessionId);
+    // Seal and flush the card but keep in the map so late events (permissions)
+    // can still append. The next turn's getOrCreate detects isSealed and starts fresh.
+    if (!msg.isSealed) {
+      await this.composer.softFinalize(sessionId);
+    }
   }
 
   /**
@@ -1448,6 +1451,10 @@ export class TeamsAdapter extends MessagingAdapter {
   // ─── sendNotification ──────────────────────────────────────────────────
 
   async sendNotification(notification: NotificationMessage): Promise<void> {
+    // All session events (permissions, errors, completions) are rendered inline
+    // in session cards. Notifications only go to the dedicated channel if configured.
+    if (!this.notificationChannelId) return;
+
     const typeIcon: Record<string, string> = {
       completed: "✅", error: "❌", permission: "🔐", input_required: "💬", budget_warning: "⚠️",
     };
@@ -1461,62 +1468,35 @@ export class TeamsAdapter extends MessagingAdapter {
       ? `${notification.sessionName} — ${notification.summary}`
       : notification.summary;
 
-    // Build a mini Adaptive Card matching the info Container style
     const card = TeamsAdapter.buildNotificationCard(icon, label, detail, notification.deepLink);
+    const ref = this.conversationStore.getAny();
+    if (!ref || !TeamsAdapter.isValidServiceUrl(ref.serviceUrl)) return;
 
-    // Post to the notification channel via Bot Framework REST API.
-    if (this.notificationChannelId) {
-      const ref = this.conversationStore.getAny();
-      if (ref && TeamsAdapter.isValidServiceUrl(ref.serviceUrl)) {
-        try {
-          const botToken = await this.acquireBotToken();
-          if (botToken) {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 10_000);
-            try {
-              const response = await fetch(`${ref.serviceUrl}/v3/conversations/${encodeURIComponent(this.notificationChannelId)}/activities`, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "Authorization": `Bearer ${botToken}`,
-                },
-                body: JSON.stringify({
-                  type: "message",
-                  attachments: [{
-                    contentType: "application/vnd.microsoft.card.adaptive",
-                    content: card,
-                  }],
-                  from: { id: ref.botId, name: ref.botName },
-                }),
-                signal: controller.signal,
-              });
-              if (response.ok) return;
-              log.warn({ status: response.status }, "[TeamsAdapter] Proactive notification to channel failed");
-            } finally {
-              clearTimeout(timeout);
-            }
-          }
-        } catch (err) {
-          log.warn({ err }, "[TeamsAdapter] Proactive notification error");
+    try {
+      const botToken = await this.acquireBotToken();
+      if (!botToken) return;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10_000);
+      try {
+        const response = await fetch(`${ref.serviceUrl}/v3/conversations/${encodeURIComponent(this.notificationChannelId)}/activities`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${botToken}` },
+          body: JSON.stringify({
+            type: "message",
+            attachments: [{ contentType: "application/vnd.microsoft.card.adaptive", content: card }],
+            from: { id: ref.botId, name: ref.botName },
+          }),
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          log.warn({ status: response.status }, "[TeamsAdapter] Notification channel post failed");
         }
+      } finally {
+        clearTimeout(timeout);
       }
+    } catch (err) {
+      log.warn({ err }, "[TeamsAdapter] Notification channel error");
     }
-
-    // Session-specific context fallback — skip for permissions since they are
-    // already rendered inline in the session card via the PermissionHandler.
-    if (notification.sessionId && notification.type !== "permission") {
-      const ctx = this._sessionContexts.get(notification.sessionId);
-      if (ctx) {
-        try {
-          await sendCard(ctx.context, card);
-          return;
-        } catch (err) {
-          log.debug({ err, sessionId: notification.sessionId }, "[TeamsAdapter] Session context fallback failed (context may be stale)");
-        }
-      }
-    }
-
-    log.debug({ type: notification.type, sessionName: notification.sessionName }, "[TeamsAdapter] sendNotification: no delivery path available");
   }
 
   /** Build a notification Adaptive Card with the same info Container style. */
